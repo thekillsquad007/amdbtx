@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ─── Configurables ──────────────────────────────────────────────────────────
 PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.0}"
-PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/user/amdbtx/releases/download/${PREBUILDS_TAG}}"
+PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/${PREBUILDS_TAG}}"
 SOLVER_URL="${PREBUILDS_BASE}/btx-gbt-solve-hip"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 
