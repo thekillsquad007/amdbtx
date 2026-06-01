@@ -37,7 +37,6 @@ ASSUME_YES=0
 SKIP_PROMPT=0
 LOCAL_SOLVER=""
 SKIP_PIP=0
-BUILD_FROM_SOURCE=0
 SKIP_ROCM=0
 
 while [[ $# -gt 0 ]]; do
@@ -50,7 +49,6 @@ while [[ $# -gt 0 ]]; do
         --local-solver) LOCAL_SOLVER="$2"; shift 2 ;;
         --skip-pip)    SKIP_PIP=1; shift ;;
         --skip-rocm)   SKIP_ROCM=1; shift ;;
-        --build)       BUILD_FROM_SOURCE=1; shift ;;
         --help|-h)
             sed -n '2,20p' "$0"
             exit 0
@@ -221,7 +219,7 @@ elif ! command -v rocm-smi >/dev/null 2>&1; then
     fi
 fi
 
-# ─── Install pip + runtime deps + amdbtx-miner ──────────────────────────────
+# ─── Install pip + runtime deps ──────────────────────────────────────────────
 if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
     log "python pip not present; installing via apt..."
     sudo apt-get update -qq
@@ -231,72 +229,41 @@ fi
 log "installing runtime deps (pyyaml)..."
 "$PYTHON" -m pip install --user --quiet --upgrade pyyaml
 
+# ─── Fetch pre-built Python package + solver binary from releases ───────────
+mkdir -p "${INSTALL_DIR}/bin"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+
+# Download and install pre-built Python wheel
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
-    log "installing amdbtx-miner (pip --user)..."
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    "$PYTHON" -m pip install --user --upgrade "$SCRIPT_DIR"
+    log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
+    WHEEL_URL="${PREBUILDS_BASE}/amdbtx_miner-${PREBUILDS_TAG#v}-py3-none-any.whl"
+    # Try exact version first, then latest release
+    if ! curl -fsSL "$WHEEL_URL" -o "$TMP" 2>/dev/null; then
+        log "trying latest release for Python package..."
+        WHEEL_URL="https://github.com/thekillsquad007/amdbtx/releases/latest/download/amdbtx_miner-py3-none-any.whl"
+        curl -fsSL "$WHEEL_URL" -o "$TMP" 2>/dev/null || err "failed to download Python package from GitHub releases"
+    fi
+    "$PYTHON" -m pip install --user --upgrade "$TMP" 2>&1 | tail -3
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) : ;;
         *) warn "add to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
     esac
 fi
 
-# ─── Fetch solver binary ────────────────────────────────────────────────────
-mkdir -p "${INSTALL_DIR}/bin"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
-
+# Download pre-built solver binary
 if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
     cp "$LOCAL_SOLVER" "$TMP"
-elif [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
-    log "building solver from source..."
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [[ -d "${SCRIPT_DIR}/solver" ]]; then
-        if [[ -f /opt/rocm/env.sh ]]; then
-            source /opt/rocm/env.sh
-        elif [[ -d /opt/rocm/bin ]]; then
-            export PATH=/opt/rocm/bin:$PATH
-        fi
-        export CMAKE_PREFIX_PATH=/opt/rocm:${CMAKE_PREFIX_PATH:-}
-        SOLVER_BUILD_DIR=$(mktemp -d)
-        cmake -B "$SOLVER_BUILD_DIR" -S "${SCRIPT_DIR}/solver" \
-            -DCMAKE_PREFIX_PATH=/opt/rocm \
-            -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -10
-        cmake --build "$SOLVER_BUILD_DIR" -j"$(nproc)"
-        find "$SOLVER_BUILD_DIR" -name "btx-gbt-solve*" -type f -exec cp {} "$TMP" \;
-        rm -rf "$SOLVER_BUILD_DIR"
-    else
-        err "solver source not found at ${SCRIPT_DIR}/solver"
-    fi
 else
     log "downloading solver binary from ${SOLVER_URL}..."
     curl -fsSL "$SOLVER_URL" -o "$TMP" 2>/dev/null || {
-        warn "download failed — attempting to build from source"
-        BUILD_FROM_SOURCE=1
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        if [[ -d "${SCRIPT_DIR}/solver" ]]; then
-            # Source ROCm environment if available
-            if [[ -f /opt/rocm/env.sh ]]; then
-                source /opt/rocm/env.sh
-            elif [[ -d /opt/rocm/bin ]]; then
-                export PATH=/opt/rocm/bin:$PATH
-                export HIP_PATH=/opt/rocm
-            fi
-            export CMAKE_PREFIX_PATH=/opt/rocm:${CMAKE_PREFIX_PATH:-}
-
-            SOLVER_BUILD_DIR=$(mktemp -d)
-            cmake -B "$SOLVER_BUILD_DIR" -S "${SCRIPT_DIR}/solver" \
-                -DCMAKE_PREFIX_PATH=/opt/rocm \
-                -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -10
-            cmake --build "$SOLVER_BUILD_DIR" -j"$(nproc)"
-            find "$SOLVER_BUILD_DIR" -name "btx-gbt-solve*" -type f -exec cp {} "$TMP" \;
-            rm -rf "$SOLVER_BUILD_DIR"
-        else
-            err "solver source not found and download failed"
-        fi
+        err "failed to download solver binary from GitHub releases
+    URL: ${SOLVER_URL}
+    Ensure you have a compatible AMD GPU and internet access.
+    You can also provide a local binary: --local-solver /path/to/btx-gbt-solve"
     }
 fi
 
