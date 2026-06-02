@@ -231,18 +231,18 @@ log "installing runtime deps (pyyaml)..."
 
 # ─── Fetch pre-built Python package + solver binary from releases ───────────
 mkdir -p "${INSTALL_DIR}/bin"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
+TMP_WHEEL="$(mktemp -u).whl"
+TMP_SOLVER="$(mktemp)"
+trap 'rm -f "$TMP_WHEEL" "$TMP_SOLVER"' EXIT
 
 # Download and install pre-built Python wheel
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
     log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
-    # The wheel version matches the package version (from pyproject.toml)
     WHEEL_URL="${PREBUILDS_BASE}/amdbtx_miner-1.0.0-py3-none-any.whl"
-    curl -fsSL "$WHEEL_URL" -o "$TMP" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
-    "$PYTHON" -m pip install --user --upgrade "$TMP" 2>&1 | tail -3
+    curl -fsSL "$WHEEL_URL" -o "$TMP_WHEEL" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
+    "$PYTHON" -m pip install --user --upgrade "$TMP_WHEEL" 2>&1 | tail -3
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) : ;;
         *) warn "add to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
@@ -252,10 +252,10 @@ fi
 # Download pre-built solver binary
 if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
-    cp "$LOCAL_SOLVER" "$TMP"
+    cp "$LOCAL_SOLVER" "$TMP_SOLVER"
 else
     log "downloading solver binary from ${SOLVER_URL}..."
-    curl -fsSL "$SOLVER_URL" -o "$TMP" 2>/dev/null || {
+    curl -fsSL "$SOLVER_URL" -o "$TMP_SOLVER" 2>/dev/null || {
         err "failed to download solver binary from GitHub releases
     URL: ${SOLVER_URL}
     Ensure you have a compatible AMD GPU and internet access.
@@ -263,7 +263,7 @@ else
     }
 fi
 
-install -m 0755 "$TMP" "$SOLVER_PATH"
+install -m 0755 "$TMP_SOLVER" "$SOLVER_PATH"
 log "solver installed → $SOLVER_PATH"
 
 # ─── Config ─────────────────────────────────────────────────────────────────
