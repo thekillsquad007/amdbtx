@@ -239,13 +239,9 @@ if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
     log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
-    WHEEL_URL="${PREBUILDS_BASE}/amdbtx_miner-${PREBUILDS_TAG#v}-py3-none-any.whl"
-    # Try exact version first, then latest release
-    if ! curl -fsSL "$WHEEL_URL" -o "$TMP" 2>/dev/null; then
-        log "trying latest release for Python package..."
-        WHEEL_URL="https://github.com/thekillsquad007/amdbtx/releases/latest/download/amdbtx_miner-py3-none-any.whl"
-        curl -fsSL "$WHEEL_URL" -o "$TMP" 2>/dev/null || err "failed to download Python package from GitHub releases"
-    fi
+    # The wheel version matches the package version (from pyproject.toml)
+    WHEEL_URL="${PREBUILDS_BASE}/amdbtx_miner-1.0.0-py3-none-any.whl"
+    curl -fsSL "$WHEEL_URL" -o "$TMP" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
     "$PYTHON" -m pip install --user --upgrade "$TMP" 2>&1 | tail -3
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) : ;;
