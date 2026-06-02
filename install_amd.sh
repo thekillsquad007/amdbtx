@@ -231,16 +231,17 @@ log "installing runtime deps (pyyaml)..."
 
 # ─── Fetch pre-built Python package + solver binary from releases ───────────
 mkdir -p "${INSTALL_DIR}/bin"
-TMP_WHEEL="$(mktemp -u).whl"
+WHEEL_FILENAME="amdbtx_miner-1.0.0-py3-none-any.whl"
+TMP_WHEEL="$(mktemp -d)/${WHEEL_FILENAME}"
 TMP_SOLVER="$(mktemp)"
-trap 'rm -f "$TMP_WHEEL" "$TMP_SOLVER"' EXIT
+trap 'rm -f "$TMP_SOLVER"; rm -rf "$(dirname "$TMP_WHEEL")"' EXIT
 
 # Download and install pre-built Python wheel
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
     log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
-    WHEEL_URL="${PREBUILDS_BASE}/amdbtx_miner-1.0.0-py3-none-any.whl"
+    WHEEL_URL="${PREBUILDS_BASE}/${WHEEL_FILENAME}"
     curl -fsSL "$WHEEL_URL" -o "$TMP_WHEEL" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
     "$PYTHON" -m pip install --user --upgrade "$TMP_WHEEL" 2>&1 | tail -3
     case ":$PATH:" in
