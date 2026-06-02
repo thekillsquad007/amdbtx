@@ -20,7 +20,8 @@ set -euo pipefail
 # ─── Configurables ──────────────────────────────────────────────────────────
 PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.0}"
 PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/${PREBUILDS_TAG}}"
-SOLVER_URL="${PREBUILDS_BASE}/btx-gbt-solve-hip"
+SOLVER_NAME="${SOLVER_NAME:-btx-gbt-solve}"
+SOLVER_URL="${PREBUILDS_BASE}/${SOLVER_NAME}"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
