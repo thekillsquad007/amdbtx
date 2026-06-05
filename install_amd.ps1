@@ -113,7 +113,9 @@ if [[ -n "\$GPU_QUERY" ]]; then
         GPU_NAME=\$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
     else
         GPU_ARCH=\$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
-        GPU_NAME=\$(rocminfo 2>/dev/null | grep -i "Name:" | head -1 | sed 's/.*Name:[ \t]*//' | sed 's/ (TM)//; s/ (R)//; s/ /-/g' || true)
+        if [[ -n "\$GPU_ARCH" ]]; then
+            GPU_NAME=\$(rocminfo 2>/dev/null | grep -B5 "\$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+        fi
     fi
     if [[ "\$GPU_ARCH" == "gfx803" ]]; then
         GPU_THREADS=4; GPU_WORKERS=8; GPU_BATCH=64

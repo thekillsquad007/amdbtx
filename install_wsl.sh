@@ -39,6 +39,15 @@ if [[ -d "$ROCM_PATH/bin" ]]; then
     export LD_LIBRARY_PATH="$ROCM_PATH/lib:$LD_LIBRARY_PATH"
 fi
 
+# Ensure python3-venv is available
+if ! python3 -m venv --help >/dev/null 2>&1 || [[ ! -f "$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null)/../bin/activate" ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+        PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "3")
+        log "Installing python${PYTHON_VERSION}-venv..."
+        sudo apt-get install -y -qq "python${PYTHON_VERSION}-venv" 2>/dev/null || sudo apt-get install -y -qq python3-venv 2>/dev/null || true
+    fi
+fi
+
 # ROCm detection: rocm-smi may not exist in ROCm 7.x, check alternative tools
 HAS_ROCM=false
 ROCM_VERSION_DETECTED=""
@@ -75,9 +84,11 @@ if [[ -n "$GPU_QUERY_CMD" ]]; then
         GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 || true)
         GPU_ARCH=$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
     else
-        # rocminfo: parse GPU info
-        GPU_NAME=$(rocminfo 2>/dev/null | grep -i "Name:" | head -1 | sed 's/.*Name:[ \t]*//' || true)
+        # rocminfo: parse GPU info (skip CPU agent, find first with gfx arch)
         GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+        if [[ -n "$GPU_ARCH" ]]; then
+            GPU_NAME=$(rocminfo 2>/dev/null | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//' || true)
+        fi
     fi
     if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
         log "GPU detected: $GPU_NAME (arch: ${GPU_ARCH:-unknown})"
@@ -145,7 +156,9 @@ if [[ -n "$GPU_QUERY_CMD" ]]; then
         GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
     else
         GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
-        GPU_NAME=$(rocminfo 2>/dev/null | grep -i "Name:" | head -1 | sed 's/.*Name:[ \t]*//' | sed 's/ (TM)//; s/ (R)//; s/ /-/g' || true)
+        if [[ -n "$GPU_ARCH" ]]; then
+            GPU_NAME=$(rocminfo 2>/dev/null | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+        fi
     fi
     # Older GCN cards
     if [[ "$GPU_ARCH" == "gfx803" ]]; then
