@@ -9,7 +9,20 @@ pre-built HIP/ROCm solver binary and a Python stratum wrapper for AMD GPUs.
 - **Pool fee**: 2.5% (PPLNS, weekly payouts)
 - **Dev fee**: 2% (time-sliced, transparent)
 - **Dev wallet**: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
-- **Source**: Partially open — installer/config public, solver/wrapper binary-only
+- **Windows support**: WSL2 with ROCm
+
+## Install Methods
+
+### Linux (Native)
+```bash
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1...
+```
+
+### Windows (WSL2)
+```powershell
+.\install_amd.ps1 -Address "btx1..." -Worker "rig1"
+wsl -d Ubuntu-22.04 -e amdbtx-miner
+```
 
 ## Architecture
 
@@ -162,13 +175,15 @@ pip install --user -e .
 |------|---------|--------|-------|
 | `AGENTS.md` | This file | Yes | ~200 |
 | `install_amd.sh` | AMD installer | Yes | ~400 |
-| `pyproject.toml` | Package definition | Yes | ~30 |
-| `config.example.yaml` | Config template | Yes | ~50 |
+| `install_amd.ps1` | Windows/WSL installer | Yes | ~80 |
+| `install_wsl.sh` | WSL setup script | Yes | ~70 |
+| `pyproject.toml` | Package definition | Yes | ~20 |
+| `config.example.yaml` | Config template | Yes | ~25 |
+| `src/amdbtx_miner/*` | Python wrapper (open) | Yes | ~150 |
 | `solver/src/*` | Solver source (C++/HIP) | Private | ~1500 |
-| `src/amdbtx_miner/*` | Python wrapper source | Private | ~1500 |
 
-**Distribution model**: Pre-built binaries only. Source code for solver and
-Python wrapper is not public. Install script downloads from GitHub releases.
+**Distribution model**: Pre-built binaries download from GitHub releases. Python wrapper
+source included for transparency.
 
 ## Testing
 
@@ -180,6 +195,7 @@ Python wrapper is not public. Install script downloads from GitHub releases.
 ## Common Pitfalls
 
 - **ROCm not detecting GPU**: Ensure `/dev/kfd` and `/dev/dri` are accessible in container
+- **WSL GPU not detected**: Set `HSA_ENABLE_DXG_DETECTION=1` in Windows environment, restart WSL
 - **Low GPU util**: Bump `solver_prepare_workers` and `solver_threads` together
 - **Share rejected (code 21)**: Normal after reconnect, wait 1-2 minutes
 - **Silent CPU fallback**: Check `rocm-smi` shows GPU in use during mining

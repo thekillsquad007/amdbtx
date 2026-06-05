@@ -1,34 +1,18 @@
 # Build artifacts
 build/
-*.o
-*.so
-*.exe
-*.out
+dist/
+*.egg-info/
+*.whl
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
-dist/
-*.whl
-*.egg
-.eggs/
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Runtime
+# Logs
 *.log
-*.pid
-
-# Temporary
-/tmp/
