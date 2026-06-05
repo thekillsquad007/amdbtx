@@ -62,7 +62,13 @@ else
 fi
 
 # ROCm install (only if not present)
-if ! command -v rocm-smi >/dev/null 2>&1; then
+# Check multiple ROCm indicators (rocm-smi may not exist in ROCm 7.x)
+HAS_ROCM=false
+if command -v rocm-smi >/dev/null 2>&1 || command -v rocminfo >/dev/null 2>&1 || command -v hipcc >/dev/null 2>&1 || [[ -f /opt/rocm/share/doc/rocm-core/version ]]; then
+    HAS_ROCM=true
+fi
+
+if ! \$HAS_ROCM; then
     echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/\$ROCM_VERSION \$UBUNTU_CODENAME main" > /etc/apt/sources.list.d/rocm.list
     apt-get update -qq 2>/dev/null || true
     apt-get install -y -qq rocm-hip-runtime hipblas hipsolver 2>/dev/null || echo 'ROCm may need manual install'
@@ -95,9 +101,20 @@ GPU_THREADS=8
 GPU_WORKERS=16
 GPU_BATCH=128
 WORKER_NAME=""
+GPU_QUERY=""
 if command -v rocm-smi >/dev/null 2>&1; then
-    GPU_ARCH=\$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
-    GPU_NAME=\$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+    GPU_QUERY="rocm-smi"
+elif command -v rocminfo >/dev/null 2>&1; then
+    GPU_QUERY="rocminfo"
+fi
+if [[ -n "\$GPU_QUERY" ]]; then
+    if [[ "\$GPU_QUERY" == "rocm-smi" ]]; then
+        GPU_ARCH=\$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
+        GPU_NAME=\$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+    else
+        GPU_ARCH=\$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+        GPU_NAME=\$(rocminfo 2>/dev/null | grep -i "Name:" | head -1 | sed 's/.*Name:[ \t]*//' | sed 's/ (TM)//; s/ (R)//; s/ /-/g' || true)
+    fi
     if [[ "\$GPU_ARCH" == "gfx803" ]]; then
         GPU_THREADS=4; GPU_WORKERS=8; GPU_BATCH=64
     fi

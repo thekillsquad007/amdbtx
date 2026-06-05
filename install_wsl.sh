@@ -39,21 +39,56 @@ if [[ -d "$ROCM_PATH/bin" ]]; then
     export LD_LIBRARY_PATH="$ROCM_PATH/lib:$LD_LIBRARY_PATH"
 fi
 
-# Check for AMD GPU
+# ROCm detection: rocm-smi may not exist in ROCm 7.x, check alternative tools
+HAS_ROCM=false
+ROCM_VERSION_DETECTED=""
 if command -v rocm-smi >/dev/null 2>&1; then
-    GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 || true)
-    if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
-        log "GPU detected: $GPU_NAME"
-    else
-        warn "rocm-smi found but no AMD GPU detected"
-    fi
-else
-    log "rocm-smi not found - will install ROCm"
+    HAS_ROCM=true
+    ROCM_VERSION_DETECTED=$(rocm-smi --version 2>/dev/null | head -1 || true)
+    log "ROCm detected via rocm-smi: $ROCM_VERSION_DETECTED"
+elif command -v rocminfo >/dev/null 2>&1; then
+    HAS_ROCM=true
+    ROCM_VERSION_DETECTED=$(rocminfo --version 2>/dev/null | head -1 || true)
+    log "ROCm detected via rocminfo: $ROCM_VERSION_DETECTED"
+elif command -v hipcc >/dev/null 2>&1; then
+    HAS_ROCM=true
+    ROCM_VERSION_DETECTED="$(hipcc --version 2>&1 | head -1 || true)"
+    log "ROCm detected via hipcc: $ROCM_VERSION_DETECTED"
+elif [[ -f /opt/rocm/share/doc/rocm-core/version ]]; then
+    HAS_ROCM=true
+    ROCM_VERSION_DETECTED=$(cat /opt/rocm/share/doc/rocm-core/version)
+    log "ROCm detected at /opt/rocm: $ROCM_VERSION_DETECTED"
 fi
 
-# Install ROCm only if not present
-if ! command -v rocm-smi >/dev/null 2>&1; then
-    log "Installing ROCm (detecting Ubuntu version)..."
+# Check for AMD GPU
+GPU_QUERY_CMD=""
+if command -v rocm-smi >/dev/null 2>&1; then
+    GPU_QUERY_CMD="rocm-smi"
+elif command -v rocminfo >/dev/null 2>&1; then
+    GPU_QUERY_CMD="rocminfo"
+fi
+
+GPU_NAME=""
+GPU_ARCH=""
+if [[ -n "$GPU_QUERY_CMD" ]]; then
+    if [[ "$GPU_QUERY_CMD" == "rocm-smi" ]]; then
+        GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 || true)
+        GPU_ARCH=$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
+    else
+        # rocminfo: parse GPU info
+        GPU_NAME=$(rocminfo 2>/dev/null | grep -i "Name:" | head -1 | sed 's/.*Name:[ \t]*//' || true)
+        GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+    fi
+    if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
+        log "GPU detected: $GPU_NAME (arch: ${GPU_ARCH:-unknown})"
+    else
+        warn "$GPU_QUERY_CMD found but no AMD GPU detected"
+    fi
+fi
+
+# Install ROCm only if not present at all
+if ! $HAS_ROCM; then
+    log "ROCm not detected. Installing..."
     UBUNTU_CODENAME=$(lsb_release -cs)
     # Ubuntu 24.04 (noble) needs ROCm 7.x
     if [[ "$UBUNTU_CODENAME" == "noble" ]]; then
@@ -104,9 +139,14 @@ GPU_WORKERS=16
 GPU_THREADS=8
 GPU_BATCH=128
 WORKER_NAME="${WORKER}"
-if command -v rocm-smi >/dev/null 2>&1; then
-    GPU_ARCH=$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
-    GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+if [[ -n "$GPU_QUERY_CMD" ]]; then
+    if [[ "$GPU_QUERY_CMD" == "rocm-smi" ]]; then
+        GPU_ARCH=$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
+        GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+    else
+        GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+        GPU_NAME=$(rocminfo 2>/dev/null | grep -i "Name:" | head -1 | sed 's/.*Name:[ \t]*//' | sed 's/ (TM)//; s/ (R)//; s/ /-/g' || true)
+    fi
     # Older GCN cards
     if [[ "$GPU_ARCH" == "gfx803" ]]; then
         GPU_WORKERS=8; GPU_THREADS=4; GPU_BATCH=64
