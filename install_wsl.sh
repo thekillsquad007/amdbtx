@@ -84,10 +84,12 @@ if [[ -n "$GPU_QUERY_CMD" ]]; then
         GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 || true)
         GPU_ARCH=$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
     else
-        # rocminfo: parse GPU info (skip CPU agent, find first with gfx arch)
-        GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
-        if [[ -n "$GPU_ARCH" ]]; then
-            GPU_NAME=$(rocminfo 2>/dev/null | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//' || true)
+        # rocminfo: only use if it succeeded (exited 0)
+        if ROCMINFO_OUT=$(rocminfo 2>/dev/null); then
+            GPU_ARCH=$(echo "$ROCMINFO_OUT" | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+            if [[ -n "$GPU_ARCH" ]]; then
+                GPU_NAME=$(echo "$ROCMINFO_OUT" | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//' || true)
+            fi
         fi
     fi
     if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
@@ -155,9 +157,12 @@ if [[ -n "$GPU_QUERY_CMD" ]]; then
         GPU_ARCH=$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)
         GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | head -1 | sed 's/.*: //; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
     else
-        GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
-        if [[ -n "$GPU_ARCH" ]]; then
-            GPU_NAME=$(rocminfo 2>/dev/null | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+        # rocminfo: only use if it succeeded (exited 0)
+        if ROCMINFO_OUT=$(rocminfo 2>/dev/null); then
+            GPU_ARCH=$(echo "$ROCMINFO_OUT" | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+            if [[ -n "$GPU_ARCH" ]]; then
+                GPU_NAME=$(echo "$ROCMINFO_OUT" | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+            fi
         fi
     fi
     # Older GCN cards

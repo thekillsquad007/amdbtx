@@ -57,6 +57,15 @@ def run_miner():
 
     cfg = validate_config(cfg)
 
+    # Detect GPU
+    gpu_info = detect_gpu_info()
+    if gpu_info["gpu_detected"]:
+        print(f"[INFO] GPU: {gpu_info['gpu_name']} (arch: {gpu_info['gpu_arch']})")
+    else:
+        print(f"[WARN] No AMD GPU detected — solver will likely fail with backend=rocm")
+        if cfg.get("solver_backend") == "rocm":
+            print(f"[WARN] Set solver_backend: cpu in config or fix GPU passthrough")
+
     solver = GBTSolveWrapper(
         cfg.get("gbt_solve_path", "~/.amdbtx-miner/bin/btx-gbt-solve"),
         cfg.get("solver_backend", "rocm"),
