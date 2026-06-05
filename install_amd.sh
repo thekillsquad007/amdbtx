@@ -268,6 +268,77 @@ fi
 install -m 0755 "$TMP_SOLVER" "$SOLVER_PATH"
 log "solver installed → $SOLVER_PATH"
 
+# ─── Build solver runtime (library resolver) ──────────────────────────────
+# The pre-built solver binary links against specific sonames (e.g. libamdhip64.so.6, libhipblas.so.2)
+# ROCm 7.x ships different sonames. We create a local runtime dir with symlinks.
+RUNTIME_DIR="${INSTALL_DIR}/runtime"
+mkdir -p "$RUNTIME_DIR"
+
+ROCM_LIB_DIRS=()
+if [[ -d /opt/rocm/lib ]]; then ROCM_LIB_DIRS+=(/opt/rocm/lib); fi
+for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
+
+resolve_lib() {
+    local soname="$1" base="$2" target=""
+    for d in "${ROCM_LIB_DIRS[@]}"; do
+        [[ -f "$d/$soname" ]] && { ln -sfn "$d/$soname" "$RUNTIME_DIR/$soname"; log "  $soname -> $d/$soname"; return 0; }
+    done
+    for d in "${ROCM_LIB_DIRS[@]}"; do
+        latest=$(find "$d" -maxdepth 1 -name "${base}.so.*" ! -type l 2>/dev/null | sort -V | tail -1 || true)
+        [[ -n "$latest" ]] && { ln -sfn "$latest" "$RUNTIME_DIR/$soname"; log "  $soname -> $(basename $latest) ($d)"; return 0; }
+        if [[ -L "$d/${base}.so" ]]; then
+            real_target=$(readlink -f "$d/${base}.so")
+            [[ -f "$real_target" ]] && { ln -sfn "$real_target" "$RUNTIME_DIR/$soname"; log "  $soname -> $(basename $real_target) ($d)"; return 0; }
+        fi
+    done
+    warn "  $soname: not found in any ROCm installation"
+    return 1
+}
+
+log "building solver runtime..."
+declare -A SOLVER_LIBS=( ["libamdhip64.so.6"]="libamdhip64" ["libhipblas.so.2"]="libhipblas" )
+for soname in "${!SOLVER_LIBS[@]}"; do
+    resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true
+done
+
+# Symlink rocblas kernels if available
+for d in "${ROCM_LIB_DIRS[@]}"; do
+    if [[ -d "$d/rocblas/library" ]]; then
+        ln -sfn "$d/rocblas" "$RUNTIME_DIR/rocblas" 2>/dev/null || true
+        log "  rocblas kernels -> $d/rocblas/"
+        break
+    fi
+done
+
+# Build LD path: runtime dir first, then all ROCm dirs
+RUNTIME_LD_PATH="$RUNTIME_DIR"
+for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
+
+# Verify solver can load all libraries
+MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
+if [[ -n "$MISSING" ]]; then
+    warn "solver has unresolved libraries:"
+    echo "$MISSING" | while read -r line; do warn "  $line"; done
+    # Fallback: try apt install
+    UBUNTU_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
+    ROCM_REPO_VER=$([[ "$UBUNTU_CODENAME" == "noble" ]] && echo "7.2" || echo "6.0")
+    log "attempting to install missing libraries via apt..."
+    curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add - 2>/dev/null || true
+    echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
+    if timeout 120 sudo apt-get update -qq 2>/dev/null && \
+       timeout 120 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hipblas rocblas rocsolver 2>/dev/null; then
+        log "apt install succeeded"
+        for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
+        for soname in "${!SOLVER_LIBS[@]}"; do resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true; done
+        RUNTIME_LD_PATH="$RUNTIME_DIR"
+        for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
+    else
+        warn "apt install timed out or failed - solver may not work"
+    fi
+else
+    log "all solver libraries resolved"
+fi
+
 # ─── Config ─────────────────────────────────────────────────────────────────
 if [[ -z "$ADDRESS" && "$SKIP_PROMPT" -eq 0 ]]; then
     echo
@@ -336,7 +407,9 @@ reconnect_max_s: 60.0
 # Mines with your address 98% of the time, dev wallet 2%.
 # All switches logged at INFO level.
 
-log_level: "INFO"
+ log_level: "INFO"
+
+ runtime_ld_path: "${RUNTIME_LD_PATH}"
 YAML
     log "config written → $CONFIG_PATH"
 fi
@@ -392,8 +465,8 @@ echo "  Dev fee:  2% (time-sliced, transparent)"
 echo "  Dev fee wallet: ${DEV_WALLET}"
 echo
 echo "Setup PATH (add to ~/.bashrc if not already):"
-echo "  export PATH=/opt/rocm/bin:\$PATH"
-echo "  export LD_LIBRARY_PATH=/opt/rocm/lib:\$LD_LIBRARY_PATH"
+echo " export PATH=/opt/rocm/bin:\$PATH"
+echo " export LD_LIBRARY_PATH=$RUNTIME_DIR:/opt/rocm/lib:\$LD_LIBRARY_PATH"
 echo
 echo "Launch the miner:"
 echo "  amdbtx-miner --config ${CONFIG_PATH}"

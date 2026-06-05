@@ -25,9 +25,10 @@ def validate_config(cfg: dict) -> dict:
         "nonces_per_slice": 20000000,
         "solver_max_seconds_per_slice": 5.0,
         "reconnect_initial_s": 1.0,
-        "reconnect_max_s": 60.0,
-        "log_level": "INFO",
-    }
+    "reconnect_max_s": 60.0,
+    "log_level": "INFO",
+    "runtime_ld_path": "",
+}
     for k, v in defaults.items():
         if k not in cfg:
             cfg[k] = v
