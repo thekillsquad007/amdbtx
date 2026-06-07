@@ -80,7 +80,9 @@ class StratumClient:
         self.host = host
         self.port = port
         self.payout_address = payout_address
-        self.worker_name = worker_name
+        self.operator_worker_name = worker_name
+        self.worker_name = ""
+        self._canonical_worker_name = ""
         self.cfg = cfg or {}
         self.sock: socket.socket | None = None
         self._buf = b""
@@ -127,11 +129,23 @@ class StratumClient:
             raise RuntimeError(f"bad subscribe response: {sub!r}")
         log.info("subscribed; extranonce1=%s en2_size=%d", self._extranonce1[:8], self._extranonce2_size)
 
-        worker = f"{self.payout_address}.{self.worker_name}"
-        ok = self._call("mining.authorize", [worker, ""])
+        # Authorize address-only first. The pool returns a canonical worker name
+        # from hardware metadata; using the operator label here creates an extra
+        # dashboard worker such as "default".
+        ok = self._call("mining.authorize", [self.payout_address, ""])
         if not ok:
-            raise RuntimeError(f"authorize rejected for worker={worker}")
-        log.info("authorized as %s", worker)
+            raise RuntimeError(f"authorize rejected for address={self.payout_address}")
+
+        if self._canonical_worker_name:
+            self.worker_name = self._canonical_worker_name
+            worker = self._worker_for(self.payout_address)
+            ok = self._call("mining.authorize", [worker, ""])
+            if not ok:
+                raise RuntimeError(f"authorize rejected for worker={worker}")
+            log.info("authorized as canonical worker %s", worker)
+        else:
+            self.worker_name = self.operator_worker_name
+            log.info("authorized as %s", self.payout_address)
 
     def _build_solver_env(self) -> dict[str, Any]:
         env: dict[str, Any] = {
@@ -194,7 +208,25 @@ class StratumClient:
                 except (IndexError, TypeError, ValueError):
                     pass
         elif method == "mining.set_canonical_name":
-            log.info("canonical name: %s", msg.get("params"))
+            params = msg.get("params")
+            canonical = self._extract_canonical_name(params)
+            if canonical:
+                self._canonical_worker_name = canonical
+                self.worker_name = canonical
+            log.info("canonical name: %s", params)
+
+    @staticmethod
+    def _extract_canonical_name(params: Any) -> str:
+        if isinstance(params, list) and params:
+            first = params[0]
+            if isinstance(first, dict):
+                return str(first.get("canonical_name", "") or "")
+        if isinstance(params, dict):
+            return str(params.get("canonical_name", "") or "")
+        return ""
+
+    def _worker_for(self, address: str) -> str:
+        return f"{address}.{self.worker_name}" if self.worker_name else address
 
     def _call(self, method: str, params: list) -> Any:
         msg_id = self._next_id()
@@ -210,7 +242,7 @@ class StratumClient:
         raise RuntimeError(f"{method} timed out")
 
     def send_authorize(self, address: str):
-        worker = f"{address}.{self.worker_name}"
+        worker = self._worker_for(address)
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": "mining.authorize", "params": [worker, ""]})
 
@@ -241,7 +273,7 @@ class StratumClient:
                 return job
 
     def submit_share(self, job: Job, result: dict):
-        worker = f"{self.payout_address}.{self.worker_name}"
+        worker = self._worker_for(self.payout_address)
         nonce_hex = f"{result['nonce64']:016x}" if "nonce64" in result else ""
         ntime = f"{job.time:08x}"
         extranonce2 = "00" * self._extranonce2_size
