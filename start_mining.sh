@@ -6,7 +6,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${HOME}/.amdbtx-miner"
 CONFIG_PATH="${INSTALL_DIR}/config.yaml"
 SOLVER_DIR="${HOME}/amdbtx-private-solver"
-SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve"
+SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
 PAYOUT_ADDRESS="${PAYOUT_ADDRESS:-}"
 
 echo "=== 1. Build HIP solver ==="
@@ -17,13 +17,13 @@ if [ -d "${SOLVER_DIR}/src" ]; then
     cmake -S "${SOLVER_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_PREFIX_PATH=/opt/rocm \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_HIP_ARCHITECTURES="gfx803;gfx900;gfx906;gfx90a;gfx1010;gfx1030;gfx1100;gfx1102"
+        -DCMAKE_HIP_ARCHITECTURES="gfx803;gfx900;gfx906;gfx90a;gfx1010;gfx1030;gfx1100;gfx1101;gfx1102"
     cmake --build "${BUILD_DIR}" -j"$(nproc)"
     mkdir -p "${INSTALL_DIR}/bin"
-    cp "${BUILD_DIR}/btx-gbt-solve" "${SOLVER_PATH}"
+    cp "${BUILD_DIR}/btx-gbt-solve-hip" "${SOLVER_PATH}"
     echo "[ok] solver built from source → ${SOLVER_PATH}"
 else
-    SOLVER_URL="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/amdbtx-prebuilds-v1.0}/btx-gbt-solve"
+    SOLVER_URL="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/amdbtx-prebuilds-v1.0}/btx-gbt-solve-hip"
     mkdir -p "${INSTALL_DIR}/bin"
     echo "downloading pre-built solver..."
     curl -fsSL -o "${SOLVER_PATH}" "${SOLVER_URL}"

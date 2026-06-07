@@ -14,7 +14,7 @@ def validate_config(cfg: dict) -> dict:
         "pool_tls": False,
         "payout_address": "",
         "worker_name": "default",
-        "gbt_solve_path": "~/.amdbtx-miner/bin/btx-gbt-solve",
+        "gbt_solve_path": "",
         "solver_backend": "rocm",
         "solver_threads": 8,
         "solver_prepare_workers": 16,

@@ -17,15 +17,21 @@
 
 set -euo pipefail
 
+# Preserve real user's HOME even if run with sudo
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    export HOME="$REAL_HOME"
+fi
+
 # ─── Configurables ──────────────────────────────────────────────────────────
 PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.0}"
 PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/${PREBUILDS_TAG}}"
-SOLVER_NAME="${SOLVER_NAME:-btx-gbt-solve}"
+SOLVER_NAME="${SOLVER_NAME:-btx-gbt-solve-hip}"
 SOLVER_URL="${PREBUILDS_BASE}/${SOLVER_NAME}"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
-SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve"
+SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
 CONFIG_PATH="${INSTALL_DIR}/config.yaml"
 
 DEV_WALLET="btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
@@ -90,10 +96,32 @@ if command -v rocm-smi >/dev/null 2>&1; then
     if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
         HAS_AMD=1
         log "detected AMD GPU: ${GPU_NAME}"
-        # Try to get arch
         GPU_ARCH="$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)"
         if [[ -n "$GPU_ARCH" ]]; then
             log "GPU arch: ${GPU_ARCH}"
+        fi
+    fi
+fi
+if [[ "$HAS_AMD" -eq 0 ]] && command -v rocminfo >/dev/null 2>&1; then
+    if ROCMINFO_OUT=$(rocminfo 2>/dev/null); then
+        GPU_NAME=$(echo "$ROCMINFO_OUT" | awk '
+            /Agent [0-9]/ { mktname=""; devtype=""; }
+            /Marketing Name:/ { sub(/^.*Marketing Name: */, ""); mktname=$0; sub(/ *$/, "", mktname); }
+            /Device Type.*GPU/ { devtype="GPU"; }
+            devtype=="GPU" && mktname!="" { print mktname; devtype=""; exit; }
+        ' || true)
+        GPU_ARCH=$(echo "$ROCMINFO_OUT" | awk '
+            /Agent [0-9]/ { devtype=""; arch=""; }
+            /Device Type.*GPU/ { devtype="GPU"; }
+            /gfx[0-9a-f]+/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]+/); arch=substr($0, RSTART, RLENGTH); }
+            END { print arch; }
+        ' || true)
+        if [[ -n "$GPU_ARCH" ]]; then
+            HAS_AMD=1
+            if [[ -z "$GPU_NAME" || "$GPU_NAME" == *"None"* ]]; then
+                GPU_NAME="AMD-$GPU_ARCH"
+            fi
+            log "detected AMD GPU: ${GPU_NAME} (arch: ${GPU_ARCH})"
         fi
     fi
 fi
@@ -261,7 +289,7 @@ else
         err "failed to download solver binary from GitHub releases
     URL: ${SOLVER_URL}
     Ensure you have a compatible AMD GPU and internet access.
-    You can also provide a local binary: --local-solver /path/to/btx-gbt-solve"
+    You can also provide a local binary: --local-solver /path/to/btx-gbt-solve-hip"
     }
 fi
 
@@ -281,17 +309,18 @@ for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
 resolve_lib() {
     local soname="$1" base="$2" target=""
     for d in "${ROCM_LIB_DIRS[@]}"; do
-        [[ -f "$d/$soname" ]] && { ln -sfn "$d/$soname" "$RUNTIME_DIR/$soname"; log "  $soname -> $d/$soname"; return 0; }
+        [[ -f "$d/$soname" ]] && { ln -sfn "$d/$soname" "$RUNTIME_DIR/$soname"; log " $soname -> $d/$soname"; return 0; }
     done
     for d in "${ROCM_LIB_DIRS[@]}"; do
-        latest=$(find "$d" -maxdepth 1 -name "${base}.so.*" ! -type l 2>/dev/null | sort -V | tail -1 || true)
-        [[ -n "$latest" ]] && { ln -sfn "$latest" "$RUNTIME_DIR/$soname"; log "  $soname -> $(basename $latest) ($d)"; return 0; }
-        if [[ -L "$d/${base}.so" ]]; then
-            real_target=$(readlink -f "$d/${base}.so")
-            [[ -f "$real_target" ]] && { ln -sfn "$real_target" "$RUNTIME_DIR/$soname"; log "  $soname -> $(basename $real_target) ($d)"; return 0; }
+        latest=$(find "$d" -maxdepth 1 -name "${base}.so.*" 2>/dev/null | sort -V | tail -1 || true)
+        if [[ -n "$latest" ]]; then
+            real_file=$(readlink -f "$latest")
+            if [[ -f "$real_file" ]]; then
+                ln -sfn "$real_file" "$RUNTIME_DIR/$soname"; log " $soname -> $(basename $real_file) ($d)"; return 0
+            fi
         fi
     done
-    warn "  $soname: not found in any ROCm installation"
+    warn " $soname: not found in any ROCm installation"
     return 1
 }
 

@@ -102,8 +102,8 @@ python3 -m venv ~/.amdbtx-miner/venv
 # Download assets
 mkdir -p ~/.amdbtx-miner/bin
 PREBUILDS='https://github.com/thekillsquad007/amdbtx/releases/download/amdbtx-prebuilds-v1.0'
-curl -fsSL "`$PREBUILDS/btx-gbt-solve" -o ~/.amdbtx-miner/bin/btx-gbt-solve
-chmod +x ~/.amdbtx-miner/bin/btx-gbt-solve
+curl -fsSL "`$PREBUILDS/btx-gbt-solve-hip" -o ~/.amdbtx-miner/bin/btx-gbt-solve-hip
+chmod +x ~/.amdbtx-miner/bin/btx-gbt-solve-hip
 curl -fsSL "`$PREBUILDS/amdbtx_miner-1.0.0-py3-none-any.whl" -o /tmp/amdbtx_miner.whl
 ~/.amdbtx-miner/venv/bin/pip install --force-reinstall /tmp/amdbtx_miner.whl
 
@@ -113,8 +113,8 @@ ROCM_LIBS=(/opt/rocm/lib)
 for d in /opt/rocm-*/lib; do [[ -d "`$d" ]] && ROCM_LIBS+=("`$d"); done
 RUNTIME_LD=""
 for d in "`${ROCM_LIBS[@]}"; do
-    for f in libamdhip64.so libhipblas.so; do
-        latest=`$(find "`$d" -maxdepth 1 -name "`$f.*" ! -type l 2>/dev/null | sort -V | tail -1)
+    for f in libamdhip64 libhipblas; do
+        latest=`$(find "`$d" -maxdepth 1 -name "`$f.so.*" 2>/dev/null | sort -V | tail -1)
         if [[ -n "`$latest" ]]; then
             soname=`$(echo "`$f" | sed 's/\.so$//').so.`$(echo "`$latest" | grep -oP '\.so\.\K[0-9]+' | head -1)
             ln -sfn "`$latest" ~/.amdbtx-miner/runtime/"`$soname"
@@ -127,13 +127,13 @@ RUNTIME_LD="$HOME/.amdbtx-miner/runtime`$RUNTIME_LD"
 # GPU detection
 GPU_THREADS=8; GPU_WORKERS=16; GPU_BATCH=128; WORKER_NAME="amdgpu-1"
 if command -v rocminfo >/dev/null 2>&1; then
-    if ROCMINFO_OUT=`$(rocminfo 2>/dev/null); then
-        GPU_ARCH=`$(echo "`$ROCMINFO_OUT" | grep -oP 'gfx[0-9a-f]+' | head -1)
-        if [[ -n "`$GPU_ARCH" ]]; then
-            GPU_NAME=`$(echo "`$ROCMINFO_OUT" | grep -B5 "`$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//; s/ /-/g')
-            WORKER_NAME="`${GPU_NAME:-amdgpu}-1"
-        fi
-    fi
+if ROCMINFO_OUT=`$(rocminfo 2>/dev/null); then
+GPU_ARCH=`$(echo "`$ROCMINFO_OUT" | awk '/Agent [0-9]/{devtype=""} /Device Type.*GPU/{devtype="GPU"} /gfx[0-9a-f]+/ && devtype=="GPU" && arch==""{match(`$0,/gfx[0-9a-f]+/);arch=substr(`$0,RSTART,RLENGTH)} END{print arch}')
+GPU_NAME=`$(echo "`$ROCMINFO_OUT" | awk '/Agent [0-9]/{mktname="";devtype=""} /Marketing Name:/{sub(/^.*Marketing Name: */,"");mktname=`$0;sub(/ *$/,"",mktname)} /Device Type.*GPU/{devtype="GPU"} devtype=="GPU" && mktname!=""{print mktname;devtype="";exit}')
+if [[ -n "`$GPU_ARCH" ]]; then
+WORKER_NAME="`${GPU_NAME:-AMD-`$GPU_ARCH}-1"
+fi
+fi
 fi
 
 # Write config
@@ -143,7 +143,7 @@ pool_port: $($Pool -split ':')[1]
 pool_tls: false
 payout_address: "$Address"
 worker_name: "`$WORKER_NAME"
-gbt_solve_path: "`$HOME/.amdbtx-miner/bin/btx-gbt-solve"
+gbt_solve_path: "`$HOME/.amdbtx-miner/bin/btx-gbt-solve-hip"
 solver_backend: "rocm"
 solver_threads: `$GPU_THREADS
 solver_prepare_workers: `$GPU_WORKERS
@@ -193,4 +193,4 @@ echo ""
 echo "Troubleshoot:"
 echo "  Check GPU:   wsl -d $wslDistro -e rocminfo"
 echo "  Check logs:  wsl -d $wslDistro -e tail -f ~/.amdbtx-miner/miner.log"
-echo "  Check libs:  wsl -d $wslDistro -e ldd ~/.amdbtx-miner/bin/btx-gbt-solve"
+echo "  Check libs:  wsl -d $wslDistro -e ldd ~/.amdbtx-miner/bin/btx-gbt-solve-hip"

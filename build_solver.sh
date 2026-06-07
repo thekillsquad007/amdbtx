@@ -4,7 +4,7 @@ set -euo pipefail
 
 SOLVER_SRC="${SOLVER_SRC:-/var/home/bazzite/amdbtx-private-solver}"
 BUILD_DIR="${SOLVER_SRC}/build"
-OUTPUT="${BUILD_DIR}/btx-gbt-solve"
+OUTPUT="${BUILD_DIR}/btx-gbt-solve-hip"
 
 echo "[build] Cleaning old build..."
 rm -rf "${BUILD_DIR}"
@@ -14,7 +14,7 @@ echo "[build] Configuring with CMake..."
 cmake -S "${SOLVER_SRC}" -B "${BUILD_DIR}" \
     -DCMAKE_PREFIX_PATH=/opt/rocm \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_HIP_ARCHITECTURES="gfx803;gfx900;gfx906;gfx90a;gfx1010;gfx1030;gfx1100;gfx1102"
+    -DCMAKE_HIP_ARCHITECTURES="gfx803;gfx900;gfx906;gfx90a;gfx1010;gfx1030;gfx1100;gfx1101;gfx1102"
 
 echo "[build] Building..."
 cmake --build "${BUILD_DIR}" -j"$(nproc)"

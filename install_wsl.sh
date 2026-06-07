@@ -5,11 +5,17 @@
 
 set -euo pipefail
 
+# Preserve real user's HOME even if run with sudo
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    export HOME="$REAL_HOME"
+fi
+
 ADDRESS="${ADDRESS:-}"
 WORKER="${WORKER:-}"
 POOL="${POOL:-stratum.minebtx.com:3333}"
 INSTALL_DIR="${HOME}/.amdbtx-miner"
-SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve"
+SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
 CONFIG_PATH="${INSTALL_DIR}/config.yaml"
 RUNTIME_DIR="${INSTALL_DIR}/runtime"
 
@@ -103,14 +109,27 @@ GPU_QUERY_CMD=""
 
 if command -v rocm-smi >/dev/null 2>&1; then
     GPU_QUERY_CMD="rocm-smi"
-    GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | grep -oP '\S+.*' | head -1 | sed 's/ *$//; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
     GPU_ARCH=$(rocm-smi --showid 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
+    GPU_NAME=$(rocm-smi --showproductname 2>/dev/null | grep -i 'Card\|product' | head -1 | sed 's/.*: *//; s/ *(TM)//; s/ *(R)//; s/ *$//' || true)
 elif command -v rocminfo >/dev/null 2>&1; then
     if ROCMINFO_OUT=$(rocminfo 2>/dev/null); then
         GPU_QUERY_CMD="rocminfo"
-        GPU_ARCH=$(echo "$ROCMINFO_OUT" | grep -oP 'gfx[0-9a-f]+' | head -1 || true)
-        if [[ -n "$GPU_ARCH" ]]; then
-            GPU_NAME=$(echo "$ROCMINFO_OUT" | grep -B5 "$GPU_ARCH" | grep "Name:" | head -1 | sed 's/.*Name:[ \t]*//; s/ (TM)//; s/ (R)//; s/ /-/g' || true)
+        GPU_NAME=$(echo "$ROCMINFO_OUT" | awk '
+            /Agent [0-9]/ { mktname=""; devtype=""; }
+            /Marketing Name:/ { sub(/^.*Marketing Name: */, ""); mktname=$0; sub(/ *$/, "", mktname); }
+            /Device Type.*GPU/ { devtype="GPU"; }
+            devtype=="GPU" && mktname!="" { print mktname; devtype=""; exit; }
+        ' || true)
+        GPU_ARCH=$(echo "$ROCMINFO_OUT" | awk '
+            /Agent [0-9]/ { devtype=""; arch=""; }
+            /Device Type.*GPU/ { devtype="GPU"; }
+            /gfx[0-9a-f]+/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]+/); arch=substr($0, RSTART, RLENGTH); }
+            END { print arch; }
+        ' || true)
+        if [[ -z "$GPU_NAME" || "$GPU_NAME" == *"None"* ]]; then
+            if [[ -n "$GPU_ARCH" ]]; then
+                GPU_NAME="AMD-$GPU_ARCH"
+            fi
         fi
     fi
 fi
@@ -146,14 +165,12 @@ log "Building solver runtime..."
 
 mkdir -p "$RUNTIME_DIR"
 
-# Solver expected sonames -> search pattern in installed ROCm
+# Solver expected sonames -> base name for search (WITHOUT .so prefix)
 declare -A SOLVER_LIBS=(
-    ["libamdhip64.so.6"]="libamdhip64.so"
-    ["libhipblas.so.2"]="libhipblas.so"
+    ["libamdhip64.so.6"]="libamdhip64"
 )
 
-# Also find transitive deps of hipblas (rocblas, rocsolver)
-# These are loaded at runtime by the hipblas library
+# Also find transitive ROCm deps loaded at runtime.
 declare -A TRANSITIVE_LIBS=()
 
 resolve_lib() {
@@ -169,39 +186,29 @@ resolve_lib() {
         fi
     done
 
-    # 2. Find latest versioned .so in any ROCm lib dir and symlink
-    if [[ -z "$target" ]]; then
-        for d in "${ROCM_LIB_DIRS[@]}"; do
-            # Find the real .so file (not a symlink) with the highest version
-            latest=$(find "$d" -maxdepth 1 -name "${base}.so.*" ! -type l 2>/dev/null | sort -V | tail -1 || true)
-            if [[ -n "$latest" ]]; then
-                ln -sfn "$latest" "$RUNTIME_DIR/$soname"
-                log "  $soname -> $(basename $latest) (from $d)"
-                # Check transitive deps of this library
-                check_transitive_deps "$latest"
-                return 0
-            fi
-            # Also check for unversioned symlink pointing to a versioned file
-            if [[ -L "$d/${base}.so" ]]; then
-                real_target=$(readlink -f "$d/${base}.so")
-                if [[ -f "$real_target" ]]; then
-                    ln -sfn "$real_target" "$RUNTIME_DIR/$soname"
-                    log "  $soname -> $(basename $real_target) (from $d)"
-                    check_transitive_deps "$real_target"
-                    return 0
-                fi
-            fi
-        done
-    fi
-
     if [[ -n "$target" ]]; then
         ln -sfn "$target" "$RUNTIME_DIR/$soname"
-        log "  $soname -> $target (direct)"
+        log " $soname -> $target (direct)"
         check_transitive_deps "$target"
         return 0
     fi
 
-    warn "  $soname: not found in any ROCm installation"
+    # 2. Find any versioned .so.N in any ROCm lib dir and symlink
+    for d in "${ROCM_LIB_DIRS[@]}"; do
+        # Find highest-versioned .so.N file (symlinks OK, we resolve them)
+        latest=$(find "$d" -maxdepth 1 -name "${base}.so.*" 2>/dev/null | sort -V | tail -1 || true)
+        if [[ -n "$latest" ]]; then
+            real_file=$(readlink -f "$latest")
+            if [[ -f "$real_file" ]]; then
+                ln -sfn "$real_file" "$RUNTIME_DIR/$soname"
+                log " $soname -> $(basename $real_file) (from $d)"
+                check_transitive_deps "$real_file"
+                return 0
+            fi
+        fi
+    done
+
+    warn " $soname: not found in any ROCm installation"
     return 1
 }
 
@@ -214,7 +221,7 @@ check_transitive_deps() {
             continue
         fi
         # Get base name (e.g., librocblas.so from librocblas.so.5)
-        base="${dep%%.so*}.so"
+        base="${dep%%.so*}"
         TRANSITIVE_LIBS["$dep"]="$base"
     done
 }
@@ -262,7 +269,7 @@ mkdir -p "${INSTALL_DIR}/bin"
 PREBUILDS="https://github.com/thekillsquad007/amdbtx/releases/download/amdbtx-prebuilds-v1.0"
 
 log "Downloading solver binary..."
-curl -fsSL "${PREBUILDS}/btx-gbt-solve" -o "$SOLVER_PATH"
+curl -fsSL "${PREBUILDS}/btx-gbt-solve-hip" -o "$SOLVER_PATH"
 chmod +x "$SOLVER_PATH"
 
 log "Verifying solver libraries..."
@@ -344,8 +351,22 @@ python3 -m venv "${INSTALL_DIR}/venv"
 
 log "Downloading Python wheel..."
 WHEEL="${INSTALL_DIR}/amdbtx_miner-1.0.0-py3-none-any.whl"
-curl -fsSL "${PREBUILDS}/amdbtx_miner-1.0.0-py3-none-any.whl" -o "$WHEEL"
-"${INSTALL_DIR}/venv/bin/pip" install --force-reinstall "$WHEEL"
+mkdir -p "$INSTALL_DIR"
+curl -fsSL "${PREBUILDS}/amdbtx_miner-1.0.0-py3-none-any.whl" -o "$WHEEL" || {
+    err "Failed to download Python wheel"
+    err "The wheel may not exist at $PREBUILDS yet"
+    err "Installing from local source instead..."
+    if [[ -f "/mnt/e/Business/amdbtx/pyproject.toml" ]]; then
+        "${INSTALL_DIR}/venv/bin/pip" install --force-reinstall "/mnt/e/Business/amdbtx" 2>&1 || \
+            err "Local install also failed"
+    else
+        err "No local source found. Build and upload the wheel first."
+    fi
+    WHEEL=""
+}
+if [[ -n "$WHEEL" && -f "$WHEEL" ]]; then
+    "${INSTALL_DIR}/venv/bin/pip" install --force-reinstall "$WHEEL"
+fi
 
 # ──────────────────────────────────────────────────────
 # 7. Environment persistence
@@ -365,7 +386,9 @@ ENVEOF
 WORKER_NAME="${WORKER:-}"
 if [[ -z "$WORKER_NAME" ]]; then
     if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
-        WORKER_NAME="${GPU_NAME}-1"
+        # Clean name: replace spaces with dashes, strip special chars
+        CLEAN_NAME=$(echo "$GPU_NAME" | tr -s ' ' '-' | tr -cd 'a-zA-Z0-9.-')
+        WORKER_NAME="${CLEAN_NAME}-1"
     elif [[ -n "$GPU_ARCH" ]]; then
         WORKER_NAME="${GPU_ARCH}-1"
     else
@@ -402,8 +425,14 @@ EOF
 # ──────────────────────────────────────────────────────
 log "Running auto-benchmark (~2 minutes, finds optimal solver config)..."
 LD_LIBRARY_PATH="$RUNTIME_LD_PATH" \
-    "${INSTALL_DIR}/venv/bin/amdbtx-miner" --config "$CONFIG_PATH" --benchmark 2>&1 || \
+    HSA_ENABLE_DXG_DETECTION=1 \
+    "${INSTALL_DIR}/venv/bin/python3" -m amdbtx_miner --config "$CONFIG_PATH" --benchmark 2>&1 || \
     warn "Benchmark failed - using default tuning for $GPU_ARCH"
+
+# Fix ownership if run with sudo
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    chown -R "$SUDO_USER:$SUDO_USER" "$INSTALL_DIR" 2>/dev/null || true
+fi
 
 # ──────────────────────────────────────────────────────
 # 10. Summary

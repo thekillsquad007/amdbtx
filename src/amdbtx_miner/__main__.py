@@ -27,6 +27,18 @@ USER_SLICE_S = 58 * 60
 log = logging.getLogger("amdbtx_miner")
 
 
+def resolve_solver_path(configured_path: str = "") -> Path:
+    if configured_path:
+        return Path(configured_path).expanduser()
+
+    solver_bin_dir = Path.home() / ".amdbtx-miner" / "bin"
+    for name in ["btx-gbt-solve-hip", "btx-gbt-solve"]:
+        candidate = solver_bin_dir / name
+        if candidate.exists():
+            return candidate
+    return solver_bin_dir / "btx-gbt-solve-hip"
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="AMD BTX Miner")
     p.add_argument("--config", default=str(Path.home() / ".amdbtx-miner" / "config.yaml"))
@@ -45,7 +57,7 @@ def parse_args():
 def run_benchmark(cfg: dict, config_path: str = ""):
     import yaml
 
-    solver_path = Path(cfg.get("gbt_solve_path", "~/.amdbtx-miner/bin/btx-gbt-solve")).expanduser()
+    solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
     if not solver_path.exists():
         print(f"[ERROR] Solver not found at {solver_path}")
         return
@@ -169,8 +181,9 @@ def run_miner():
     else:
         log.warning("No AMD GPU detected — solver will likely fail with backend=rocm")
 
+    solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
     solver = GBTSolveWrapper(
-        solver_path=cfg.get("gbt_solve_path", "~/.amdbtx-miner/bin/btx-gbt-solve"),
+        solver_path=str(solver_path),
         backend=cfg.get("solver_backend", "rocm"),
         threads=cfg.get("solver_threads", 8),
         prepare_workers=cfg.get("solver_prepare_workers", 16),
@@ -210,12 +223,16 @@ def run_miner():
     max_seconds_per_slice = cfg.get("solver_max_seconds_per_slice", 5.0)
 
     current_job = None
+    log_interval = 30
+    last_log = 0
     while True:
         try:
             if current_job is None:
                 current_job = stratum.get_job()
-                log.info("new job=%s height=%d nonce_start=%d",
-                         current_job.job_id, current_job.block_height, current_job.nonce64_start)
+                log.info("new job=%s height=%d nonce_start=%d target=%s bits=%s",
+                         current_job.job_id, current_job.block_height, current_job.nonce64_start,
+                         current_job.target[:16] if current_job.target else "none",
+                         current_job.bits)
 
             check_dev_fee()
 
@@ -227,10 +244,43 @@ def run_miner():
             )
 
             if result.get("found"):
+                log.info("FOUND! nonce=%d digest=%s target=%s is_block=%s",
+                         result.get("nonce64"), result.get("digest", "")[:16],
+                         current_job.target[:16] if current_job.target else "none",
+                         result.get("is_block"))
                 stratum.submit_share(current_job, result)
+
+            now = time.time()
+            tries = result.get("tries_used", 0)
+            elapsed = result.get("elapsed_s", 0)
+            khps = tries / elapsed / 1000 if elapsed > 0 else 0
+            if now - last_log >= log_interval or result.get("found"):
+                log.info("solve: nonce=%d tries=%d elapsed=%.2fs khps=%.0f found=%s",
+                         current_job.nonce64_start, tries, elapsed, khps, result.get("found"))
+                last_log = now
 
             if stratum._current_job is not None:
                 log.info("job changed during solve, switching to %s", stratum._current_job.job_id)
+                current_job = stratum._current_job
+                stratum._current_job = None
+                continue
+
+            if stratum.sock:
+                try:
+                    stratum.sock.setblocking(False)
+                    try:
+                        while True:
+                            msg = stratum._recv()
+                            stratum._handle_server_message(msg)
+                    except (BlockingIOError, ConnectionError):
+                        pass
+                    finally:
+                        stratum.sock.setblocking(True)
+                except Exception:
+                    pass
+
+            if stratum._current_job is not None:
+                log.info("new job from poll: %s", stratum._current_job.job_id)
                 current_job = stratum._current_job
                 stratum._current_job = None
                 continue

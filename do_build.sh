@@ -23,7 +23,7 @@ echo "Wheel: ${WHEEL_PATH}"
 # ── 2. Solver binary (via distrobox) ───────────────────────────────
 echo "=== Step 2: Build HIP solver in distrobox ==="
 distrobox enter "${DISTROBOX}" -- bash /var/home/bazzite/amdbtx/build_solver.sh
-SOLVER_BINARY="${SOLVER_SRC}/build/btx-gbt-solve"
+SOLVER_BINARY="${SOLVER_SRC}/build/btx-gbt-solve-hip"
 if [ ! -f "${SOLVER_BINARY}" ]; then
     echo "ERROR: solver binary not found at ${SOLVER_BINARY}"
     exit 1
@@ -39,7 +39,7 @@ echo
 # Delete old assets
 echo "Fetching existing assets..."
 ASSETS=$(curl -s -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets")
-for name in "btx-gbt-solve" "amdbtx_miner-1.0.0-py3-none-any.whl"; do
+for name in "btx-gbt-solve-hip" "amdbtx_miner-1.0.0-py3-none-any.whl"; do
     asset_id=$(echo "${ASSETS}" | jq -r ".[] | select(.name==\"${name}\") | .id")
     if [ -n "${asset_id}" ]; then
         echo "Deleting old ${name} (asset ${asset_id})..."
@@ -60,7 +60,7 @@ echo "Uploading solver..."
 curl -s -X POST \
     -H "Authorization: token ${GH_TOKEN}" \
     -H "Content-Type: application/octet-stream" \
-    "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=btx-gbt-solve" \
+    "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=btx-gbt-solve-hip" \
     --data-binary @"${SOLVER_BINARY}" | jq '{state: .state, name: .name, size: .size}'
 
 echo ""

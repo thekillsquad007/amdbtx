@@ -178,7 +178,7 @@ pool_host: "stratum.minebtx.com"
 pool_port: 3333
 payout_address: "btx1z..."
 worker_name: "7800XT-ALPHA-1"
-gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve"
+gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve-hip"
 solver_backend: "rocm"     # "rocm" or "cpu"
 solver_threads: 8
 solver_prepare_workers: 16
@@ -226,7 +226,7 @@ Required if the pre-built binary doesn't support your GPU:
 bash build_solver.sh
 ```
 
-Output: `amdbtx-private-solver/build/btx-gbt-solve`.
+Output: `amdbtx-private-solver/build/btx-gbt-solve-hip`.
 
 Point `gbt_solve_path` in config to this path and re-launch.
 

@@ -6,7 +6,7 @@ pool_tls: false
 payout_address: "btx1z...YOUR_BTX_ADDRESS_HERE..."
 worker_name: "default"
 
-gbt_solve_path: "~/.amdbtx-miner/bin/btx-gbt-solve"
+gbt_solve_path: ""
 
 # Solver tuning for AMD GPUs
 solver_backend: "rocm"

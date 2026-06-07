@@ -66,7 +66,14 @@ class GBTSolveWrapper:
         env["BTX_MATMUL_PIPELINE_ASYNC"] = str(self.pipeline_async)
         env["BTX_MATMUL_GPU_INPUTS"] = str(self.gpu_inputs)
 
-        cmd = [str(self.solver_path), "--daemon"]
+        backend_arg = "hip" if self.backend in ("rocm", "hip") else self.backend
+        cmd = [
+            str(self.solver_path),
+            "--daemon",
+            "--backend", backend_arg,
+            "--batch-size", str(self.batch_size),
+            "--epsilon-bits", "18",
+        ]
         try:
             self.proc = subprocess.Popen(
                 cmd,
