@@ -168,18 +168,25 @@ fi
 log "using Python: $($PYTHON --version 2>&1)"
 
 # ─── Install ROCm (if missing) ─────────────────────────────────────────────
+ROCM_LIB_PRESENT=0
+if find /opt/rocm /opt/rocm-* -maxdepth 2 -name 'libamdhip64.so*' -print -quit 2>/dev/null | grep -q .; then
+    ROCM_LIB_PRESENT=1
+fi
+
 if [[ "$SKIP_ROCM" -eq 1 ]]; then
     log "skipping ROCm installation (--skip-rocm)"
+elif [[ "$ROCM_LIB_PRESENT" -eq 1 ]]; then
+    log "ROCm runtime libraries detected under /opt; skipping package installation"
 elif ! command -v rocm-smi >/dev/null 2>&1; then
-    log "ROCm not detected. Installing ROCm 6.x..."
+    UBUNTU_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
+    ROCM_REPO_VER=$([[ "$UBUNTU_CODENAME" == "noble" ]] && echo "7.2" || echo "6.0")
+    log "ROCm not detected. Installing ROCm ${ROCM_REPO_VER} packages..."
     if command -v apt-get >/dev/null 2>&1; then
         sudo apt-get update -qq || true
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget gnupg2 curl || true
 
-        # Use trusted=yes to bypass GPG verification issues in containers
-        # This is acceptable for the known-good AMD ROCm repo
         log "adding ROCm repo..."
-        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/6.0 jammy main" | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
+        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
 
         # Remove stale ROCm 5.x sources if any
         for old in /etc/apt/sources.list.d/rocm*.list; do
@@ -189,46 +196,18 @@ elif ! command -v rocm-smi >/dev/null 2>&1; then
         log "updating package lists..."
         sudo apt-get update -qq 2>&1 | grep -v "Warning:" || true
 
-        # If old ROCm 5.x packages are installed, they'll conflict with 6.x — purge first
-        OLD_ROCM_COUNT=$(dpkg -l 2>/dev/null | grep -cE 'rocm-cmake|rocm-device-libs|rocminfo' 2>/dev/null || true)
-        OLD_ROCM_COUNT="${OLD_ROCM_COUNT//[^0-9]/}"
-        OLD_ROCM_COUNT="${OLD_ROCM_COUNT:-0}"
-        if [[ "$OLD_ROCM_COUNT" -gt 0 ]]; then
-            log "detected old ROCm packages — purging to avoid version conflicts..."
-            # Try graceful purge first
-            sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq \
-                rocm-cmake rocm-device-libs rocminfo rocm-core rocm-utils 2>/dev/null || true
-            # Force-remove if dpkg is in broken state
-            sudo dpkg --purge --force-depends rocm-cmake rocm-device-libs rocminfo rocm-core 2>/dev/null || true
-            # Also remove any held packages that block installation
-            sudo dpkg --configure -a 2>/dev/null || true
-            sudo apt-get autoremove -y -qq 2>/dev/null || true
-            # Force-remove held packages
-            sudo apt-get -o Dpkg::Options::="--force-remove-reinstreq" purge -y \
-                rocm-cmake rocm-device-libs rocminfo rocm-core rocm-utils 2>/dev/null || true
-            sudo dpkg --configure -a 2>/dev/null || true
-            sudo apt-get update -qq 2>&1 | grep -v "Warning:" || true
+        # Install only the runtime needed by the pre-built miner. Full rocm-dev
+        # pulls compiler/debugger packages that conflict on WSL/Noble.
+        log "installing ROCm runtime packages (may take several minutes)..."
+        if [[ "$ROCM_REPO_VER" == "7.2" ]]; then
+            RUNTIME_PACKAGES=(hip-runtime-amd rocminfo)
+        else
+            RUNTIME_PACKAGES=(rocm-hip-runtime rocminfo)
         fi
-
-        # Install ROCm packages
-        log "installing ROCm packages (may take several minutes)..."
-        if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            rocm-dev rocm-hip-runtime hipblas hipsolver 2>&1 | tail -10; then
-            warn "ROCm full install failed — diagnosing..."
-            # Show exactly what's broken
-            sudo apt-get install -y rocm-dev 2>&1 | grep -E "Depends:|not going|broken|held" | head -10 >&2
-            # Try to fix held packages
-            log "attempting to fix held packages..."
-            sudo dpkg --configure -a 2>/dev/null || true
-            sudo apt-get -f install -y 2>/dev/null || true
-            # Try installing just the minimal HIP runtime
-            log "trying minimal ROCm install..."
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-                rocm-hip-runtime 2>&1 | tail -5 || {
-                    warn "minimal install also failed"
-                    warn "run inside container: sudo apt-get install -y rocm-hip-runtime"
-                    warn "if that fails, check: apt-cache policy rocm-hip-runtime"
-                }
+        if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${RUNTIME_PACKAGES[@]}" 2>&1 | tail -10; then
+            warn "ROCm runtime install failed — diagnosing..."
+            sudo apt-get install -y "${RUNTIME_PACKAGES[@]}" 2>&1 | grep -E "Depends:|not going|broken|held|not installable" | head -10 >&2 || true
+            warn "install ROCm runtime manually, then rerun with --skip-rocm"
         fi
 
         # Add to PATH
@@ -436,9 +415,9 @@ reconnect_max_s: 60.0
 # Mines with your address 98% of the time, dev wallet 2%.
 # All switches logged at INFO level.
 
- log_level: "INFO"
+log_level: "INFO"
 
- runtime_ld_path: "${RUNTIME_LD_PATH}"
+runtime_ld_path: "${RUNTIME_LD_PATH}"
 YAML
     log "config written → $CONFIG_PATH"
 fi
