@@ -14,35 +14,32 @@ ROCm/HIP. Provides a HIP solver binary and a Python stratum wrapper.
 
 ### Linux (Native Ubuntu 22.04+)
 
-One-liner install (downloads pre-built binaries):
+Copy/paste this, replacing `btx1z...YOUR_ADDRESS` with your BTX address:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --yes
 ```
 
 Launch:
 
 ```bash
-amdbtx-miner
+amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
 ### Windows (WSL2 with AMD GPU)
 
 > **Requires**: Windows 11 with WSL2, AMD GPU (RDNA 2+ recommended).
 
+Download this repo, open PowerShell in the folder, then run:
+
 ```powershell
-# 1. Install WSL2 with Ubuntu
-wsl --install -d Ubuntu-22.04
+.\install_amd.ps1 -Address "btx1z...YOUR_ADDRESS"
+```
 
-# 2. Enable AMD GPU detection (required!)
-$env:HSA_ENABLE_DXG_DETECTION=1
-# Or add permanently: System Properties > Environment Variables
+Launch after install:
 
-# 3. Run the Windows installer
-.\install_amd.ps1 -Address "btx1z..."
-
-# 4. Launch miner
-wsl -d Ubuntu-22.04 -e amdbtx-miner
+```powershell
+wsl -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
 ---
@@ -60,7 +57,7 @@ wsl -d Ubuntu-22.04 -e amdbtx-miner
 #### Option A: One-liner (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --worker myrig
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --worker myrig --yes
 ```
 
 #### Option B: From source
@@ -104,28 +101,24 @@ wsl --install -d Ubuntu-22.04
 
 Download and install the latest AMD Adrenalin driver from [AMD.com](https://www.amd.com/en/support).
 
-**3. Enable AMD GPU detection in WSL**
+**3. Run the installer**
+
+The installer sets `HSA_ENABLE_DXG_DETECTION=1`, installs the WSL/Linux pieces, writes config, and downloads the fixed prebuilt solver.
 
 ```powershell
-# Set environment variable (temporary)
-$env:HSA_ENABLE_DXG_DETECTION=1
-
-# OR set permanently (recommended):
-# System Properties > Advanced > Environment Variables
-# Add: HSA_ENABLE_DXG_DETECTION=1
+.\install_amd.ps1 -Address "btx1z...YOUR_ADDRESS" -Worker "myrig"
 ```
 
-**4. Clone and install**
+**4. Launch the miner**
 
 ```powershell
-cd E:\Business\amdbtx
-.\install_amd.ps1 -Address "btx1z..." -Worker "myrig"
+wsl -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
-**5. Launch the miner**
+If you have multiple Ubuntu distros, use the distro name printed by the installer:
 
 ```powershell
-wsl -d Ubuntu-22.04 -e amdbtx-miner
+wsl -d Ubuntu-22.04 -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
 Or for persistent mining (via tmux inside WSL):

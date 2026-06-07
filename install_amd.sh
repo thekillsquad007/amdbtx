@@ -33,6 +33,8 @@ DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 INSTALL_DIR="${HOME}/.amdbtx-miner"
 SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
 CONFIG_PATH="${INSTALL_DIR}/config.yaml"
+VENV_DIR="${INSTALL_DIR}/venv"
+LAUNCHER_PATH="${HOME}/.local/bin/amdbtx-miner"
 
 DEV_WALLET="btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
 
@@ -228,14 +230,15 @@ elif ! command -v rocm-smi >/dev/null 2>&1; then
 fi
 
 # ─── Install pip + runtime deps ──────────────────────────────────────────────
-if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
-    log "python pip not present; installing via apt..."
+if ! "$PYTHON" -m venv --help >/dev/null 2>&1; then
+    log "python venv support not present; installing via apt..."
     sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pip
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip
 fi
 
-log "installing runtime deps (pyyaml)..."
-"$PYTHON" -m pip install --user --quiet --upgrade pyyaml
+log "creating private Python environment..."
+"$PYTHON" -m venv "$VENV_DIR"
+"$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip wheel pyyaml
 
 # ─── Fetch pre-built Python package + solver binary from releases ───────────
 mkdir -p "${INSTALL_DIR}/bin"
@@ -251,7 +254,13 @@ else
     log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
     WHEEL_URL="${PREBUILDS_BASE}/${WHEEL_FILENAME}"
     curl -fsSL "$WHEEL_URL" -o "$TMP_WHEEL" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
-    "$PYTHON" -m pip install --user --upgrade "$TMP_WHEEL" 2>&1 | tail -3
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$TMP_WHEEL"
+    mkdir -p "$(dirname "$LAUNCHER_PATH")"
+    cat > "$LAUNCHER_PATH" <<EOF
+#!/usr/bin/env bash
+exec "$VENV_DIR/bin/amdbtx-miner" "\$@"
+EOF
+    chmod +x "$LAUNCHER_PATH"
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) : ;;
         *) warn "add to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
@@ -347,6 +356,18 @@ else
     log "all solver libraries resolved"
 fi
 
+# If rocm-smi/rocminfo was unavailable before installation, use the solver's
+# own HIP startup line as a final GPU detection fallback.
+if [[ "$HAS_AMD" -eq 0 ]]; then
+    SOLVER_PROBE="$(printf '%s\n' '{"version":536870912,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","time":1779672814,"bits":"1d17c609","seed_a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seed_b":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_height":1,"nonce_start":0,"max_tries":1,"max_seconds":1,"share_target":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" HSA_ENABLE_DXG_DETECTION=1 "$SOLVER_PATH" --daemon --backend hip --epsilon-bits 0 --batch-size 1 2>&1 | head -3 || true)"
+    if echo "$SOLVER_PROBE" | grep -q 'HIP GPU detected:'; then
+        HAS_AMD=1
+        GPU_NAME="$(echo "$SOLVER_PROBE" | sed -nE 's/^HIP GPU detected: (.*) arch=(gfx[0-9a-f]+) memory=.*/\1/p' | head -1)"
+        GPU_ARCH="$(echo "$SOLVER_PROBE" | grep -oE 'gfx[0-9a-f]+' | head -1)"
+        log "detected AMD GPU via solver: ${GPU_NAME:-AMD GPU} ${GPU_ARCH:+(arch: $GPU_ARCH)}"
+    fi
+fi
+
 # ─── Config ─────────────────────────────────────────────────────────────────
 if [[ -z "$ADDRESS" && "$SKIP_PROMPT" -eq 0 ]]; then
     echo
@@ -418,6 +439,7 @@ reconnect_max_s: 60.0
 log_level: "INFO"
 
 runtime_ld_path: "${RUNTIME_LD_PATH}"
+venv_path: "${VENV_DIR}"
 YAML
     log "config written → $CONFIG_PATH"
 fi
@@ -432,17 +454,9 @@ if [[ "$HAS_AMD" -eq 1 ]]; then
         warn "Try: export LD_LIBRARY_PATH=/opt/rocm/lib:\$LD_LIBRARY_PATH"
     fi
     
-    SMOKE_OUT="$("$SOLVER_PATH" \
-        --version 536870912 \
-        --prev-hash 0ab38fdff2ef667dcddac7f50c3696080c26697615f7b6b9af5c3a1ba0a5fb7e \
-        --merkle-root d906f02ed11d8936770423263b56c5ffe1ea1b15c8a2867afb161adb6fd76eb7 \
-        --time 1779672814 --bits 0x1d17c609 \
-        --share-target 00ffffff00000000000000000000000000000000000000000000000000000000 \
-        --seed-a 8460daf3ff446cc55a7115de88ee24c8a2bf182eedde43abb9cf4cc94cc209bf \
-        --seed-b 7f2e377616feb92d2e9857cab390595b7d6b8d24373a2da394f8d97197b5f437 \
-        --block-height 110806 --nonce-start 1 \
-        --max-tries 200000 --max-seconds 30 \
-        --backend hip --solver-threads ${GPU_THREADS} --batch-size ${GPU_BATCH} 2>&1 || true)"
+    SMOKE_JOB='{"version":536870912,"prev_hash":"0ab38fdff2ef667dcddac7f50c3696080c26697615f7b6b9af5c3a1ba0a5fb7e","merkle_root":"d906f02ed11d8936770423263b56c5ffe1ea1b15c8a2867afb161adb6fd76eb7","time":1779672814,"bits":"1d17c609","seed_a":"8460daf3ff446cc55a7115de88ee24c8a2bf182eedde43abb9cf4cc94cc209bf","seed_b":"7f2e377616feb92d2e9857cab390595b7d6b8d24373a2da394f8d97197b5f437","block_height":110806,"nonce_start":1,"max_tries":200000,"max_seconds":30,"share_target":"00ffffff00000000000000000000000000000000000000000000000000000000"}'
+    SMOKE_OUT="$(printf '%s\n' "$SMOKE_JOB" | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" "$SOLVER_PATH" \
+        --daemon --backend hip --epsilon-bits 18 --batch-size ${GPU_BATCH} 2>&1 || true)"
     SMOKE_LAST_LINE="$(echo "$SMOKE_OUT" | grep -E '^\{.*\}$' | tail -1)"
     if [[ -z "$SMOKE_LAST_LINE" ]]; then
         warn "GPU smoke test: solver produced no JSON output."

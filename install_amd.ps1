@@ -78,9 +78,8 @@ $installArgs += " --pool `"$Pool`""
 if (Test-Path $installWslSh) {
     # Use the WSL install script directly
     Log "Running install_wsl.sh inside WSL..."
-    $repoPath = $scriptDir -replace '\\', '/' -replace '^([A-Za-z]):', '/mnt/$1L'
-    $repoPath = $repoPath -replace '([A-Z]):', { "/mnt/$($_.Groups[1].Value.ToLower())" }
-    $repoPath = $repoPath -replace '\\', '/'
+    $repoPath = (wsl -d $wslDistro wslpath -a $scriptDir 2>$null | Select-Object -First 1).Trim()
+    if (-not $repoPath) { Err "Could not map Windows path to WSL path: $scriptDir" }
 
     $wslCmd = "cd '$repoPath' && bash install_wsl.sh $installArgs"
     wsl -d $wslDistro bash -c $wslCmd

@@ -45,6 +45,16 @@ fi
 log "AMD BTX Miner - WSL setup"
 log "========================="
 
+if [[ -f "$(dirname "$0")/install_amd.sh" ]]; then
+    export HSA_ENABLE_DXG_DETECTION=1
+    args=(--address "$ADDRESS" --pool "$POOL" --yes)
+    if [[ -n "$WORKER" ]]; then
+        args+=(--worker "$WORKER")
+    fi
+    log "Using unified Linux installer inside WSL..."
+    exec bash "$(dirname "$0")/install_amd.sh" "${args[@]}"
+fi
+
 # ──────────────────────────────────────────────────────
 # 1. WSL GPU passthrough check
 # ──────────────────────────────────────────────────────

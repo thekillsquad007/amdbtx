@@ -240,6 +240,49 @@ def _probe_active_backend(solver_path: str | None) -> dict[str, Any]:
     return result
 
 
+def _probe_solver_gpu(solver_path: str | None) -> dict[str, Any] | None:
+    if not solver_path or not os.path.isfile(solver_path):
+        return None
+    env = {**os.environ, "HSA_ENABLE_DXG_DETECTION": "1"}
+    ld_parts = [str(Path.home() / ".amdbtx-miner" / "runtime"), "/opt/rocm/lib"]
+    ld_parts.extend(str(d) for d in sorted(Path("/opt").glob("rocm-*/lib")))
+    existing_ld = env.get("LD_LIBRARY_PATH", "")
+    if existing_ld:
+        ld_parts.extend(p for p in existing_ld.split(":") if p)
+    env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in ld_parts if os.path.isdir(p)))
+    try:
+        proc = subprocess.Popen(
+            [solver_path, "--daemon", "--backend", "hip", "--batch-size", "1", "--epsilon-bits", "0"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            line = proc.stderr.readline() if proc.stderr else ""
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    m = re.search(r"HIP GPU detected:\s*(.*?)\s+arch=(gfx[0-9a-f]+)\s+memory=(\d+)MB", line)
+    if not m:
+        return None
+    return {
+        "model": m.group(1).strip() or "AMD GPU",
+        "vram_gb": round(int(m.group(3)) / 1024, 2),
+        "compute_capability": m.group(2),
+        "gpu_uuid": f"amdgpu-{m.group(2)}",
+        "pcie_link": None,
+    }
+
+
 def collect_static_hardware(
     miner_version: str,
     cpu_threads_allocated: int | None = None,
@@ -247,6 +290,10 @@ def collect_static_hardware(
     solver_path: str | None = None,
 ) -> dict[str, Any]:
     gpus = _enumerate_amd_gpus()
+    if not gpus:
+        solver_gpu = _probe_solver_gpu(solver_path)
+        if solver_gpu:
+            gpus = [solver_gpu]
     env = _detect_environment()
     backend = _probe_active_backend(solver_path)
     out = {
@@ -273,9 +320,13 @@ def collect_static_hardware(
     return out
 
 
-def detect_gpu_info() -> dict:
+def detect_gpu_info(solver_path: str | None = None) -> dict:
     info = {"gpu_detected": False, "gpu_name": "", "gpu_arch": ""}
     gpus = _enumerate_amd_gpus()
+    if not gpus:
+        solver_gpu = _probe_solver_gpu(solver_path)
+        if solver_gpu:
+            gpus = [solver_gpu]
     if gpus:
         info["gpu_detected"] = True
         info["gpu_name"] = gpus[0].get("model", "")

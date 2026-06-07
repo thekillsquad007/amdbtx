@@ -175,13 +175,14 @@ def run_miner():
         log.error("payout_address is required. Use --payout-address or set in config.yaml")
         sys.exit(1)
 
-    gpu_info = detect_gpu_info()
+    solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
+
+    gpu_info = detect_gpu_info(str(solver_path))
     if gpu_info["gpu_detected"]:
         log.info("GPU: %s (arch: %s)", gpu_info["gpu_name"], gpu_info["gpu_arch"])
     else:
         log.warning("No AMD GPU detected — solver will likely fail with backend=rocm")
 
-    solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
     solver = GBTSolveWrapper(
         solver_path=str(solver_path),
         backend=cfg.get("solver_backend", "rocm"),
@@ -244,6 +245,27 @@ def run_miner():
             )
 
             if result.get("found"):
+                if stratum.sock:
+                    try:
+                        stratum.sock.setblocking(False)
+                        try:
+                            while True:
+                                msg = stratum._recv()
+                                stratum._handle_server_message(msg)
+                        except (BlockingIOError, ConnectionError):
+                            pass
+                        finally:
+                            stratum.sock.setblocking(True)
+                    except Exception:
+                        pass
+
+                if stratum._current_job is not None:
+                    log.info("discarding stale share for job=%s after new job=%s arrived",
+                             current_job.job_id, stratum._current_job.job_id)
+                    current_job = stratum._current_job
+                    stratum._current_job = None
+                    continue
+
                 log.info("FOUND! nonce=%d digest=%s target=%s is_block=%s",
                          result.get("nonce64"), result.get("digest", "")[:16],
                          current_job.target[:16] if current_job.target else "none",

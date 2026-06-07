@@ -95,6 +95,7 @@ class StratumClient:
         self.shares_rejected = 0
         self.blocks_found = 0
         self._current_job: Job | None = None
+        self._suppress_canonical_reauth = False
         self._connect()
 
     def _next_id(self) -> int:
@@ -118,6 +119,7 @@ class StratumClient:
         extension = {
             "protocol_compliant": list(PROTOCOL_CAPABILITIES),
             "hardware": hw,
+            "operator_label": self.operator_worker_name,
             "session_id": self._session_id,
         }
 
@@ -136,6 +138,8 @@ class StratumClient:
         if not ok:
             raise RuntimeError(f"authorize rejected for address={self.payout_address}")
 
+        self._drain_handshake_messages(2.0)
+
         if self._canonical_worker_name:
             self.worker_name = self._canonical_worker_name
             worker = self._worker_for(self.payout_address)
@@ -144,8 +148,25 @@ class StratumClient:
                 raise RuntimeError(f"authorize rejected for worker={worker}")
             log.info("authorized as canonical worker %s", worker)
         else:
-            self.worker_name = self.operator_worker_name
             log.info("authorized as %s", self.payout_address)
+
+    def _drain_handshake_messages(self, seconds: float):
+        if self.sock is None:
+            return
+        deadline = time.time() + seconds
+        old_timeout = self.sock.gettimeout()
+        try:
+            self._suppress_canonical_reauth = True
+            self.sock.settimeout(0.2)
+            while time.time() < deadline and not self._canonical_worker_name:
+                try:
+                    msg = self._recv()
+                except socket.timeout:
+                    continue
+                self._handle_server_message(msg)
+        finally:
+            self._suppress_canonical_reauth = False
+            self.sock.settimeout(old_timeout)
 
     def _build_solver_env(self) -> dict[str, Any]:
         env: dict[str, Any] = {
@@ -213,6 +234,8 @@ class StratumClient:
             if canonical:
                 self._canonical_worker_name = canonical
                 self.worker_name = canonical
+                if not self._suppress_canonical_reauth:
+                    self.send_authorize(self.payout_address)
             log.info("canonical name: %s", params)
 
     @staticmethod
@@ -274,10 +297,10 @@ class StratumClient:
 
     def submit_share(self, job: Job, result: dict):
         worker = self._worker_for(self.payout_address)
-        nonce_hex = f"{result['nonce64']:016x}" if "nonce64" in result else ""
+        nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime = f"{job.time:08x}"
         extranonce2 = "00" * self._extranonce2_size
-        params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
+        params = [worker, job.job_id, extranonce2, ntime, nonce_hex, result.get("digest", "")]
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
         deadline = time.time() + 30.0
@@ -286,8 +309,9 @@ class StratumClient:
             if resp.get("id") == msg_id:
                 if resp.get("error"):
                     self.shares_rejected += 1
-                    log.info("share REJECTED job=%s nonce=%s (a/r=%d/%d) error=%s",
-                             job.job_id, nonce_hex, self.shares_accepted, self.shares_rejected, resp["error"])
+                    log.info("share REJECTED job=%s nonce=%s solver_digest=%s (a/r=%d/%d) error=%s",
+                             job.job_id, nonce_hex, result.get("digest", ""),
+                             self.shares_accepted, self.shares_rejected, resp["error"])
                 else:
                     self.shares_accepted += 1
                     is_block = result.get("is_block", False)
