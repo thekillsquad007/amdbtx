@@ -203,7 +203,7 @@ detect_amd_gpu() {
         name="$(rocm-smi --showproductname 2>/dev/null | head -1 || true)"
         if [[ -n "$name" && "$name" != *"None"* ]]; then
             has=1
-            arch="$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)"
+            arch="$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]{3,}' || true)"
         fi
     fi
     if [[ "$has" -eq 0 ]] && command -v rocminfo >/dev/null 2>&1; then
@@ -219,7 +219,7 @@ detect_amd_gpu() {
             arch=$(echo "$out" | awk '
                 /Agent [0-9]/ { devtype=""; arch=""; }
                 /Device Type.*GPU/ { devtype="GPU"; }
-                /gfx[0-9a-f]+/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]+/); arch=substr($0, RSTART, RLENGTH); }
+                /gfx[0-9a-f]{3,}/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]{3,}/); arch=substr($0, RSTART, RLENGTH); }
                 END { print arch; }
             ' || true)
             if [[ -n "$arch" ]]; then
