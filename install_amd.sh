@@ -634,16 +634,21 @@ fi
 # This is the most reliable GPU detection — it works even when rocm-smi/rocminfo
 # are missing or misconfigured, and provides the exact GPU model + arch + VRAM.
 log "probing AMD GPU via solver binary..."
-SOLVER_PROBE="$(printf '%s\n' '{"version":536870912,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","time":1779672814,"bits":"1d17c609","seed_a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seed_b":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_height":1,"nonce_start":0,"max_tries":1,"max_seconds":1,"share_target":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" HSA_ENABLE_DXG_DETECTION=1 "$SOLVER_PATH" --daemon --backend hip --epsilon-bits 0 --batch-size 1 2>&1 | head -3 || true)"
+set +e
+SOLVER_PROBE="$(printf '%s\n' '{"version":536870912,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","time":1779672814,"bits":"1d17c609","seed_a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seed_b":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_height":1,"nonce_start":0,"max_tries":1,"max_seconds":1,"share_target":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" HSA_ENABLE_DXG_DETECTION=1 "$SOLVER_PATH" --daemon --backend hip --epsilon-bits 0 --batch-size 1 2>&1)"
+PROBE_EXIT=$?
+set -e
 PROBE_GPU_NAME="$(echo "$SOLVER_PROBE" | sed -nE 's/^HIP GPU detected: (.*) arch=(gfx[0-9a-f]+) memory=.*/\1/p' | head -1)"
-PROBE_GPU_ARCH="$(echo "$SOLVER_PROBE" | grep -oE 'gfx[0-9a-f]+' | head -1)"
+PROBE_GPU_ARCH="$(echo "$SOLVER_PROBE" | grep -oE 'gfx[0-9a-f]{3,}' | head -1)"
 if [[ -n "$PROBE_GPU_ARCH" ]]; then
     HAS_AMD=1
     GPU_NAME="${PROBE_GPU_NAME:-AMD GPU}"
     GPU_ARCH="$PROBE_GPU_ARCH"
     log "detected AMD GPU via solver: ${GPU_NAME} (arch: ${GPU_ARCH})"
 else
+    log "solver probe returned nothing (exit=$PROBE_EXIT); probe output: $(echo "$SOLVER_PROBE" | head -1)"
     if [[ "$HAS_AMD" -eq 1 ]]; then
+        GPU_ARCH="${GPU_ARCH:-}"
         log "using GPU detected earlier via rocm-smi/rocminfo: ${GPU_NAME} ${GPU_ARCH:+(arch: ${GPU_ARCH})}"
     else
         warn "no AMD GPU detected by solver probe either — solver will run on CPU only (much slower)"
