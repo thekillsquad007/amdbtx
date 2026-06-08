@@ -97,7 +97,7 @@ apt_install() {
 
 rocm_repo_for_codename() {
     local codename="$1"
-    local version_id="$2"
+    local version_id="${2:-}"
     if [[ -n "${ROCM_REPO_VER:-}" ]]; then
         echo "$ROCM_REPO_VER"
         return 0
@@ -105,21 +105,7 @@ rocm_repo_for_codename() {
     case "$codename" in
         noble|oracular|plucky) echo "7.2" ;;
         jammy) echo "6.4" ;;
-        *)
-            # Fallback to version number for unknown codenames (e.g. Ubuntu 26.04)
-            if [[ -n "$version_id" ]]; then
-                local major="${version_id%%.*}"
-                if [[ "$major" -ge 24 ]]; then
-                    echo "7.2"
-                elif [[ "$major" -ge 22 ]]; then
-                    echo "6.4"
-                else
-                    echo ""
-                fi
-            else
-                echo ""
-            fi
-            ;;
+        *) echo "" ;;
     esac
 }
 
@@ -168,12 +154,16 @@ fi
 OS_ID=""
 OS_VERSION_ID=""
 UBUNTU_CODENAME=""
+IS_HIVEOS=0
 if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     . /etc/os-release
     OS_ID="${ID:-}"
     OS_VERSION_ID="${VERSION_ID:-}"
     UBUNTU_CODENAME="${VERSION_CODENAME:-}"
+fi
+if [[ -e /hive || -e /etc/hive-release ]] || grep -qi 'hive\s*os\|hiveos' /etc/os-release 2>/dev/null; then
+    IS_HIVEOS=1
 fi
 if [[ -z "$UBUNTU_CODENAME" ]]; then
     UBUNTU_CODENAME="$(lsb_release -cs 2>/dev/null || true)"
@@ -186,6 +176,10 @@ if [[ "$OS_ID" == "ubuntu" ]]; then
     log "detected Ubuntu ${OS_VERSION_ID:-unknown} (${UBUNTU_CODENAME})"
 elif [[ -n "$OS_ID" ]]; then
     warn "detected ${OS_ID} ${OS_VERSION_ID:-}; installer is best tested on Ubuntu 22.04/24.04"
+fi
+if [[ "$IS_HIVEOS" -eq 1 ]]; then
+    log "detected HiveOS; preserving HiveOS-managed AMD/ROCm driver stack"
+    SKIP_ROCM=1
 fi
 
 if have_apt; then
@@ -297,26 +291,25 @@ log "using Python: $($PYTHON --version 2>&1)"
 ROCM_LIB_PRESENT=0
 if find /opt/rocm /opt/rocm-* -maxdepth 2 -name 'libamdhip64.so*' -print -quit 2>/dev/null | grep -q .; then
     ROCM_LIB_PRESENT=1
+elif command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libamdhip64\.so'; then
+    ROCM_LIB_PRESENT=1
 fi
 
 if [[ "$SKIP_ROCM" -eq 1 ]]; then
     log "skipping ROCm installation (--skip-rocm)"
 elif [[ "$ROCM_LIB_PRESENT" -eq 1 ]]; then
-    log "ROCm runtime libraries detected under /opt; skipping package installation"
-elif ! command -v rocm-smi >/dev/null 2>&1; then
+    log "ROCm runtime libraries detected; skipping package installation"
+else
     ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
-    if [[ -z "$ROCM_REPO_VER" ]]; then
-        err "automatic ROCm install is supported on Ubuntu 22.04 (jammy) and 24.04 (noble). Install ROCm manually, then rerun with --skip-rocm."
-    fi
     log "ROCm not detected. Installing ROCm packages..."
     if command -v apt-get >/dev/null 2>&1; then
         sudo_cmd apt-get update -qq || true
         sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget gnupg2 curl ca-certificates || true
 
         # First try system packages (Ubuntu 26.04+ has ROCm in main repos).
-        # Prebuilt packages: rocm-hip-runtime (ROCm 6.x), hip-runtime-amd (ROCm 7.x).
+        # Package names differ between Ubuntu and Radeon repositories.
         ROCM_INSTALL_OK=0
-        for pkg_set in "rocm-hip-runtime rocminfo" "hip-runtime-amd rocminfo"; do
+        for pkg_set in "rocm-hip-runtime rocminfo" "hip-runtime-amd rocminfo" "rocm-hip-runtime" "hip-runtime-amd"; do
             if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
                 ROCM_INSTALL_OK=1
                 log "ROCm installed from system repositories"
@@ -325,7 +318,10 @@ elif ! command -v rocm-smi >/dev/null 2>&1; then
         done
 
         if [[ "$ROCM_INSTALL_OK" -eq 0 ]]; then
-            log "system packages not available, trying external ROCm repo..."
+            if [[ -z "$ROCM_REPO_VER" ]]; then
+                err "ROCm packages were not available from system apt, and no supported Radeon repo mapping exists for Ubuntu ${OS_VERSION_ID:-unknown} (${UBUNTU_CODENAME}). Install ROCm manually, then rerun with --skip-rocm."
+            fi
+            log "system packages not available, trying external ROCm ${ROCM_REPO_VER} repo..."
             echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list > /dev/null
 
             # Remove stale ROCm 5.x sources if any
@@ -448,8 +444,28 @@ RUNTIME_DIR="${INSTALL_DIR}/runtime"
 mkdir -p "$RUNTIME_DIR"
 
 ROCM_LIB_DIRS=()
-if [[ -d /opt/rocm/lib ]]; then ROCM_LIB_DIRS+=(/opt/rocm/lib); fi
-for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
+add_rocm_lib_dir() {
+    local d="$1"
+    [[ -n "$d" && -d "$d" ]] || return 0
+    local existing
+    for existing in "${ROCM_LIB_DIRS[@]}"; do
+        [[ "$existing" == "$d" ]] && return 0
+    done
+    ROCM_LIB_DIRS+=("$d")
+}
+
+collect_rocm_lib_dirs() {
+    local d path
+    ROCM_LIB_DIRS=()
+    add_rocm_lib_dir /opt/rocm/lib
+    for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && add_rocm_lib_dir "$d"; done
+    if command -v ldconfig >/dev/null 2>&1; then
+        while read -r path; do
+            [[ -n "$path" ]] && add_rocm_lib_dir "$(dirname "$path")"
+        done < <(ldconfig -p 2>/dev/null | awk '/libamdhip64|libhsa-runtime64|librocprofiler-register|libhip|libroc/ {print $NF}')
+    fi
+}
+collect_rocm_lib_dirs
 
 resolve_lib() {
     local soname="$1" base="$2" target=""
@@ -487,10 +503,12 @@ resolve_ldd_missing_libs() {
 link_resolved_rocm_libs() {
     local line path soname
     LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>/dev/null | while read -r line; do
-        path="$(echo "$line" | awk '/=> \/opt\/rocm/ {print $3}')"
+        path="$(echo "$line" | awk '/=> \// {print $3}')"
         [[ -n "$path" && -f "$path" ]] || continue
         soname="$(basename "$path")"
-        ln -sfn "$(readlink -f "$path")" "$RUNTIME_DIR/$soname" 2>/dev/null || true
+        case "$soname" in
+            libamd*|libhsa*|libroc*|libhip*) ln -sfn "$(readlink -f "$path")" "$RUNTIME_DIR/$soname" 2>/dev/null || true ;;
+        esac
     done
 }
 
@@ -525,37 +543,54 @@ MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not
 if [[ -n "$MISSING" ]]; then
     warn "solver has unresolved libraries:"
     echo "$MISSING" | while read -r line; do warn "  $line"; done
-    # Fallback: try apt install
-    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
-    EXTRA_ROCM_PACKAGES=()
-    if [[ "$ROCM_REPO_VER" == "7."* ]]; then
-        EXTRA_ROCM_PACKAGES=(hip-runtime-amd rocminfo)
+
+    if [[ "$SKIP_ROCM" -eq 1 ]]; then
+        warn "not installing ROCm packages because ROCm installation is disabled"
     else
-        EXTRA_ROCM_PACKAGES=(rocm-hip-runtime rocminfo)
-    fi
-    if [[ -n "$ROCM_REPO_VER" ]]; then
-        # Try system packages first (Ubuntu 26.04+ has ROCm in main repos)
-        if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
+    # Fallback: try apt install. System packages are preferred because Ubuntu
+    # 26.04+ ships ROCm directly; the Radeon repo is only a fallback for known
+    # codenames.
+    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
+    ROCM_APT_OK=0
+    for pkg_set in "rocm-hip-runtime rocminfo" "hip-runtime-amd rocminfo" "rocm-hip-runtime" "hip-runtime-amd"; do
+        if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
+            ROCM_APT_OK=1
             log "apt install succeeded (system packages)"
-        else
-            log "system packages not available, trying external ROCm repo..."
-            curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
-            echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
-            if sudo_cmd apt-get update -qq 2>/dev/null && \
-               sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
-                log "apt install succeeded"
-            for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
-            for soname in "${!SOLVER_LIBS[@]}"; do resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true; done
-            RUNTIME_LD_PATH="$RUNTIME_DIR"
-            for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
-            resolve_ldd_missing_libs
-            link_resolved_rocm_libs
-            MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
-        else
-            warn "apt install timed out or failed - solver may not work"
+            break
         fi
+    done
+
+    if [[ "$ROCM_APT_OK" -eq 0 && -n "$ROCM_REPO_VER" ]]; then
+        log "system packages not available, trying external ROCm ${ROCM_REPO_VER} repo..."
+        curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
+        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
+        if sudo_cmd apt-get update -qq 2>/dev/null; then
+            if [[ "$ROCM_REPO_VER" == "7."* ]]; then
+                EXTRA_ROCM_PACKAGES=(hip-runtime-amd rocminfo)
+            else
+                EXTRA_ROCM_PACKAGES=(rocm-hip-runtime rocminfo)
+            fi
+            if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
+                ROCM_APT_OK=1
+                log "apt install succeeded (external ROCm repo)"
+            fi
+        fi
+    elif [[ "$ROCM_APT_OK" -eq 0 ]]; then
+        warn "no external ROCm repo mapping for ${UBUNTU_CODENAME}; relying on existing libraries"
     fi
-fi
+
+    if [[ "$ROCM_APT_OK" -eq 1 ]]; then
+        collect_rocm_lib_dirs
+        for soname in "${!SOLVER_LIBS[@]}"; do resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true; done
+        RUNTIME_LD_PATH="$RUNTIME_DIR"
+        for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
+        resolve_ldd_missing_libs
+        link_resolved_rocm_libs
+        MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
+    else
+        warn "apt install failed or was not applicable - solver may not work"
+    fi
+    fi
 else
     log "all solver libraries resolved"
 fi

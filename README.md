@@ -59,6 +59,22 @@ curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install
 
 The `.cmd` launcher runs `install_amd.ps1` with `-ExecutionPolicy Bypass`, so no system policy changes are needed. It sets `HSA_ENABLE_DXG_DETECTION=1` for WSL GPU passthrough, installs the solver and Python wrapper inside WSL, and writes the config.
 
+### HiveOS
+
+HiveOS manages the AMD driver/ROCm stack itself. The installer detects HiveOS and skips ROCm package installation automatically.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --yes
+```
+
+If GPU detection fails on HiveOS, check that Hive exposes ROCm/HIP libraries and devices:
+
+```bash
+ldconfig -p | grep libamdhip64
+ls -la /dev/kfd /dev/dri
+rocminfo | grep -m1 gfx
+```
+
 ### Manual / Advanced
 
 ```bash
