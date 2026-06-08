@@ -393,14 +393,17 @@ log "creating private Python environment..."
 "$PYTHON" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip wheel pyyaml
 
-# ─── Fetch pre-built Python package + solver binary from releases ───────────
+# ─── Fetch pre-built Python package from releases ────────────────────────
 mkdir -p "${INSTALL_DIR}/bin"
 WHEEL_FILENAME="amdbtx_miner-1.0.0-py3-none-any.whl"
 TMP_WHEEL="$(mktemp -d)/${WHEEL_FILENAME}"
-TMP_SOLVER="$(mktemp)"
-trap 'rm -f "$TMP_SOLVER"; rm -rf "$(dirname "$TMP_WHEEL")"' EXIT
+TMP_BUILD_DIR=""
+cleanup_temp() {
+    rm -rf "$(dirname "$TMP_WHEEL")" 2>/dev/null || true
+    [[ -n "$TMP_BUILD_DIR" ]] && rm -rf "$TMP_BUILD_DIR" 2>/dev/null || true
+}
+trap cleanup_temp EXIT
 
-# Download and install pre-built Python wheel
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
@@ -420,21 +423,47 @@ EOF
     esac
 fi
 
-# Download pre-built solver binary
+# ─── Build solver from source ───────────────────────────────────────────
+# The solver source is part of the repository. On the target system, we
+# clone the repo, compile with the locally-installed ROCm, and install.
 if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
-    cp "$LOCAL_SOLVER" "$TMP_SOLVER"
+    install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
 else
-    log "downloading solver binary from ${SOLVER_URL}..."
-    curl -fsSL "$SOLVER_URL" -o "$TMP_SOLVER" 2>/dev/null || {
-        err "failed to download solver binary from GitHub releases
-    URL: ${SOLVER_URL}
-    Ensure you have a compatible AMD GPU and internet access.
-    You can also provide a local binary: --local-solver /path/to/btx-gbt-solve-hip"
-    }
+    TMP_BUILD_DIR="$(mktemp -d)"
+    BUILD_DIR="$TMP_BUILD_DIR"
+    log "downloading solver source from GitHub..."
+    curl -fsSL "https://github.com/thekillsquad007/amdbtx/archive/main.tar.gz" -o "$BUILD_DIR/repo.tar.gz" 2>/dev/null || \
+        err "failed to download solver source"
+    tar xzf "$BUILD_DIR/repo.tar.gz" -C "$BUILD_DIR"
+    SOLVER_SRC_DIR="$BUILD_DIR/amdbtx-main/solver"
+
+    # Install HIP development packages for compilation if not already present
+    if ! command -v hipcc >/dev/null 2>&1 && \
+       ! find /opt/rocm /opt/rocm-* -name 'hip_runtime.h' -print -quit 2>/dev/null | grep -q .; then
+        log "installing HIP development packages for solver compilation..."
+        for pkg_set in "rocm-hip-development" "hip-dev" "rocm-dev" "hip-devel"; do
+            if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
+                log "installed $pkg_set"
+                break
+            fi
+        done
+    fi
+
+    log "compiling solver for detected GPU architecture..."
+    BUILD_LOG="$BUILD_DIR/build.log"
+    if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
+        log "solver compilation successful"
+        install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
+    else
+        warn "solver compilation failed (see log below). Falling back to pre-built binary."
+        cat "$BUILD_LOG" >&2
+        log "downloading pre-built solver binary from ${SOLVER_URL}..."
+        curl -fsSL "$SOLVER_URL" -o "$SOLVER_PATH" 2>/dev/null || \
+            err "failed to download pre-built solver binary. GPU mining will not work."
+    fi
 fi
 
-install -m 0755 "$TMP_SOLVER" "$SOLVER_PATH"
 log "solver installed → $SOLVER_PATH"
 
 # ─── Build solver runtime (library resolver) ──────────────────────────────
