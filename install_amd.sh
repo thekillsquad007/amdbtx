@@ -430,6 +430,7 @@ fi
 # ─── Build solver from source ───────────────────────────────────────────
 # The solver source is part of the repository. On the target system, we
 # clone the repo, compile with the locally-installed ROCm, and install.
+SOLVER_BUILT_FROM_SOURCE=0
 if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
     install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
@@ -465,6 +466,7 @@ else
     if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
         log "solver compilation successful"
         install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
+        SOLVER_BUILT_FROM_SOURCE=1
     else
         warn "solver compilation failed (see log below). Falling back to pre-built binary."
         cat "$BUILD_LOG" >&2
@@ -552,6 +554,24 @@ link_resolved_rocm_libs() {
 }
 
 log "building solver runtime..."
+if [[ "$SOLVER_BUILT_FROM_SOURCE" -eq 1 ]]; then
+    # Source builds should run against the same libraries selected by the linker.
+    # Do not force /opt/rocm symlinks here; distrobox hosts can expose a newer
+    # /opt/rocm while Ubuntu hipcc links against system ROCm libraries.
+    RUNTIME_LD_PATH=""
+    while read -r libdir; do
+        [[ -n "$libdir" ]] || continue
+        case ":$RUNTIME_LD_PATH:" in
+            *":$libdir:"*) ;;
+            *) RUNTIME_LD_PATH="${RUNTIME_LD_PATH:+$RUNTIME_LD_PATH:}$libdir" ;;
+        esac
+    done < <(ldd "$SOLVER_PATH" 2>/dev/null | awk '/=> \// {print $3}' | while read -r p; do
+        case "$(basename "$p")" in
+            libamd*|libhsa*|libroc*|libhip*) dirname "$p" ;;
+        esac
+    done)
+    [[ -n "$RUNTIME_LD_PATH" ]] || RUNTIME_LD_PATH="$RUNTIME_DIR"
+else
 declare -A SOLVER_LIBS=(
     ["libamdhip64.so.7"]="libamdhip64"
     ["libamdhip64.so.6"]="libamdhip64"
@@ -576,6 +596,7 @@ RUNTIME_LD_PATH="$RUNTIME_DIR"
 for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
 resolve_ldd_missing_libs
 link_resolved_rocm_libs
+fi
 
 # Verify solver can load all libraries
 MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
@@ -764,7 +785,7 @@ if [[ "$HAS_AMD" -eq 1 ]]; then
     SMOKE_JOB='{"version":536870912,"prev_hash":"0ab38fdff2ef667dcddac7f50c3696080c26697615f7b6b9af5c3a1ba0a5fb7e","merkle_root":"d906f02ed11d8936770423263b56c5ffe1ea1b15c8a2867afb161adb6fd76eb7","time":1779672814,"bits":"1d17c609","seed_a":"8460daf3ff446cc55a7115de88ee24c8a2bf182eedde43abb9cf4cc94cc209bf","seed_b":"7f2e377616feb92d2e9857cab390595b7d6b8d24373a2da394f8d97197b5f437","block_height":110806,"nonce_start":1,"max_tries":200000,"max_seconds":30,"share_target":"00ffffff00000000000000000000000000000000000000000000000000000000"}'
     SMOKE_OUT="$(printf '%s\n' "$SMOKE_JOB" | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" "$SOLVER_PATH" \
         --daemon --backend hip --epsilon-bits 18 --batch-size ${GPU_BATCH} 2>&1 || true)"
-    SMOKE_LAST_LINE="$(echo "$SMOKE_OUT" | grep -E '^\{.*\}$' | tail -1)"
+    SMOKE_LAST_LINE="$(echo "$SMOKE_OUT" | grep -E '^\{.*\}$' | tail -1 || true)"
     if [[ -z "$SMOKE_LAST_LINE" ]]; then
         warn "GPU smoke test: solver produced no JSON output."
         warn "Possible causes:"
