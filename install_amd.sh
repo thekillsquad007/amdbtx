@@ -232,7 +232,11 @@ detect_amd_gpu() {
         HAS_AMD=1
         GPU_NAME="$name"
         GPU_ARCH="$arch"
-        log "detected AMD GPU: ${GPU_NAME}${GPU_ARCH:+ (arch: ${GPU_ARCH})}"
+        if [[ -n "$GPU_ARCH" ]]; then
+            log "detected AMD GPU: ${GPU_NAME} (arch: ${GPU_ARCH})"
+        else
+            log "detected AMD GPU: ${GPU_NAME}"
+        fi
     fi
 }
 detect_amd_gpu
@@ -660,7 +664,11 @@ if [[ -n "$PROBE_GPU_ARCH" ]]; then
 else
     log "solver probe: no GPU arch in output (using earlier detection)"
     if [[ "$HAS_AMD" -eq 1 ]]; then
-        log "using GPU detected earlier via rocm-smi/rocminfo: ${GPU_NAME}$([[ -n "$GPU_ARCH" ]] && echo " (arch: ${GPU_ARCH}")")"
+        if [[ -n "$GPU_ARCH" ]]; then
+            log "using GPU detected earlier via rocm-smi/rocminfo: ${GPU_NAME} (arch: ${GPU_ARCH})"
+        else
+            log "using GPU detected earlier via rocm-smi/rocminfo: ${GPU_NAME}"
+        fi
     else
         warn "no AMD GPU detected by solver probe either — solver will run on CPU only (much slower)"
         warn "ensure /dev/kfd and /dev/dri are accessible"
