@@ -438,18 +438,28 @@ else
     tar xzf "$BUILD_DIR/repo.tar.gz" -C "$BUILD_DIR"
     SOLVER_SRC_DIR="$BUILD_DIR/amdbtx-main/solver"
 
-    # Install HIP development packages for compilation if not already present.
-    # build.sh prefers /opt/rocm's hipcc/headers when available (ROCm version matching runtime).
-    # Only install system dev packages if /opt/rocm lacks headers entirely.
-    if ! find /opt/rocm /opt/rocm-* -name 'hip_runtime.h' -print -quit 2>/dev/null | grep -q .; then
-        if ! command -v hipcc >/dev/null 2>&1; then
-            log "installing HIP development packages for solver compilation..."
-            for pkg_set in "hip-dev" "rocm-dev" "hip-devel" "rocm-hip-development"; do
-                if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
-                    log "installed $pkg_set"
-                    break
-                fi
-            done
+    # Ensure HIP dev packages match the runtime ROCm version.
+    # If /opt/rocm is present (host mount), force-install matching dev packages
+    # from the Radeon repo, even if system ROCm dev packages exist.
+    ROCM_DEV_NEEDED=0
+    if command -v hipcc >/dev/null 2>&1; then
+        # Check if system hipcc matches /opt/rocm version
+        if [[ -f /opt/rocm/lib/libamdhip64.so ]]; then
+            ROCM_VER=$(readlink -f /opt/rocm/lib/libamdhip64.so | grep -oP '\d+\.\d+\.\d+' | head -1)
+            HIPCC_VER=$(hipcc --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "0")
+            if [[ -n "$ROCM_VER" && "$ROCM_VER" != "$HIPCC_VER"* ]]; then
+                ROCM_DEV_NEEDED=1
+            fi
+        fi
+    else
+        ROCM_DEV_NEEDED=1
+    fi
+    if [[ "$ROCM_DEV_NEEDED" -eq 1 ]]; then
+        if [[ -f /etc/apt/sources.list.d/rocm.list ]]; then
+            log "installing matching HIP dev packages from Radeon repo..."
+            sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --reinstall hip-dev libamdhip64-dev 2>/dev/null || true
+        else
+            log "system hipcc found, using it for compilation"
         fi
     fi
 

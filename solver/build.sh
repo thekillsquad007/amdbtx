@@ -35,19 +35,22 @@ fi
 echo "Using HIP compiler: $HIPCC"
 
 # --- Find ROCm include/lib paths ---
-# Prefer /opt/rocm over hipconfig (which may point to system-installed older ROCm)
+# Use hipconfig by default (guarantees headers match the HIP compiler version).
+# Only prefer /opt/rocm when no hipconfig is available.
 ROCM_INCLUDE=""
 ROCM_LIB=""
-for cand in /opt/rocm /opt/rocm-*; do
-    if [[ -d "$cand/include/hip" ]]; then
-        ROCM_INCLUDE="$cand/include"
-        ROCM_LIB="$cand/lib"
-        break
-    fi
-done
-if [[ -z "$ROCM_INCLUDE" ]] && command -v hipconfig >/dev/null 2>&1; then
+if command -v hipconfig >/dev/null 2>&1; then
     ROCM_INCLUDE="$(hipconfig --hip-path 2>/dev/null)/include"
     ROCM_LIB="$(hipconfig --hip-path 2>/dev/null)/lib"
+fi
+if [[ -z "$ROCM_INCLUDE" ]]; then
+    for cand in /opt/rocm /opt/rocm-*; do
+        if [[ -d "$cand/include/hip" ]]; then
+            ROCM_INCLUDE="$cand/include"
+            ROCM_LIB="$cand/lib"
+            break
+        fi
+    done
 fi
 if [[ -z "$ROCM_INCLUDE" ]]; then
     # System install (Ubuntu 26.04+)
