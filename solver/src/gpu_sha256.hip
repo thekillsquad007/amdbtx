@@ -295,21 +295,7 @@ __global__ void CompareDigestsKernel(
     else if (le_share) results[idx] = 1;
 }
 
-// Block header structure for sigma derivation.
-// All fields are stored in little-endian (matching CPU DeriveSigma).
-struct alignas(8) SigmaHeader {
-    uint8_t version[4];       // LE32
-    uint8_t prev_hash[32];    // canonical bytes (big-endian reversed → LE)
-    uint8_t merkle_root[32];  // canonical bytes
-    uint8_t time[4];          // LE32
-    uint8_t bits[4];          // LE32
-    uint8_t nonce_lo[4];      // nonce bits 0-31 (LE)
-    uint8_t nonce_hi[4];      // nonce bits 32-63 (LE)
-    uint8_t dim[2];           // LE16
-    uint8_t seed_a[32];       // canonical bytes
-    uint8_t seed_b[32];       // canonical bytes
-};
-static_assert(sizeof(SigmaHeader) == 150, "SigmaHeader must be 150 bytes");
+static_assert(sizeof(gpasha::SigmaHeader) == 150, "SigmaHeader must be 150 bytes");
 
 // Compute SHA-256 mid-state after processing block_count 64-byte blocks.
 // s is the state (8 x uint32_t), updated in place.

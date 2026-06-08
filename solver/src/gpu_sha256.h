@@ -5,7 +5,20 @@
 
 namespace gpasha {
 
-struct SigmaHeader;
+// Block header structure for sigma derivation.
+// All fields are stored in little-endian (matching CPU DeriveSigma).
+struct alignas(8) SigmaHeader {
+    uint8_t version[4];       // LE32
+    uint8_t prev_hash[32];    // canonical bytes (big-endian reversed → LE)
+    uint8_t merkle_root[32];  // canonical bytes
+    uint8_t time[4];          // LE32
+    uint8_t bits[4];          // LE32
+    uint8_t nonce_lo[4];      // nonce bits 0-31 (LE) — unused, kernel uses nonce_start
+    uint8_t nonce_hi[4];      // nonce bits 32-63 (LE)
+    uint8_t dim[2];           // LE16
+    uint8_t seed_a[32];       // canonical bytes
+    uint8_t seed_b[32];       // canonical bytes
+};
 
 void DeriveSigmaGateKernel_launch(
     const SigmaHeader* header,

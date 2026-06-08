@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amdbtx-miner"
+version = "1.0.0"
+description = "AMDBTX AMD GPU miner for MineBtx pool"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6.0"]
+
+[project.scripts]
+amdbtx-miner = "amdbtx_miner.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["amdbtx_miner*"]
