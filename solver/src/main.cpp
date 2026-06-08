@@ -1,0 +1,201 @@
+#include "solve.h"
+#include "sha256.h"
+#include <hip/hip_runtime.h>
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <sstream>
+#include <iomanip>
+
+static Uint256 HexToUint256(const std::string& hex) {
+    Uint256 result;
+    std::memset(result.data, 0, 32);
+    std::string padded = hex;
+    while (padded.size() < 64) padded = "0" + padded;
+    if (padded.size() > 64) padded = padded.substr(padded.size() - 64);
+    for (int i = 0; i < 32; ++i) {
+        unsigned int byte;
+        std::sscanf(padded.c_str() + i * 2, "%02x", &byte);
+        result.data[i] = static_cast<uint8_t>(byte);
+    }
+    return result;
+}
+
+static std::string Uint256ToHex(const Uint256& v) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (int i = 0; i < 32; ++i) oss << std::setw(2) << static_cast<unsigned>(v.data[i]);
+    return oss.str();
+}
+
+static uint32_t ParseBits(const std::string& bits_str) {
+    if (bits_str.size() > 2 && bits_str[0] == '0' && (bits_str[1] == 'x' || bits_str[1] == 'X'))
+        return static_cast<uint32_t>(std::stoul(bits_str.substr(2), nullptr, 16));
+    return static_cast<uint32_t>(std::stoul(bits_str, nullptr, 16));
+}
+
+struct DaemonConfig {
+    uint32_t matmul_n = 512;
+    uint32_t matmul_b = 16;
+    uint32_t matmul_r = 8;
+    uint32_t epsilon_bits = 18;
+    std::string backend = "hip";
+    uint32_t solver_threads = 8;
+    uint32_t batch_size = 128;
+};
+
+static std::string extract_json_string(const std::string& s, const std::string& key) {
+    auto pos = s.find("\"" + key + "\"");
+    if (pos == std::string::npos) return "";
+    auto colon = s.find(':', pos + key.size() + 2);
+    if (colon == std::string::npos) return "";
+    auto q1 = s.find('"', colon);
+    if (q1 == std::string::npos) return "";
+    auto q2 = s.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return s.substr(q1 + 1, q2 - q1 - 1);
+}
+
+static std::string extract_json_number(const std::string& s, const std::string& key) {
+    auto pos = s.find("\"" + key + "\"");
+    if (pos == std::string::npos) return "0";
+    auto colon = s.find(':', pos + key.size() + 2);
+    if (colon == std::string::npos) return "0";
+    size_t start = colon + 1;
+    while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) ++start;
+    size_t end = start;
+    if (end < s.size() && s[end] == '-') ++end;
+    while (end < s.size() && (std::isdigit(s[end]) || s[end] == '.' || s[end] == 'e' || s[end] == 'E' || s[end] == '+' || s[end] == '-')) ++end;
+    return s.substr(start, end - start);
+}
+
+int main(int argc, char* argv[]) {
+    DaemonConfig config;
+    bool daemon_mode = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--daemon") daemon_mode = true;
+        else if (arg == "--matmul-n" && i+1 < argc) config.matmul_n = std::stoul(argv[++i]);
+        else if (arg == "--matmul-b" && i+1 < argc) config.matmul_b = std::stoul(argv[++i]);
+        else if (arg == "--matmul-r" && i+1 < argc) config.matmul_r = std::stoul(argv[++i]);
+        else if (arg == "--epsilon-bits" && i+1 < argc) config.epsilon_bits = std::stoul(argv[++i]);
+        else if (arg == "--backend" && i+1 < argc) config.backend = argv[++i];
+        else if (arg == "--solver-threads" && i+1 < argc) config.solver_threads = std::stoul(argv[++i]);
+        else if (arg == "--batch-size" && i+1 < argc) config.batch_size = std::stoul(argv[++i]);
+        else if (arg == "--share-target") { if (i+1 < argc) ++i; }
+        else if (arg == "--version") {
+            std::cerr << "btx-gbt-solve-hip 2.0.0" << std::endl;
+            return 0;
+        } else if (arg == "--help") {
+            std::cerr << "Usage: " << argv[0] << " --daemon [--matmul-n N] [--matmul-b B] [--matmul-r R] "
+                      << "[--epsilon-bits E] [--backend hip|cpu] [--solver-threads T] [--batch-size S] "
+                      << "[--share-target HEX]" << std::endl;
+            return 0;
+        }
+    }
+
+    if (!daemon_mode) {
+        std::cerr << "Error: --daemon mode is required" << std::endl;
+        return 1;
+    }
+
+    if (config.backend == "hip") {
+        int device_count = 0;
+        hipError_t err = hipGetDeviceCount(&device_count);
+        if (err == hipSuccess && device_count > 0) {
+            hipDeviceProp_t prop;
+            hipGetDeviceProperties(&prop, 0);
+            std::cerr << "HIP GPU detected: " << prop.name << " arch=" << prop.gcnArchName
+                      << " memory=" << (prop.totalGlobalMem / (1024*1024)) << "MB" << std::endl;
+        } else {
+            std::cerr << "No HIP GPU found, falling back to CPU" << std::endl;
+            config.backend = "cpu";
+        }
+    }
+
+    std::cerr << "Solver config: n=" << config.matmul_n
+              << " b=" << config.matmul_b
+              << " r=" << config.matmul_r
+              << " epsilon=" << config.epsilon_bits
+              << " batch_size=" << config.batch_size
+              << " backend=" << config.backend << std::endl;
+
+    std::cerr << "{\"event\":\"daemon_ready\"}" << std::endl;
+
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        PowState state;
+        std::memset(&state, 0, sizeof(state));
+        state.matmul_dim = static_cast<uint16_t>(config.matmul_n);
+
+        uint64_t nonce_start = 0;
+        uint64_t max_tries = 2000000;
+        double max_seconds = 5.0;
+
+        Uint256 share_target;
+        std::memset(share_target.data, 0xFF, 32);
+
+        state.version = std::stoi(extract_json_number(line, "version"));
+        state.previous_block_hash = HexToUint256(extract_json_string(line, "prev_hash"));
+        state.merkle_root = HexToUint256(extract_json_string(line, "merkle_root"));
+        state.time = static_cast<uint32_t>(std::stoul(extract_json_number(line, "time")));
+
+        std::string bits_str = extract_json_string(line, "bits");
+        if (bits_str.empty()) bits_str = extract_json_number(line, "bits");
+        state.bits = bits_str.empty() ? 0 : ParseBits(bits_str);
+
+        state.seed_a = HexToUint256(extract_json_string(line, "seed_a"));
+        state.seed_b = HexToUint256(extract_json_string(line, "seed_b"));
+
+        std::string ns_str = extract_json_number(line, "nonce_start");
+        if (!ns_str.empty()) nonce_start = std::stoull(ns_str);
+
+        std::string mt_str = extract_json_number(line, "max_tries");
+        if (!mt_str.empty()) max_tries = std::stoull(mt_str);
+
+        std::string ms_str = extract_json_number(line, "max_seconds");
+        if (!ms_str.empty()) max_seconds = std::stod(ms_str);
+
+        std::string st_str = extract_json_string(line, "share_target");
+        if (!st_str.empty()) share_target = HexToUint256(st_str);
+
+        state.nonce = nonce_start;
+
+        Uint256 block_target = DeriveBlockTarget(state.bits);
+
+        uint64_t tries_used = 0;
+        double elapsed_s = 0;
+        bool found;
+
+        if (config.backend == "hip") {
+            found = SolveGPU(state, config.matmul_n, config.matmul_b, config.matmul_r,
+                             block_target, share_target, max_tries, max_seconds,
+                             tries_used, elapsed_s,
+                             config.batch_size, config.epsilon_bits);
+        } else {
+            found = SolveCPU(state, config.matmul_n, config.matmul_b, config.matmul_r,
+                             block_target, share_target,
+                             max_tries, max_seconds, tries_used, elapsed_s);
+        }
+
+        bool is_block = found && Uint256LE(state.digest, block_target);
+
+        std::cout << "{";
+        std::cout << "\"found\":" << (found ? "true" : "false") << ",";
+        std::cout << "\"nonce64\":" << state.nonce << ",";
+        std::cout << "\"nonce64_end\":" << state.nonce << ",";
+        if (found) {
+            std::cout << "\"digest\":\"" << Uint256ToHex(state.digest) << "\",";
+            std::cout << "\"is_block\":" << (is_block ? "true" : "false") << ",";
+        }
+        std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(2) << elapsed_s << ",";
+        std::cout << "\"tries_used\":" << tries_used;
+        std::cout << "}" << std::endl;
+    }
+
+    return 0;
+}
