@@ -300,11 +300,11 @@ static_assert(sizeof(gpasha::SigmaHeader) == 150, "SigmaHeader must be 150 bytes
 // Compute SHA-256 mid-state after processing block_count 64-byte blocks.
 // s is the state (8 x uint32_t), updated in place.
 __device__ void sha256_blocks_midstate(uint32_t s[8], const uint8_t* data, uint32_t block_count) {
-    for (uint32_t b = 0; b < block_count; ++b) {
+    for (uint32_t blk = 0; blk < block_count; ++blk) {
         uint32_t w[64];
         for (int i = 0; i < 16; ++i)
-            w[i] = (uint32_t(data[b*64 + i*4])<<24) | (uint32_t(data[b*64 + i*4+1])<<16) |
-                   (uint32_t(data[b*64 + i*4+2])<<8) | uint32_t(data[b*64 + i*4+3]);
+            w[i] = (uint32_t(data[blk*64 + i*4])<<24) | (uint32_t(data[blk*64 + i*4+1])<<16) |
+                   (uint32_t(data[blk*64 + i*4+2])<<8) | uint32_t(data[blk*64 + i*4+3]);
         for (int i = 16; i < 64; ++i) {
             uint32_t s0 = d_rotr(w[i-15],7) ^ d_rotr(w[i-15],18) ^ (w[i-15] >> 3);
             uint32_t s1 = d_rotr(w[i-2],17) ^ d_rotr(w[i-2],19) ^ (w[i-2] >> 10);
