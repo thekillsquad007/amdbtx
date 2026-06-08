@@ -5,6 +5,19 @@
 
 namespace gpasha {
 
+struct SigmaHeader;
+
+void DeriveSigmaGateKernel_launch(
+    const SigmaHeader* header,
+    uint64_t nonce_start,
+    const uint8_t* sigma_gate_threshold_be,
+    uint32_t epsilon_bits,
+    uint64_t batch_size,
+    uint32_t* gate_count,
+    uint64_t* sigma_nonces,
+    uint8_t* sigma_batch,
+    hipStream_t stream = 0);
+
 void DeriveNoiseSeedsKernel_launch(
     const uint8_t* sigma_batch,
     uint8_t* noise_seeds,

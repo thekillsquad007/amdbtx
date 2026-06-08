@@ -7,7 +7,6 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
-#include <atomic>
 
 namespace {
 
@@ -209,11 +208,6 @@ static Uint256 LeftShiftUint256(const Uint256& val, uint32_t shift) {
     return result;
 }
 
-struct GateEntry {
-    uint64_t nonce;
-    Uint256 sigma;
-};
-
 }
 
 bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
@@ -258,6 +252,9 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     uint8_t* d_sigma_batch{nullptr}; size_t cap_sigma{0};
     uint8_t* d_noise_seeds{nullptr}; size_t cap_nseeds{0};
     uint8_t* d_compress_seeds{nullptr}; size_t cap_cseeds{0};
+    uint32_t* d_gate_count{nullptr}; size_t cap_gate_count{0};
+    uint64_t* d_sigma_nonces{nullptr}; size_t cap_sigma_nonces{0};
+    gpasha::SigmaHeader* d_header{nullptr}; size_t cap_header{0};
 
     auto cleanup = [&]() {
         hipFree(d_base_a); hipFree(d_base_b);
@@ -268,6 +265,8 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         hipFree(d_output);
         hipFree(d_sigma_batch); hipFree(d_noise_seeds);
         hipFree(d_compress_seeds);
+        hipFree(d_gate_count); hipFree(d_sigma_nonces);
+        hipFree(d_header);
     };
 
 if (!EnsureBuffer(d_base_a, cap_base_a, matrix_elements) ||
@@ -277,7 +276,10 @@ if (!EnsureBuffer(d_base_a, cap_base_a, matrix_elements) ||
     !EnsureBuffer(d_output, cap_out, words_per_request) ||
     !EnsureBufferU8(d_sigma_batch, cap_sigma, size_t(batch_size) * 32) ||
     !EnsureBufferU8(d_noise_seeds, cap_nseeds, size_t(batch_size) * 4 * 32) ||
-    !EnsureBufferU8(d_compress_seeds, cap_cseeds, size_t(batch_size) * 32))
+    !EnsureBufferU8(d_compress_seeds, cap_cseeds, size_t(batch_size) * 32) ||
+    !EnsureBufferI32(reinterpret_cast<int32_t*&>(d_gate_count), cap_gate_count, 1) ||
+    !EnsureBuffer(reinterpret_cast<Element*&>(d_sigma_nonces), cap_sigma_nonces, batch_size) ||
+    !EnsureBuffer(reinterpret_cast<Element*&>(d_header), cap_header, 1))
 {
     cleanup();
     return SolveCPU(state, n, b, r, block_target, share_target,
@@ -290,32 +292,48 @@ if (!EnsureBuffer(d_base_a, cap_base_a, matrix_elements) ||
   PowState base_state = state;
 uint64_t current_nonce = state.nonce;
 
+// Prepare sigma gate header on host (nonce fields are unused; kernel uses nonce_start)
+  auto write_canonical = [](uint8_t* dst, const Uint256& src) {
+      for (int i = 0; i < 32; ++i) dst[i] = src.data[31 - i];
+  };
+  gpasha::SigmaHeader sigma_hdr = {};
+  WriteLE32(sigma_hdr.version, static_cast<uint32_t>(base_state.version));
+  write_canonical(sigma_hdr.prev_hash, base_state.previous_block_hash);
+  write_canonical(sigma_hdr.merkle_root, base_state.merkle_root);
+  WriteLE32(sigma_hdr.time, base_state.time);
+  WriteLE32(sigma_hdr.bits, base_state.bits);
+  sigma_hdr.dim[0] = uint8_t(n & 0xFF);
+  sigma_hdr.dim[1] = uint8_t(n >> 8);
+  write_canonical(sigma_hdr.seed_a, base_state.seed_a);
+  write_canonical(sigma_hdr.seed_b, base_state.seed_b);
+  hipMemcpy(d_header, &sigma_hdr, sizeof(sigma_hdr), hipMemcpyHostToDevice);
+
+  uint8_t sigma_gate_threshold_be[32];
+  for (int i = 0; i < 32; ++i) sigma_gate_threshold_be[i] = sigma_gate_threshold.data[31 - i];
+
   while (max_tries > 0) {
     auto now = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - t0).count();
         if (max_seconds > 0 && elapsed >= max_seconds) break;
 
-    std::vector<GateEntry> gate_entries;
-    gate_entries.reserve(batch_size);
+    // Reset gate counter
+    uint32_t zero = 0;
+    hipMemcpy(d_gate_count, &zero, sizeof(zero), hipMemcpyHostToDevice);
 
-    while (gate_entries.size() < batch_size && max_tries > 0) {
-            now = std::chrono::steady_clock::now();
-            elapsed = std::chrono::duration<double>(now - t0).count();
-            if (max_seconds > 0 && elapsed >= max_seconds) break;
+    uint64_t this_batch = batch_size;
+    if (this_batch > max_tries) this_batch = max_tries;
+    max_tries -= this_batch;
+    tries_used += this_batch;
 
-            base_state.nonce = current_nonce++;
-            --max_tries;
-            ++tries_used;
+    gpasha::DeriveSigmaGateKernel_launch(
+        d_header, current_nonce, sigma_gate_threshold_be, epsilon_bits,
+        this_batch, d_gate_count, d_sigma_nonces, d_sigma_batch);
 
-            Uint256 sigma = DeriveSigma(base_state);
-            if (epsilon_bits == 0 || Uint256LE(sigma, sigma_gate_threshold)) {
-                gate_entries.push_back({base_state.nonce, sigma});
-            }
-        }
+    uint32_t actual_batch = 0;
+    hipMemcpy(&actual_batch, d_gate_count, sizeof(actual_batch), hipMemcpyDeviceToHost);
+    current_nonce += this_batch;
 
-    if (gate_entries.empty()) continue;
-
-    uint32_t actual_batch = static_cast<uint32_t>(gate_entries.size());
+    if (actual_batch == 0) continue;
 
         if (!EnsureBufferU8(d_sigma_batch, cap_sigma, size_t(actual_batch) * 32) ||
             !EnsureBufferU8(d_noise_seeds, cap_nseeds, size_t(actual_batch) * 4 * 32) ||
@@ -333,11 +351,6 @@ uint64_t current_nonce = state.nonce;
             return SolveCPU(state, n, b, r, block_target, share_target,
                             max_tries, max_seconds, tries_used, elapsed_s);
         }
-
-    std::vector<uint8_t> host_sigma(size_t(actual_batch) * 32);
-    for (uint32_t i = 0; i < actual_batch; ++i)
-      std::memcpy(host_sigma.data() + size_t(i) * 32, gate_entries[i].sigma.data, 32);
-    hipMemcpy(d_sigma_batch, host_sigma.data(), host_sigma.size(), hipMemcpyHostToDevice);
 
     gpasha::DeriveNoiseSeedsKernel_launch(
       d_sigma_batch, d_noise_seeds, d_compress_seeds, actual_batch);
@@ -382,17 +395,24 @@ uint64_t current_nonce = state.nonce;
         }
 
         size_t total_output_elements = size_t(actual_batch) * words_per_request;
+    std::vector<uint64_t> host_nonces(actual_batch);
+    std::vector<uint8_t> host_sigma(size_t(actual_batch) * 32);
+    hipMemcpy(host_nonces.data(), d_sigma_nonces, actual_batch * sizeof(uint64_t), hipMemcpyDeviceToHost);
+    hipMemcpy(host_sigma.data(), d_sigma_batch, host_sigma.size(), hipMemcpyDeviceToHost);
+
     std::vector<Element> host_output(total_output_elements);
     hipMemcpy(host_output.data(), d_output, total_output_elements * sizeof(Element), hipMemcpyDeviceToHost);
 
     for (uint32_t bi = 0; bi < actual_batch; ++bi) {
             const Element* batch_words = host_output.data() + size_t(bi) * words_per_request;
+            Uint256 sigma;
+            std::memcpy(sigma.data, host_sigma.data() + size_t(bi) * 32, 32);
             Uint256 c_prime_hash = transcript::HashMatrixWords(batch_words, words_per_request);
             Uint256 digest = transcript::FinalizeProductCommittedDigest(
-                c_prime_hash, gate_entries[bi].sigma, n, b);
+                c_prime_hash, sigma, n, b);
             bool is_block = Uint256LE(digest, block_target);
             if (is_block || Uint256LE(digest, share_target)) {
-                state.nonce = gate_entries[bi].nonce;
+                state.nonce = host_nonces[bi];
                 state.digest = digest;
                 auto t1 = std::chrono::steady_clock::now();
                 elapsed_s = std::chrono::duration<double>(t1 - t0).count();

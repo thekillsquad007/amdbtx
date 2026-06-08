@@ -295,9 +295,157 @@ __global__ void CompareDigestsKernel(
     else if (le_share) results[idx] = 1;
 }
 
+// Block header structure for sigma derivation.
+// All fields are stored in little-endian (matching CPU DeriveSigma).
+struct alignas(8) SigmaHeader {
+    uint8_t version[4];       // LE32
+    uint8_t prev_hash[32];    // canonical bytes (big-endian reversed → LE)
+    uint8_t merkle_root[32];  // canonical bytes
+    uint8_t time[4];          // LE32
+    uint8_t bits[4];          // LE32
+    uint8_t nonce_lo[4];      // nonce bits 0-31 (LE)
+    uint8_t nonce_hi[4];      // nonce bits 32-63 (LE)
+    uint8_t dim[2];           // LE16
+    uint8_t seed_a[32];       // canonical bytes
+    uint8_t seed_b[32];       // canonical bytes
+};
+static_assert(sizeof(SigmaHeader) == 150, "SigmaHeader must be 150 bytes");
+
+// Compute SHA-256 mid-state after processing block_count 64-byte blocks.
+// s is the state (8 x uint32_t), updated in place.
+__device__ void sha256_blocks_midstate(uint32_t s[8], const uint8_t* data, uint32_t block_count) {
+    for (uint32_t b = 0; b < block_count; ++b) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i)
+            w[i] = (uint32_t(data[b*64 + i*4])<<24) | (uint32_t(data[b*64 + i*4+1])<<16) |
+                   (uint32_t(data[b*64 + i*4+2])<<8) | uint32_t(data[b*64 + i*4+3]);
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = d_rotr(w[i-15],7) ^ d_rotr(w[i-15],18) ^ (w[i-15] >> 3);
+            uint32_t s1 = d_rotr(w[i-2],17) ^ d_rotr(w[i-2],19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=s[0],b=s[1],c=s[2],d=s[3],e=s[4],f=s[5],g=s[6],h=s[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t t1 = h + (d_rotr(e,6) ^ d_rotr(e,11) ^ d_rotr(e,25)) +
+                          ((e & f) ^ (~e & g)) + d_K[i] + w[i];
+            uint32_t t2 = (d_rotr(a,2) ^ d_rotr(a,13) ^ d_rotr(a,22)) +
+                          ((a & b) ^ (a & c) ^ (b & c));
+            h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        s[0]+=a; s[1]+=b; s[2]+=c; s[3]+=d; s[4]+=e; s[5]+=f; s[6]+=g; s[7]+=h;
+    }
 }
 
-namespace gpasha {
+// Finalize SHA-256 from mid-state s, processing the final padded block.
+__device__ void sha256_finalize_from_midstate(uint32_t s[8], uint8_t hash_out[32]) {
+    for (int i = 0; i < 8; ++i) {
+        hash_out[i*4]   = uint8_t(s[i] >> 24);
+        hash_out[i*4+1] = uint8_t(s[i] >> 16);
+        hash_out[i*4+2] = uint8_t(s[i] >> 8);
+        hash_out[i*4+3] = uint8_t(s[i]);
+    }
+}
+
+__global__ void DeriveSigmaGateKernel(
+    const SigmaHeader* __restrict__ header_base,
+    uint64_t nonce_start,
+    const uint8_t* __restrict__ sigma_gate_threshold_be,
+    uint32_t epsilon_bits,
+    uint64_t batch_size,
+    uint32_t* __restrict__ gate_count_out,
+    uint64_t* __restrict__ sigma_nonces_out,
+    uint8_t* __restrict__ sigma_batch_out)
+{
+    uint64_t gid = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= batch_size) return;
+
+    uint64_t nonce = nonce_start + gid;
+
+    // Build the 150-byte header buffer
+    uint8_t hdr[150];
+    SigmaHeader base = *header_base;
+    for (int i = 0; i < 4; ++i) hdr[i] = base.version[i];
+    for (int i = 0; i < 32; ++i) hdr[4 + i] = base.prev_hash[i];
+    for (int i = 0; i < 32; ++i) hdr[36 + i] = base.merkle_root[i];
+    for (int i = 0; i < 4; ++i) hdr[68 + i] = base.time[i];
+    for (int i = 0; i < 4; ++i) hdr[72 + i] = base.bits[i];
+    for (int i = 0; i < 4; ++i) hdr[76 + i] = uint8_t(nonce >> (i * 8));
+    for (int i = 0; i < 4; ++i) hdr[80 + i] = uint8_t(nonce >> (32 + i * 8));
+    hdr[84] = base.dim[0];
+    hdr[85] = base.dim[1];
+    for (int i = 0; i < 32; ++i) hdr[86 + i] = base.seed_a[i];
+    for (int i = 0; i < 32; ++i) hdr[118 + i] = base.seed_b[i];
+
+    // First SHA-256 round: process blocks 0-1 (128 bytes), leaving block 2 for finalization
+    uint32_t s[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+
+    sha256_blocks_midstate(s, hdr, 2); // process blocks 0 and 1
+
+    // Block 2: bytes 128-149 (22 bytes) + padding
+    uint8_t block2[64];
+    for (int i = 0; i < 64; ++i) block2[i] = 0;
+    for (int i = 0; i < 22; ++i) block2[i] = hdr[128 + i];
+    block2[22] = 0x80;
+    uint64_t total_bits = 150 * 8;
+    block2[62] = uint8_t((total_bits >> 8) & 0xFF);
+    block2[63] = uint8_t(total_bits & 0xFF);
+
+    sha256_blocks_midstate(s, block2, 1);
+
+    uint8_t header_hash[32];
+    sha256_finalize_from_midstate(s, header_hash);
+
+    // Second SHA-256: hash the 32-byte header_hash
+    uint8_t block3[64];
+    for (int i = 0; i < 64; ++i) block3[i] = 0;
+    for (int i = 0; i < 32; ++i) block3[i] = header_hash[i];
+    block3[32] = 0x80;
+    total_bits = 32 * 8;
+    block3[62] = uint8_t((total_bits >> 8) & 0xFF);
+    block3[63] = uint8_t(total_bits & 0xFF);
+
+    uint32_t s2[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    sha256_blocks_midstate(s2, block3, 1);
+
+    uint8_t sigma_be[32];
+    sha256_finalize_from_midstate(s2, sigma_be);
+
+    if (epsilon_bits > 0) {
+        for (int i = 0; i < 32; ++i) {
+            if (sigma_be[i] < sigma_gate_threshold_be[i]) break;
+            if (sigma_be[i] > sigma_gate_threshold_be[i]) return;
+        }
+    }
+
+    uint32_t idx = atomicAdd(gate_count_out, 1u);
+    if (idx >= uint32_t(batch_size)) return;
+    sigma_nonces_out[idx] = nonce;
+    for (int i = 0; i < 32; ++i)
+        sigma_batch_out[idx * 32 + i] = sigma_be[i];
+}
+
+void DeriveSigmaGateKernel_launch(
+    const SigmaHeader* header,
+    uint64_t nonce_start,
+    const uint8_t* sigma_gate_threshold_be,
+    uint32_t epsilon_bits,
+    uint64_t batch_size,
+    uint32_t* gate_count,
+    uint64_t* sigma_nonces,
+    uint8_t* sigma_batch,
+    hipStream_t stream)
+{
+    EnsureKInitialized();
+    uint32_t threads = 256;
+    uint32_t blocks = (batch_size + threads - 1) / threads;
+    hipLaunchKernelGGL(DeriveSigmaGateKernel,
+        dim3(blocks), dim3(threads), 0, stream,
+        header, nonce_start, sigma_gate_threshold_be,
+        epsilon_bits, batch_size,
+        gate_count, sigma_nonces, sigma_batch);
+}
 
 void DeriveNoiseSeedsKernel_launch(
   const uint8_t* sigma_batch,
