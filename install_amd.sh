@@ -6,7 +6,7 @@
 #   bash install_amd.sh --address btx1z...
 #
 # Installs:
-#   1. ROCm 6.x (if not present)
+#   1. ROCm runtime (if not present)
 #   2. amdbtx-miner Python wrapper
 #   3. btx-gbt-solve-hip solver binary (prebuilt or from source)
 #   4. Writes tuned config for detected AMD GPU
@@ -33,7 +33,7 @@ DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 INSTALL_DIR="${HOME}/.amdbtx-miner"
 SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
 CONFIG_PATH="${INSTALL_DIR}/config.yaml"
-VENV_DIR="${INSTALL_DIR}/venv"
+VENV_DIR="${AMDBTX_VENV_DIR:-${HOME}/.local/share/amdbtx-miner/venv}"
 LAUNCHER_PATH="${HOME}/.local/bin/amdbtx-miner"
 
 DEV_WALLET="btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
@@ -75,6 +75,48 @@ need() {
     command -v "$1" >/dev/null 2>&1 || err "missing required tool: $1"
 }
 
+have_apt() {
+    command -v apt-get >/dev/null 2>&1
+}
+
+sudo_cmd() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        err "sudo is required to install missing system packages. Install sudo or run as root."
+    fi
+}
+
+apt_install() {
+    have_apt || return 1
+    sudo_cmd apt-get update -qq
+    sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+}
+
+rocm_repo_for_codename() {
+    local codename="$1"
+    if [[ -n "${ROCM_REPO_VER:-}" ]]; then
+        echo "$ROCM_REPO_VER"
+        return 0
+    fi
+    case "$codename" in
+        noble|oracular|plucky) echo "7.2" ;;
+        jammy) echo "6.4" ;;
+        *) echo "" ;;
+    esac
+}
+
+python_apt_packages_for_codename() {
+    local codename="$1"
+    case "$codename" in
+        noble|oracular|plucky) echo "python3 python3-venv python3-pip" ;;
+        jammy) echo "python3.10 python3.10-venv python3-pip" ;;
+        *) echo "" ;;
+    esac
+}
+
 confirm() {
     [[ "$ASSUME_YES" -eq 1 ]] && return 0
     read -rp "$1 [y/N] " ans
@@ -87,6 +129,40 @@ log "AMDBTX miner installer — AMD GPU edition"
 OS="$(uname -s)"
 if [[ "$OS" != "Linux" ]]; then
     err "unsupported OS: $OS (AMD ROCm requires Linux)"
+fi
+
+OS_ID=""
+OS_VERSION_ID=""
+UBUNTU_CODENAME=""
+if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    OS_VERSION_ID="${VERSION_ID:-}"
+    UBUNTU_CODENAME="${VERSION_CODENAME:-}"
+fi
+if [[ -z "$UBUNTU_CODENAME" ]]; then
+    UBUNTU_CODENAME="$(lsb_release -cs 2>/dev/null || true)"
+fi
+if [[ -z "$UBUNTU_CODENAME" ]]; then
+    UBUNTU_CODENAME="jammy"
+fi
+
+if [[ "$OS_ID" == "ubuntu" ]]; then
+    log "detected Ubuntu ${OS_VERSION_ID:-unknown} (${UBUNTU_CODENAME})"
+elif [[ -n "$OS_ID" ]]; then
+    warn "detected ${OS_ID} ${OS_VERSION_ID:-}; installer is best tested on Ubuntu 22.04/24.04"
+fi
+
+if have_apt; then
+    log "installing base system dependencies..."
+    apt_install \
+        ca-certificates curl wget gnupg2 lsb-release coreutils findutils grep gawk sed \
+        python3 python3-venv python3-pip \
+        libstdc++6 libgcc-s1 libc6 libelf1 libdrm2 libdrm-amdgpu1 libnuma1 zlib1g libzstd1 \
+        pciutils procps >/dev/null || warn "some base packages failed to install; continuing"
+else
+    warn "apt-get not found; installer can still run, but you must provide Python 3.10+, curl, and ROCm runtime libraries"
 fi
 
 # Detect AMD GPU
@@ -151,7 +227,7 @@ need curl
 need sha256sum
 
 PYTHON=""
-for cand in python3.11 python3.10 python3; do
+for cand in python3.12 python3.11 python3.10 python3; do
     if command -v "$cand" >/dev/null 2>&1; then
         PYTHON="$cand"
         if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'; then
@@ -162,10 +238,20 @@ for cand in python3.11 python3.10 python3; do
 done
 
 if [[ -z "$PYTHON" ]]; then
-    log "installing python3.10 via apt..."
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3.10 python3.10-venv python3-pip
-    PYTHON=python3.10
+    PY_PKGS="$(python_apt_packages_for_codename "$UBUNTU_CODENAME")"
+    if [[ -z "$PY_PKGS" ]]; then
+        err "Python 3.10+ is required. Please use Ubuntu 22.04+ or install Python 3.10+ manually."
+    fi
+    log "installing Python runtime (${PY_PKGS}) via apt..."
+    # shellcheck disable=SC2086
+    apt_install $PY_PKGS || err "failed to install Python 3.10+"
+    for cand in python3.12 python3.11 python3.10 python3; do
+        if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'; then
+            PYTHON="$cand"
+            break
+        fi
+    done
+    [[ -n "$PYTHON" ]] || err "Python install completed but no Python 3.10+ executable was found"
 fi
 log "using Python: $($PYTHON --version 2>&1)"
 
@@ -180,35 +266,37 @@ if [[ "$SKIP_ROCM" -eq 1 ]]; then
 elif [[ "$ROCM_LIB_PRESENT" -eq 1 ]]; then
     log "ROCm runtime libraries detected under /opt; skipping package installation"
 elif ! command -v rocm-smi >/dev/null 2>&1; then
-    UBUNTU_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
-    ROCM_REPO_VER=$([[ "$UBUNTU_CODENAME" == "noble" ]] && echo "7.2" || echo "6.0")
+    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME")"
+    if [[ -z "$ROCM_REPO_VER" ]]; then
+        err "automatic ROCm install is supported on Ubuntu 22.04 (jammy) and 24.04 (noble). Install ROCm manually, then rerun with --skip-rocm."
+    fi
     log "ROCm not detected. Installing ROCm ${ROCM_REPO_VER} packages..."
     if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -qq || true
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget gnupg2 curl || true
+        sudo_cmd apt-get update -qq || true
+        sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget gnupg2 curl ca-certificates || true
 
         log "adding ROCm repo..."
-        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo tee /etc/apt/sources.list.d/rocm.list > /dev/null
+        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list > /dev/null
 
         # Remove stale ROCm 5.x sources if any
         for old in /etc/apt/sources.list.d/rocm*.list; do
-            [[ -f "$old" ]] && grep -q "rocm/apt/5\." "$old" 2>/dev/null && sudo rm -f "$old" && log "removed stale ROCm 5.x source: $old"
+            [[ -f "$old" ]] && grep -q "rocm/apt/5\." "$old" 2>/dev/null && sudo_cmd rm -f "$old" && log "removed stale ROCm 5.x source: $old"
         done
 
         log "updating package lists..."
-        sudo apt-get update -qq 2>&1 | grep -v "Warning:" || true
+        sudo_cmd apt-get update -qq 2>&1 | grep -v "Warning:" || true
 
         # Install only the runtime needed by the pre-built miner. Full rocm-dev
         # pulls compiler/debugger packages that conflict on WSL/Noble.
         log "installing ROCm runtime packages (may take several minutes)..."
-        if [[ "$ROCM_REPO_VER" == "7.2" ]]; then
+        if [[ "$ROCM_REPO_VER" == "7."* ]]; then
             RUNTIME_PACKAGES=(hip-runtime-amd rocminfo)
         else
             RUNTIME_PACKAGES=(rocm-hip-runtime rocminfo)
         fi
-        if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${RUNTIME_PACKAGES[@]}" 2>&1 | tail -10; then
+        if ! sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${RUNTIME_PACKAGES[@]}" 2>&1 | tail -10; then
             warn "ROCm runtime install failed — diagnosing..."
-            sudo apt-get install -y "${RUNTIME_PACKAGES[@]}" 2>&1 | grep -E "Depends:|not going|broken|held|not installable" | head -10 >&2 || true
+            sudo_cmd apt-get install -y "${RUNTIME_PACKAGES[@]}" 2>&1 | grep -E "Depends:|not going|broken|held|not installable" | head -10 >&2 || true
             warn "install ROCm runtime manually, then rerun with --skip-rocm"
         fi
 
@@ -232,8 +320,20 @@ fi
 # ─── Install pip + runtime deps ──────────────────────────────────────────────
 if ! "$PYTHON" -m venv --help >/dev/null 2>&1; then
     log "python venv support not present; installing via apt..."
-    sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip
+    apt_install python3-venv python3-pip || err "failed to install python3-venv"
+fi
+
+# ─── Clean previous installation ────────────────────────────────────────────
+if [[ -d "$INSTALL_DIR" ]]; then
+    log "removing previous installation at ${INSTALL_DIR}..."
+    rm -rf "$INSTALL_DIR"
+fi
+if [[ -d "$VENV_DIR" ]]; then
+    log "removing previous virtual environment at ${VENV_DIR}..."
+    rm -rf "$VENV_DIR"
+fi
+if [[ -f "$LAUNCHER_PATH" ]]; then
+    rm -f "$LAUNCHER_PATH"
 fi
 
 log "creating private Python environment..."
@@ -312,8 +412,38 @@ resolve_lib() {
     return 1
 }
 
+resolve_ldd_missing_libs() {
+    local missing soname base
+    missing="$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>/dev/null | awk '/not found/ {print $1}' || true)"
+    [[ -n "$missing" ]] || return 0
+    while read -r soname; do
+        [[ -n "$soname" ]] || continue
+        case "$soname" in
+            libamdhip64.so.*|libhsa-runtime64.so.*|librocprofiler-register.so.*|libhip*.so.*|libroc*.so.*|libamd*.so.*)
+                base="${soname%%.so*}"
+                resolve_lib "$soname" "$base" || true
+                ;;
+        esac
+    done <<< "$missing"
+}
+
+link_resolved_rocm_libs() {
+    local line path soname
+    LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>/dev/null | while read -r line; do
+        path="$(echo "$line" | awk '/=> \/opt\/rocm/ {print $3}')"
+        [[ -n "$path" && -f "$path" ]] || continue
+        soname="$(basename "$path")"
+        ln -sfn "$(readlink -f "$path")" "$RUNTIME_DIR/$soname" 2>/dev/null || true
+    done
+}
+
 log "building solver runtime..."
-declare -A SOLVER_LIBS=( ["libamdhip64.so.6"]="libamdhip64" ["libhipblas.so.2"]="libhipblas" )
+declare -A SOLVER_LIBS=(
+    ["libamdhip64.so.7"]="libamdhip64"
+    ["libamdhip64.so.6"]="libamdhip64"
+    ["libhsa-runtime64.so.1"]="libhsa-runtime64"
+    ["librocprofiler-register.so.0"]="librocprofiler-register"
+)
 for soname in "${!SOLVER_LIBS[@]}"; do
     resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true
 done
@@ -330,6 +460,8 @@ done
 # Build LD path: runtime dir first, then all ROCm dirs
 RUNTIME_LD_PATH="$RUNTIME_DIR"
 for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
+resolve_ldd_missing_libs
+link_resolved_rocm_libs
 
 # Verify solver can load all libraries
 MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
@@ -337,23 +469,40 @@ if [[ -n "$MISSING" ]]; then
     warn "solver has unresolved libraries:"
     echo "$MISSING" | while read -r line; do warn "  $line"; done
     # Fallback: try apt install
-    UBUNTU_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")
-    ROCM_REPO_VER=$([[ "$UBUNTU_CODENAME" == "noble" ]] && echo "7.2" || echo "6.0")
-    log "attempting to install missing libraries via apt..."
-    curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo apt-key add - 2>/dev/null || true
-    echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo tee /etc/apt/sources.list.d/rocm.list >/dev/null
-    if timeout 120 sudo apt-get update -qq 2>/dev/null && \
-       timeout 120 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hipblas rocblas rocsolver 2>/dev/null; then
-        log "apt install succeeded"
-        for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
-        for soname in "${!SOLVER_LIBS[@]}"; do resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true; done
-        RUNTIME_LD_PATH="$RUNTIME_DIR"
-        for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
+    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME")"
+    if [[ -z "$ROCM_REPO_VER" ]]; then
+        warn "cannot auto-install missing ROCm libraries on this OS; install ROCm manually and rerun with --skip-rocm"
+    elif [[ "$ROCM_REPO_VER" == "7."* ]]; then
+        EXTRA_ROCM_PACKAGES=(hip-runtime-amd rocminfo)
     else
-        warn "apt install timed out or failed - solver may not work"
+        EXTRA_ROCM_PACKAGES=(rocm-hip-runtime rocminfo)
+    fi
+    if [[ -n "$ROCM_REPO_VER" ]]; then
+        log "attempting to install missing libraries via apt..."
+        curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
+        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
+        if sudo_cmd apt-get update -qq 2>/dev/null && \
+           sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
+            log "apt install succeeded"
+            for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
+            for soname in "${!SOLVER_LIBS[@]}"; do resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true; done
+            RUNTIME_LD_PATH="$RUNTIME_DIR"
+            for d in "${ROCM_LIB_DIRS[@]}"; do RUNTIME_LD_PATH="$RUNTIME_LD_PATH:$d"; done
+            resolve_ldd_missing_libs
+            link_resolved_rocm_libs
+            MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
+        else
+            warn "apt install timed out or failed - solver may not work"
+        fi
     fi
 else
     log "all solver libraries resolved"
+fi
+FINAL_MISSING=$(LD_LIBRARY_PATH="$RUNTIME_LD_PATH" ldd "$SOLVER_PATH" 2>&1 | grep 'not found' || true)
+if [[ -n "$FINAL_MISSING" ]]; then
+    warn "solver still has unresolved libraries after automatic setup:"
+    echo "$FINAL_MISSING" | while read -r line; do warn "  $line"; done
+    warn "GPU mining may not start until ROCm runtime packages are fixed."
 fi
 
 # If rocm-smi/rocminfo was unavailable before installation, use the solver's

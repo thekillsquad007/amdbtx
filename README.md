@@ -14,8 +14,6 @@ ROCm/HIP. Provides a HIP solver binary and a Python stratum wrapper.
 
 ### Linux (Native Ubuntu 22.04+)
 
-Copy/paste this, replacing `btx1z...YOUR_ADDRESS` with your BTX address:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --yes
 ```
@@ -28,15 +26,14 @@ amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 
 ### Windows (WSL2 with AMD GPU)
 
-> **Requires**: Windows 11 with WSL2, AMD GPU (RDNA 2+ recommended).
-
-Download this repo, open PowerShell in the folder, then run:
+> Requires: Windows 11 with WSL2, AMD GPU (RDNA 2+ recommended), latest AMD Adrenalin driver.
 
 ```powershell
-.\install_amd.ps1 -Address "btx1z...YOUR_ADDRESS"
+# From PowerShell in the repo folder:
+.\install_amd.cmd btx1z...YOUR_ADDRESS
 ```
 
-Launch after install:
+Launch:
 
 ```powershell
 wsl -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
@@ -44,127 +41,39 @@ wsl -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 
 ---
 
-## Platform Guides
+## Installation Details
 
-### 🐧 Linux (Native)
+### Linux
 
-#### Prerequisites
+**Prerequisites**: AMD GPU (GCN 4+), Ubuntu 22.04+. The installer auto-detects your Ubuntu version and installs the correct ROCm runtime (6.4 on 22.04, 7.2 on 24.04+), Python venv, solver binary, and config.
 
-- AMD GPU (GCN 4+ / RDNA 1-4)
-- Ubuntu 22.04+ (or equivalent with ROCm support)
-- ROCm 6.0+ installed at `/opt/rocm`
-
-#### Option A: One-liner (recommended)
+Custom options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --worker myrig --yes
+# With worker name and custom pool
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- \
+  --address btx1z... --worker myrig --pool stratum.minebtx.com:3333 --yes
 ```
 
-#### Option B: From source
+### Windows (WSL2)
+
+The `.cmd` launcher runs `install_amd.ps1` with `-ExecutionPolicy Bypass`, so no system policy changes are needed. It sets `HSA_ENABLE_DXG_DETECTION=1` for WSL GPU passthrough, installs the solver and Python wrapper inside WSL, and writes the config.
+
+### Manual / Advanced
 
 ```bash
 git clone https://github.com/thekillsquad007/amdbtx.git
 cd amdbtx
-export PAYOUT_ADDRESS=btx1z...
-bash start_mining.sh
-```
-
-#### Option C: Manual
-
-```bash
-git clone https://github.com/thekillsquad007/amdbtx.git
-cd amdbtx
-bash install_amd.sh --skip-rocm
-# Edit ~/.amdbtx-miner/config.yaml, set payout_address
+bash install_amd.sh --address btx1z... --skip-rocm
+# Edit ~/.amdbtx-miner/config.yaml if needed
 amdbtx-miner
 ```
-
-### 🪟 Windows (WSL2)
-
-#### Prerequisites
-
-- Windows 11 22H2+ (or Windows 10 21H2+)
-- AMD GPU with WSL GPU support (RDNA 2+/RX 6600+ recommended)
-- WSL2 with Ubuntu 22.04
-
-#### Step-by-step
-
-**1. Install WSL2 with Ubuntu**
-
-```powershell
-# From PowerShell as Admin
-wsl --install -d Ubuntu-22.04
-# Restart if prompted
-```
-
-**2. Install AMD GPU drivers**
-
-Download and install the latest AMD Adrenalin driver from [AMD.com](https://www.amd.com/en/support).
-
-**3. Run the installer**
-
-The installer sets `HSA_ENABLE_DXG_DETECTION=1`, installs the WSL/Linux pieces, writes config, and downloads the fixed prebuilt solver.
-
-```powershell
-.\install_amd.ps1 -Address "btx1z...YOUR_ADDRESS" -Worker "myrig"
-```
-
-**4. Launch the miner**
-
-```powershell
-wsl -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
-```
-
-If you have multiple Ubuntu distros, use the distro name printed by the installer:
-
-```powershell
-wsl -d Ubuntu-22.04 -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
-```
-
-Or for persistent mining (via tmux inside WSL):
-
-```powershell
-wsl -d Ubuntu-22.04 tmux new -d -s amdbtx 'amdbtx-miner 2>&1 | tee ~/.amdbtx-miner/miner.log'
-wsl -d Ubuntu-22.04 tmux attach -t amdbtx
-```
-
-### 🐳 Container (Docker/Proxmox)
-
-For containerized environments, ensure `--device=/dev/kfd --device=/dev/dri` are passed:
-
-```bash
-docker run -it --rm \
-  --device=/dev/kfd --device=/dev/dri \
-  -v /opt/rocm:/opt/rocm \
-  ubuntu:22.04 bash
-```
-
-Then run the one-liner installer inside the container.
-
----
-
-## Worker Names
-
-The pool assigns worker names based on detected GPU model and a canonical group
-(ALPHA, BRAVO, CHARLIE, DELTA, etc.):
-
-| GPU | Worker Name | Canonical Group |
-|-----|-------------|-----------------|
-| RX 7800 XT | `7800XT-ALPHA-1` | ALPHA |
-| RX 7900 XTX | `7900XTX-BRAVO-1` | BRAVO |
-| RX 6800 XT | `6800XT-CHARLIE-1` | CHARLIE |
-| RX 5700 XT | `5700XT-DELTA-1` | DELTA |
-| RX 6600 | `6600-ECHO-1` | ECHO |
-
-- The `-1` suffix is the GPU index (increment for multi-GPU rigs: `-1`, `-2`, etc.)
-- The canonical group rotates per GPU model for dashboard organization
-- Custom names can be set with `--worker` flag during install
 
 ---
 
 ## Configuration
 
-Edit `~/.amdbtx-miner/config.yaml`:
+Edit `~/.amdbtx-miner/config.yaml` (generated during install):
 
 ```yaml
 pool_host: "stratum.minebtx.com"
@@ -178,16 +87,14 @@ solver_prepare_workers: 16
 solver_batch_size: 128
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
-gpu_inputs: 0
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0
 reconnect_initial_s: 1.0
 reconnect_max_s: 60.0
 log_level: "INFO"
-venv_path: "/home/user/.amdbtx-miner/venv"
 ```
 
-CLI flags override config file values:
+CLI flags override config values:
 
 ```bash
 amdbtx-miner --payout-address btx1z... --worker-name myrig --backend rocm
@@ -219,9 +126,7 @@ Required if the pre-built binary doesn't support your GPU:
 bash build_solver.sh
 ```
 
-Output: `amdbtx-private-solver/build/btx-gbt-solve-hip`.
-
-Point `gbt_solve_path` in config to this path and re-launch.
+Output: `amdbtx-private-solver/build/btx-gbt-solve-hip`. Point `gbt_solve_path` in config to this path.
 
 ---
 
@@ -248,9 +153,7 @@ Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 ### Getting a BTX Address
 
-1. Visit https://pool.minebtx.com
-2. Register an account or use a compatible BTX wallet
-3. Copy your BTX deposit address (starts with `btx1z...` or `btx1q...`)
+The pool does **not** create wallets. Visit https://easybtx.com/wallet to create a BTX wallet and get a payout address (starts with `btx1z...` or `btx1q...`).
 
 ---
 
@@ -258,15 +161,13 @@ Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 | Symptom | Fix |
 |---------|------|
-| `invalid payout address` | Config has placeholder address — edit `~/.amdbtx-miner/config.yaml` |
-| `401 Miner does not declare pre_hash_block_tier_v18` | Upgrade wheel: `pip install --force-reinstall ~/.amdbtx-miner/amdbtx_miner.whl` |
+| `invalid payout address` | Config has placeholder — edit `~/.amdbtx-miner/config.yaml` |
 | Solver binary does nothing | Build from source: `bash build_solver.sh` |
 | `rocm-smi` not found | Install ROCm or `export PATH=/opt/rocm/bin:$PATH` |
 | `/dev/kfd` permission denied | `sudo chmod 666 /dev/kfd /dev/dri/*` |
 | GPU not detected in WSL | Set `HSA_ENABLE_DXG_DETECTION=1` in Windows env, `wsl --shutdown`, restart |
 | Low GPU utilization | Bump `solver_prepare_workers` and `solver_threads` |
 | Share rejected (code 21) | Normal after reconnect, wait 1–2 minutes |
-| `--break-system-packages` error | Use venv: `python3 -m venv ~/.amdbtx-miner/venv` then install there |
 
 ---
 
@@ -276,4 +177,3 @@ Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 - **Dashboard**: https://pool.minebtx.com
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
 - **GitHub**: https://github.com/thekillsquad007/amdbtx
-- **Pool Stratum Check**: `nc stratum.minebtx.com 3333`

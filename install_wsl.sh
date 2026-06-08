@@ -165,6 +165,14 @@ case "$GPU_ARCH" in
 esac
 
 # ──────────────────────────────────────────────────────
+# 4a. Clean previous installation
+# ──────────────────────────────────────────────────────
+if [[ -d "$INSTALL_DIR" ]]; then
+    log "removing previous installation at ${INSTALL_DIR}..."
+    rm -rf "$INSTALL_DIR"
+fi
+
+# ──────────────────────────────────────────────────────
 # 4. Build solver runtime (library resolver)
 # ──────────────────────────────────────────────────────
 # The pre-built solver binary links against specific sonames from ROCm 6.0:

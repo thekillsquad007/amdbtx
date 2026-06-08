@@ -91,6 +91,16 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 export HSA_ENABLE_DXG_DETECTION=1
 
+# Clean previous installation
+if [[ -d ~/.amdbtx-miner ]]; then
+    echo "[amdbtx] removing previous installation..."
+    rm -rf ~/.amdbtx-miner
+fi
+if [[ -d ~/.local/share/amdbtx-miner/venv ]]; then
+    echo "[amdbtx] removing previous virtual environment..."
+    rm -rf ~/.local/share/amdbtx-miner/venv
+fi
+
 # Ensure python3-venv
 python3 -m venv --help >/dev/null 2>&1 || sudo apt-get install -y -qq python3-venv 2>/dev/null || true
 
