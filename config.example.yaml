@@ -17,6 +17,10 @@ solver_prefetch_depth: 8
 solver_pipeline_async: 1
 gpu_inputs: 0
 
+# GPU device selection (-1 = auto). Set to 0/1/.. to force a specific GPU
+# on multi-GPU systems (e.g. laptops with iGPU+dGPU).
+gpu_device: -1
+
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0
 

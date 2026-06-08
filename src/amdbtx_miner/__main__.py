@@ -8,13 +8,13 @@ from pathlib import Path
 
 try:
     from .config import load_config, validate_config
-    from .hardware import detect_gpu_info
+    from .hardware import detect_gpu_info, pick_best_gpu_index
     from .stratum_client import StratumClient, Job
     from .gbt_solve_wrapper import GBTSolveWrapper
     from . import __version__, USER_AGENT
 except ImportError:
     from config import load_config, validate_config
-    from hardware import detect_gpu_info
+    from hardware import detect_gpu_info, pick_best_gpu_index
     from stratum_client import StratumClient, Job
     from gbt_solve_wrapper import GBTSolveWrapper
     __version__ = "1.0.0"
@@ -49,6 +49,7 @@ def parse_args():
     p.add_argument("--solver-backend", default="rocm", choices=["rocm", "cpu"])
     p.add_argument("--solver-threads", type=int, default=8)
     p.add_argument("--solver-batch-size", type=int, default=128)
+    p.add_argument("--gpu-device", type=int, default=-1, help="GPU device index (-1 = auto)")
     p.add_argument("--benchmark", action="store_true", help="run benchmark to find optimal config")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
@@ -162,6 +163,8 @@ def run_miner():
         cfg["solver_threads"] = args.solver_threads
     if args.solver_batch_size:
         cfg["solver_batch_size"] = args.solver_batch_size
+    if args.gpu_device >= 0:
+        cfg["gpu_device"] = args.gpu_device
     if args.log_level:
         cfg["log_level"] = args.log_level
 
@@ -180,8 +183,19 @@ def run_miner():
     gpu_info = detect_gpu_info(str(solver_path))
     if gpu_info["gpu_detected"]:
         log.info("GPU: %s (arch: %s)", gpu_info["gpu_name"], gpu_info["gpu_arch"])
+        for i, g in enumerate(gpu_info.get("gpus", [])):
+            log.info("  GPU %d: %s arch=%s vram=%sGB", i, g.get("model", "?"),
+                     g.get("compute_capability", "?"), g.get("vram_gb", "?"))
     else:
         log.warning("No AMD GPU detected — solver will likely fail with backend=rocm")
+
+    gpu_device = cfg.get("gpu_device", -1)
+    if gpu_device < 0:
+        gpus = gpu_info.get("gpus", [])
+        if gpus:
+            gpu_device = pick_best_gpu_index(gpus)
+            if len(gpus) > 1:
+                log.info("auto-selected GPU %d (dGPU with most VRAM)", gpu_device)
 
     solver = GBTSolveWrapper(
         solver_path=str(solver_path),
@@ -192,6 +206,7 @@ def run_miner():
         prefetch_depth=cfg.get("solver_prefetch_depth", 8),
         pipeline_async=cfg.get("solver_pipeline_async", 1),
         gpu_inputs=cfg.get("gpu_inputs", 0),
+        gpu_device=gpu_device,
         runtime_ld_path=cfg.get("runtime_ld_path", ""),
     )
 

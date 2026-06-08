@@ -21,6 +21,7 @@ def validate_config(cfg: dict) -> dict:
         "solver_batch_size": 128,
         "solver_prefetch_depth": 8,
         "solver_pipeline_async": 1,
+        "gpu_device": -1,
         "gpu_inputs": 0,
         "nonces_per_slice": 20000000,
         "solver_max_seconds_per_slice": 5.0,

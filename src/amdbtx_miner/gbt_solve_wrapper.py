@@ -12,7 +12,7 @@ class GBTSolveWrapper:
     def __init__(self, solver_path: str, backend: str = "rocm", threads: int = 8,
                  prepare_workers: int = 16, batch_size: int = 128,
                  prefetch_depth: int = 8, pipeline_async: int = 1,
-                 gpu_inputs: int = 0,
+                 gpu_inputs: int = 0, gpu_device: int = -1,
                  runtime_ld_path: str = ""):
         self.solver_path = Path(solver_path).expanduser()
         self.backend = backend
@@ -22,6 +22,7 @@ class GBTSolveWrapper:
         self.prefetch_depth = prefetch_depth
         self.pipeline_async = pipeline_async
         self.gpu_inputs = gpu_inputs
+        self.gpu_device = gpu_device
         self.runtime_ld_path = runtime_ld_path
         self.proc: subprocess.Popen | None = None
         self.last_observed_nps = None
@@ -65,6 +66,8 @@ class GBTSolveWrapper:
         env["BTX_MATMUL_PREPARE_PREFETCH_DEPTH"] = str(self.prefetch_depth)
         env["BTX_MATMUL_PIPELINE_ASYNC"] = str(self.pipeline_async)
         env["BTX_MATMUL_GPU_INPUTS"] = str(self.gpu_inputs)
+        if self.gpu_device >= 0:
+            env["HIP_VISIBLE_DEVICES"] = str(self.gpu_device)
 
         backend_arg = "hip" if self.backend in ("rocm", "hip") else self.backend
         cmd = [

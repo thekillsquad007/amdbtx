@@ -321,17 +321,44 @@ def collect_static_hardware(
 
 
 def detect_gpu_info(solver_path: str | None = None) -> dict:
-    info = {"gpu_detected": False, "gpu_name": "", "gpu_arch": ""}
+    info = {"gpu_detected": False, "gpu_name": "", "gpu_arch": "", "gpus": []}
     gpus = _enumerate_amd_gpus()
     if not gpus:
         solver_gpu = _probe_solver_gpu(solver_path)
         if solver_gpu:
             gpus = [solver_gpu]
+    info["gpus"] = gpus
     if gpus:
+        best = pick_best_gpu(gpus)
         info["gpu_detected"] = True
-        info["gpu_name"] = gpus[0].get("model", "")
-        info["gpu_arch"] = gpus[0].get("compute_capability", "")
+        info["gpu_name"] = best.get("model", "")
+        info["gpu_arch"] = best.get("compute_capability", "")
     return info
+
+
+def pick_best_gpu(gpus: list[dict]) -> dict | None:
+    if not gpus:
+        return None
+    if len(gpus) == 1:
+        return gpus[0]
+    sorted_gpus = sorted(
+        gpus,
+        key=lambda g: (
+            1 if (g.get("compute_capability") or "").startswith("gfx9") else 0,
+            -(g.get("vram_gb") or 0),
+        ),
+    )
+    return sorted_gpus[0]
+
+
+def pick_best_gpu_index(gpus: list[dict]) -> int:
+    if not gpus:
+        return -1
+    best = pick_best_gpu(gpus)
+    for i, g in enumerate(gpus):
+        if g is best:
+            return i
+    return 0
 
 
 def hardware_summary_string(hw: dict[str, Any]) -> str:

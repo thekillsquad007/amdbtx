@@ -103,6 +103,7 @@ solver_prepare_workers: 16
 solver_batch_size: 128
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
+gpu_device: -1           # -1 = auto, 0/1/.. = force specific GPU (laptop iGPU+dGPU)
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0
 reconnect_initial_s: 1.0
