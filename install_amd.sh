@@ -467,12 +467,10 @@ else
         log "solver compilation successful"
         install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
         SOLVER_BUILT_FROM_SOURCE=1
-    else
-        warn "solver compilation failed (see log below). Falling back to pre-built binary."
+else
+        warn "solver compilation failed (see log below). Try installing rocm-dev or hip-dev."
         cat "$BUILD_LOG" >&2
-        log "downloading pre-built solver binary from ${SOLVER_URL}..."
-        curl -fsSL "$SOLVER_URL" -o "$SOLVER_PATH" 2>/dev/null || \
-            err "failed to download pre-built solver binary. GPU mining will not work."
+        err "solver compilation failed. GPU mining cannot proceed without a working solver binary."
     fi
 fi
 
