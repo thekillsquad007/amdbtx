@@ -62,7 +62,7 @@ if ($distros) {
         }
     }
 }
-if (-not $wslDistro) { Err "No Ubuntu WSL distro found. Install: wsl --install -d Ubuntu-22.04" }
+if (-not $wslDistro) { Err "No Ubuntu WSL distro found. Install: wsl --install -d Ubuntu" }
 $wslDistro = $wslDistro.Trim()
 Log "Using WSL distro: $wslDistro"
 

@@ -308,34 +308,47 @@ elif ! command -v rocm-smi >/dev/null 2>&1; then
     if [[ -z "$ROCM_REPO_VER" ]]; then
         err "automatic ROCm install is supported on Ubuntu 22.04 (jammy) and 24.04 (noble). Install ROCm manually, then rerun with --skip-rocm."
     fi
-    log "ROCm not detected. Installing ROCm ${ROCM_REPO_VER} packages..."
+    log "ROCm not detected. Installing ROCm packages..."
     if command -v apt-get >/dev/null 2>&1; then
         sudo_cmd apt-get update -qq || true
         sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget gnupg2 curl ca-certificates || true
 
-        log "adding ROCm repo..."
-        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list > /dev/null
-
-        # Remove stale ROCm 5.x sources if any
-        for old in /etc/apt/sources.list.d/rocm*.list; do
-            [[ -f "$old" ]] && grep -q "rocm/apt/5\." "$old" 2>/dev/null && sudo_cmd rm -f "$old" && log "removed stale ROCm 5.x source: $old"
+        # First try system packages (Ubuntu 26.04+ has ROCm in main repos).
+        # Prebuilt packages: rocm-hip-runtime (ROCm 6.x), hip-runtime-amd (ROCm 7.x).
+        ROCM_INSTALL_OK=0
+        for pkg_set in "rocm-hip-runtime rocminfo" "hip-runtime-amd rocminfo"; do
+            if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
+                ROCM_INSTALL_OK=1
+                log "ROCm installed from system repositories"
+                break
+            fi
         done
 
-        log "updating package lists..."
-        sudo_cmd apt-get update -qq 2>&1 | grep -v "Warning:" || true
+        if [[ "$ROCM_INSTALL_OK" -eq 0 ]]; then
+            log "system packages not available, trying external ROCm repo..."
+            echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list > /dev/null
 
-        # Install only the runtime needed by the pre-built miner. Full rocm-dev
-        # pulls compiler/debugger packages that conflict on WSL/Noble.
-        log "installing ROCm runtime packages (may take several minutes)..."
-        if [[ "$ROCM_REPO_VER" == "7."* ]]; then
-            RUNTIME_PACKAGES=(hip-runtime-amd rocminfo)
-        else
-            RUNTIME_PACKAGES=(rocm-hip-runtime rocminfo)
-        fi
-        if ! sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${RUNTIME_PACKAGES[@]}" 2>&1 | tail -10; then
-            warn "ROCm runtime install failed — diagnosing..."
-            sudo_cmd apt-get install -y "${RUNTIME_PACKAGES[@]}" 2>&1 | grep -E "Depends:|not going|broken|held|not installable" | head -10 >&2 || true
-            warn "install ROCm runtime manually, then rerun with --skip-rocm"
+            # Remove stale ROCm 5.x sources if any
+            for old in /etc/apt/sources.list.d/rocm*.list; do
+                [[ -f "$old" ]] && grep -q "rocm/apt/5\." "$old" 2>/dev/null && sudo_cmd rm -f "$old" && log "removed stale ROCm 5.x source: $old"
+            done
+
+            log "updating package lists..."
+            sudo_cmd apt-get update -qq 2>&1 | grep -v "Warning:" || true
+
+            # Install only the runtime needed by the pre-built miner. Full rocm-dev
+            # pulls compiler/debugger packages that conflict on WSL/Noble.
+            log "installing ROCm runtime packages (may take several minutes)..."
+            if [[ "$ROCM_REPO_VER" == "7."* ]]; then
+                RUNTIME_PACKAGES=(hip-runtime-amd rocminfo)
+            else
+                RUNTIME_PACKAGES=(rocm-hip-runtime rocminfo)
+            fi
+            if ! sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${RUNTIME_PACKAGES[@]}" 2>&1 | tail -10; then
+                warn "ROCm runtime install failed — diagnosing..."
+                sudo_cmd apt-get install -y "${RUNTIME_PACKAGES[@]}" 2>&1 | grep -E "Depends:|not going|broken|held|not installable" | head -10 >&2 || true
+                warn "install ROCm runtime manually, then rerun with --skip-rocm"
+            fi
         fi
 
         # Add to PATH
@@ -514,20 +527,23 @@ if [[ -n "$MISSING" ]]; then
     echo "$MISSING" | while read -r line; do warn "  $line"; done
     # Fallback: try apt install
     ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
-    if [[ -z "$ROCM_REPO_VER" ]]; then
-        warn "cannot auto-install missing ROCm libraries on this OS; install ROCm manually and rerun with --skip-rocm"
-    elif [[ "$ROCM_REPO_VER" == "7."* ]]; then
+    EXTRA_ROCM_PACKAGES=()
+    if [[ "$ROCM_REPO_VER" == "7."* ]]; then
         EXTRA_ROCM_PACKAGES=(hip-runtime-amd rocminfo)
     else
         EXTRA_ROCM_PACKAGES=(rocm-hip-runtime rocminfo)
     fi
     if [[ -n "$ROCM_REPO_VER" ]]; then
-        log "attempting to install missing libraries via apt..."
-        curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
-        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
-        if sudo_cmd apt-get update -qq 2>/dev/null && \
-           sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
-            log "apt install succeeded"
+        # Try system packages first (Ubuntu 26.04+ has ROCm in main repos)
+        if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
+            log "apt install succeeded (system packages)"
+        else
+            log "system packages not available, trying external ROCm repo..."
+            curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
+            echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
+            if sudo_cmd apt-get update -qq 2>/dev/null && \
+               sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
+                log "apt install succeeded"
             for d in /opt/rocm-*/lib; do [[ -d "$d" ]] && ROCM_LIB_DIRS+=("$d"); done
             for soname in "${!SOLVER_LIBS[@]}"; do resolve_lib "$soname" "${SOLVER_LIBS[$soname]}" || true; done
             RUNTIME_LD_PATH="$RUNTIME_DIR"
@@ -539,6 +555,7 @@ if [[ -n "$MISSING" ]]; then
             warn "apt install timed out or failed - solver may not work"
         fi
     fi
+fi
 else
     log "all solver libraries resolved"
 fi
