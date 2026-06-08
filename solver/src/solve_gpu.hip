@@ -418,7 +418,8 @@ uint64_t current_nonce = state.nonce;
     for (uint32_t bi = 0; bi < actual_batch; ++bi) {
             const Element* batch_words = host_output.data() + size_t(bi) * words_per_request;
             Uint256 sigma;
-            std::memcpy(sigma.data, host_sigma.data() + size_t(bi) * 32, 32);
+            const uint8_t* src = host_sigma.data() + size_t(bi) * 32;
+            for (int i = 0; i < 32; ++i) sigma.data[i] = src[31 - i];
             Uint256 c_prime_hash = transcript::HashMatrixWords(batch_words, words_per_request);
             Uint256 digest = transcript::FinalizeProductCommittedDigest(
                 c_prime_hash, sigma, n, b);
