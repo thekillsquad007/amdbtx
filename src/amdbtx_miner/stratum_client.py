@@ -95,7 +95,6 @@ class StratumClient:
         self.shares_rejected = 0
         self.blocks_found = 0
         self._current_job: Job | None = None
-        self._suppress_canonical_reauth = False
         self._connect()
 
     def _next_id(self) -> int:
@@ -131,24 +130,24 @@ class StratumClient:
             raise RuntimeError(f"bad subscribe response: {sub!r}")
         log.info("subscribed; extranonce1=%s en2_size=%d", self._extranonce1[:8], self._extranonce2_size)
 
-        # Authorize address-only first. The pool returns a canonical worker name
-        # from hardware metadata; using the operator label here creates an extra
-        # dashboard worker such as "default".
+        # Authorize once with the payout address. No re-authorize with a
+        # full "address.worker" identity — that can create a separate PPLNS
+        # sub-account on the pool's side.
         ok = self._call("mining.authorize", [self.payout_address, ""])
         if not ok:
             raise RuntimeError(f"authorize rejected for address={self.payout_address}")
+        log.info("authorized as %s", self.payout_address)
 
+        # Drain handshake messages (set_canonical_name, set_difficulty, etc.).
+        # The canonical worker name is used as a label for share submissions,
+        # not for re-authorization.
         self._drain_handshake_messages(2.0)
 
         if self._canonical_worker_name:
             self.worker_name = self._canonical_worker_name
-            worker = self._worker_for(self.payout_address)
-            ok = self._call("mining.authorize", [worker, ""])
-            if not ok:
-                raise RuntimeError(f"authorize rejected for worker={worker}")
-            log.info("authorized as canonical worker %s", worker)
+            log.info("canonical worker name: %s", self.worker_name)
         else:
-            log.info("authorized as %s", self.payout_address)
+            log.info("no canonical name assigned, using address-only")
 
     def _drain_handshake_messages(self, seconds: float):
         if self.sock is None:
@@ -156,7 +155,6 @@ class StratumClient:
         deadline = time.time() + seconds
         old_timeout = self.sock.gettimeout()
         try:
-            self._suppress_canonical_reauth = True
             self.sock.settimeout(0.2)
             while time.time() < deadline and not self._canonical_worker_name:
                 try:
@@ -165,7 +163,6 @@ class StratumClient:
                     continue
                 self._handle_server_message(msg)
         finally:
-            self._suppress_canonical_reauth = False
             self.sock.settimeout(old_timeout)
 
     def _build_solver_env(self) -> dict[str, Any]:
@@ -234,8 +231,6 @@ class StratumClient:
             if canonical:
                 self._canonical_worker_name = canonical
                 self.worker_name = canonical
-                if not self._suppress_canonical_reauth:
-                    self.send_authorize(self.payout_address)
             log.info("canonical name: %s", params)
 
     @staticmethod
@@ -247,9 +242,6 @@ class StratumClient:
         if isinstance(params, dict):
             return str(params.get("canonical_name", "") or "")
         return ""
-
-    def _worker_for(self, address: str) -> str:
-        return f"{address}.{self.worker_name}" if self.worker_name else address
 
     def _call(self, method: str, params: list) -> Any:
         msg_id = self._next_id()
@@ -265,9 +257,8 @@ class StratumClient:
         raise RuntimeError(f"{method} timed out")
 
     def send_authorize(self, address: str):
-        worker = self._worker_for(address)
         msg_id = self._next_id()
-        self._send({"id": msg_id, "method": "mining.authorize", "params": [worker, ""]})
+        self._send({"id": msg_id, "method": "mining.authorize", "params": [address, ""]})
 
     def get_job(self) -> Job:
         if self._current_job is not None:
@@ -296,7 +287,7 @@ class StratumClient:
                 return job
 
     def submit_share(self, job: Job, result: dict):
-        worker = self._worker_for(self.payout_address)
+        worker = self.worker_name or self.payout_address
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime = f"{job.time:08x}"
         extranonce2 = "00" * self._extranonce2_size
