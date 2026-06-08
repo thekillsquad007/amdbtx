@@ -42,8 +42,8 @@ if ($hsaEnv -ne "1") {
 if (-not $SkipWslInstall) {
     $wslList = wsl -l 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Log "Installing WSL2..."
-        wsl --install -d Ubuntu-22.04
+        Log "Installing WSL2 with Ubuntu..."
+        wsl --install -d Ubuntu
         Log "WSL2 installed. Please restart Windows and re-run this script."
         exit 0
     }

@@ -97,6 +97,7 @@ apt_install() {
 
 rocm_repo_for_codename() {
     local codename="$1"
+    local version_id="$2"
     if [[ -n "${ROCM_REPO_VER:-}" ]]; then
         echo "$ROCM_REPO_VER"
         return 0
@@ -104,16 +105,45 @@ rocm_repo_for_codename() {
     case "$codename" in
         noble|oracular|plucky) echo "7.2" ;;
         jammy) echo "6.4" ;;
-        *) echo "" ;;
+        *)
+            # Fallback to version number for unknown codenames (e.g. Ubuntu 26.04)
+            if [[ -n "$version_id" ]]; then
+                local major="${version_id%%.*}"
+                if [[ "$major" -ge 24 ]]; then
+                    echo "7.2"
+                elif [[ "$major" -ge 22 ]]; then
+                    echo "6.4"
+                else
+                    echo ""
+                fi
+            else
+                echo ""
+            fi
+            ;;
     esac
 }
 
 python_apt_packages_for_codename() {
     local codename="$1"
+    local version_id="$2"
     case "$codename" in
         noble|oracular|plucky) echo "python3 python3-venv python3-pip" ;;
         jammy) echo "python3.10 python3.10-venv python3-pip" ;;
-        *) echo "" ;;
+        *)
+            # Fallback for unknown codenames
+            if [[ -n "$version_id" ]]; then
+                local major="${version_id%%.*}"
+                if [[ "$major" -ge 24 ]]; then
+                    echo "python3 python3-venv python3-pip"
+                elif [[ "$major" -ge 22 ]]; then
+                    echo "python3.10 python3.10-venv python3-pip"
+                else
+                    echo ""
+                fi
+            else
+                echo ""
+            fi
+            ;;
     esac
 }
 
@@ -125,6 +155,10 @@ confirm() {
 
 # ─── OS + GPU Detection ────────────────────────────────────────────────────
 log "AMDBTX miner installer — AMD GPU edition"
+
+# HSA_ENABLE_DXG_DETECTION is required for AMD GPU detection in WSL2.
+# Setting it early ensures rocminfo/rocm-smi can see the GPU later.
+export HSA_ENABLE_DXG_DETECTION=1
 
 OS="$(uname -s)"
 if [[ "$OS" != "Linux" ]]; then
@@ -165,47 +199,51 @@ else
     warn "apt-get not found; installer can still run, but you must provide Python 3.10+, curl, and ROCm runtime libraries"
 fi
 
-# Detect AMD GPU
+# Detect AMD GPU (first pass: rocm-smi/rocminfo if ROCm is already installed)
 HAS_AMD=0
 GPU_NAME=""
 GPU_ARCH=""
-if command -v rocm-smi >/dev/null 2>&1; then
-    GPU_NAME="$(rocm-smi --showproductname 2>/dev/null | head -1 || true)"
-    if [[ -n "$GPU_NAME" && "$GPU_NAME" != *"None"* ]]; then
-        HAS_AMD=1
-        log "detected AMD GPU: ${GPU_NAME}"
-        GPU_ARCH="$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)"
-        if [[ -n "$GPU_ARCH" ]]; then
-            log "GPU arch: ${GPU_ARCH}"
+detect_amd_gpu() {
+    local has=0 name="" arch=""
+    if command -v rocm-smi >/dev/null 2>&1; then
+        name="$(rocm-smi --showproductname 2>/dev/null | head -1 || true)"
+        if [[ -n "$name" && "$name" != *"None"* ]]; then
+            has=1
+            arch="$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]+' || true)"
         fi
     fi
-fi
-if [[ "$HAS_AMD" -eq 0 ]] && command -v rocminfo >/dev/null 2>&1; then
-    if ROCMINFO_OUT=$(rocminfo 2>/dev/null); then
-        GPU_NAME=$(echo "$ROCMINFO_OUT" | awk '
-            /Agent [0-9]/ { mktname=""; devtype=""; }
-            /Marketing Name:/ { sub(/^.*Marketing Name: */, ""); mktname=$0; sub(/ *$/, "", mktname); }
-            /Device Type.*GPU/ { devtype="GPU"; }
-            devtype=="GPU" && mktname!="" { print mktname; devtype=""; exit; }
-        ' || true)
-        GPU_ARCH=$(echo "$ROCMINFO_OUT" | awk '
-            /Agent [0-9]/ { devtype=""; arch=""; }
-            /Device Type.*GPU/ { devtype="GPU"; }
-            /gfx[0-9a-f]+/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]+/); arch=substr($0, RSTART, RLENGTH); }
-            END { print arch; }
-        ' || true)
-        if [[ -n "$GPU_ARCH" ]]; then
-            HAS_AMD=1
-            if [[ -z "$GPU_NAME" || "$GPU_NAME" == *"None"* ]]; then
-                GPU_NAME="AMD-$GPU_ARCH"
+    if [[ "$has" -eq 0 ]] && command -v rocminfo >/dev/null 2>&1; then
+        local out
+        out=$(rocminfo 2>/dev/null) || true
+        if [[ -n "$out" ]]; then
+            name=$(echo "$out" | awk '
+                /Agent [0-9]/ { mktname=""; devtype=""; }
+                /Marketing Name:/ { sub(/^.*Marketing Name: */, ""); mktname=$0; sub(/ *$/, "", mktname); }
+                /Device Type.*GPU/ { devtype="GPU"; }
+                devtype=="GPU" && mktname!="" { print mktname; devtype=""; exit; }
+            ' || true)
+            arch=$(echo "$out" | awk '
+                /Agent [0-9]/ { devtype=""; arch=""; }
+                /Device Type.*GPU/ { devtype="GPU"; }
+                /gfx[0-9a-f]+/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]+/); arch=substr($0, RSTART, RLENGTH); }
+                END { print arch; }
+            ' || true)
+            if [[ -n "$arch" ]]; then
+                has=1
+                [[ -z "$name" || "$name" == *"None"* ]] && name="AMD-$arch"
             fi
-            log "detected AMD GPU: ${GPU_NAME} (arch: ${GPU_ARCH})"
         fi
     fi
-fi
+    if [[ "$has" -eq 1 ]]; then
+        HAS_AMD=1
+        GPU_NAME="$name"
+        GPU_ARCH="$arch"
+        log "detected AMD GPU: ${GPU_NAME}${GPU_ARCH:+ (arch: ${GPU_ARCH})}"
+    fi
+}
+detect_amd_gpu
 if [[ "$HAS_AMD" -eq 0 ]]; then
-    warn "no AMD GPU detected via rocm-smi — solver will run on CPU only (much slower)"
-    warn "ensure /dev/kfd and /dev/dri are accessible in your container"
+    warn "no AMD GPU detected yet (will retry after ROCm install)"
 fi
 
 # Container environment detection
@@ -238,7 +276,7 @@ for cand in python3.12 python3.11 python3.10 python3; do
 done
 
 if [[ -z "$PYTHON" ]]; then
-    PY_PKGS="$(python_apt_packages_for_codename "$UBUNTU_CODENAME")"
+    PY_PKGS="$(python_apt_packages_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
     if [[ -z "$PY_PKGS" ]]; then
         err "Python 3.10+ is required. Please use Ubuntu 22.04+ or install Python 3.10+ manually."
     fi
@@ -266,7 +304,7 @@ if [[ "$SKIP_ROCM" -eq 1 ]]; then
 elif [[ "$ROCM_LIB_PRESENT" -eq 1 ]]; then
     log "ROCm runtime libraries detected under /opt; skipping package installation"
 elif ! command -v rocm-smi >/dev/null 2>&1; then
-    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME")"
+    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
     if [[ -z "$ROCM_REPO_VER" ]]; then
         err "automatic ROCm install is supported on Ubuntu 22.04 (jammy) and 24.04 (noble). Install ROCm manually, then rerun with --skip-rocm."
     fi
@@ -311,6 +349,12 @@ elif ! command -v rocm-smi >/dev/null 2>&1; then
         else
             warn "ROCm install completed but rocm-smi not in PATH"
             warn "Add to your shell: export PATH=/opt/rocm/bin:\$PATH"
+        fi
+
+        # Re-detect GPU now that ROCm is installed
+        detect_amd_gpu
+        if [[ "$HAS_AMD" -eq 0 ]]; then
+            warn "GPU still not detected via rocm-smi/rocminfo — will try solver probe later"
         fi
     else
         err "apt-get not available; install ROCm 6.x manually then re-run"
@@ -469,7 +513,7 @@ if [[ -n "$MISSING" ]]; then
     warn "solver has unresolved libraries:"
     echo "$MISSING" | while read -r line; do warn "  $line"; done
     # Fallback: try apt install
-    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME")"
+    ROCM_REPO_VER="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
     if [[ -z "$ROCM_REPO_VER" ]]; then
         warn "cannot auto-install missing ROCm libraries on this OS; install ROCm manually and rerun with --skip-rocm"
     elif [[ "$ROCM_REPO_VER" == "7."* ]]; then
@@ -505,15 +549,24 @@ if [[ -n "$FINAL_MISSING" ]]; then
     warn "GPU mining may not start until ROCm runtime packages are fixed."
 fi
 
-# If rocm-smi/rocminfo was unavailable before installation, use the solver's
-# own HIP startup line as a final GPU detection fallback.
-if [[ "$HAS_AMD" -eq 0 ]]; then
-    SOLVER_PROBE="$(printf '%s\n' '{"version":536870912,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","time":1779672814,"bits":"1d17c609","seed_a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seed_b":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_height":1,"nonce_start":0,"max_tries":1,"max_seconds":1,"share_target":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" HSA_ENABLE_DXG_DETECTION=1 "$SOLVER_PATH" --daemon --backend hip --epsilon-bits 0 --batch-size 1 2>&1 | head -3 || true)"
-    if echo "$SOLVER_PROBE" | grep -q 'HIP GPU detected:'; then
-        HAS_AMD=1
-        GPU_NAME="$(echo "$SOLVER_PROBE" | sed -nE 's/^HIP GPU detected: (.*) arch=(gfx[0-9a-f]+) memory=.*/\1/p' | head -1)"
-        GPU_ARCH="$(echo "$SOLVER_PROBE" | grep -oE 'gfx[0-9a-f]+' | head -1)"
-        log "detected AMD GPU via solver: ${GPU_NAME:-AMD GPU} ${GPU_ARCH:+(arch: $GPU_ARCH)}"
+# Solver probe: launch the solver binary briefly and parse its HIP startup line.
+# This is the most reliable GPU detection — it works even when rocm-smi/rocminfo
+# are missing or misconfigured, and provides the exact GPU model + arch + VRAM.
+log "probing AMD GPU via solver binary..."
+SOLVER_PROBE="$(printf '%s\n' '{"version":536870912,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","merkle_root":"0000000000000000000000000000000000000000000000000000000000000000","time":1779672814,"bits":"1d17c609","seed_a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seed_b":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","block_height":1,"nonce_start":0,"max_tries":1,"max_seconds":1,"share_target":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}' | LD_LIBRARY_PATH="$RUNTIME_LD_PATH" HSA_ENABLE_DXG_DETECTION=1 "$SOLVER_PATH" --daemon --backend hip --epsilon-bits 0 --batch-size 1 2>&1 | head -3 || true)"
+PROBE_GPU_NAME="$(echo "$SOLVER_PROBE" | sed -nE 's/^HIP GPU detected: (.*) arch=(gfx[0-9a-f]+) memory=.*/\1/p' | head -1)"
+PROBE_GPU_ARCH="$(echo "$SOLVER_PROBE" | grep -oE 'gfx[0-9a-f]+' | head -1)"
+if [[ -n "$PROBE_GPU_ARCH" ]]; then
+    HAS_AMD=1
+    GPU_NAME="${PROBE_GPU_NAME:-AMD GPU}"
+    GPU_ARCH="$PROBE_GPU_ARCH"
+    log "detected AMD GPU via solver: ${GPU_NAME} (arch: ${GPU_ARCH})"
+else
+    if [[ "$HAS_AMD" -eq 1 ]]; then
+        log "using GPU detected earlier via rocm-smi/rocminfo: ${GPU_NAME} ${GPU_ARCH:+(arch: ${GPU_ARCH})}"
+    else
+        warn "no AMD GPU detected by solver probe either — solver will run on CPU only (much slower)"
+        warn "ensure /dev/kfd and /dev/dri are accessible"
     fi
 fi
 
