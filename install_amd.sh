@@ -438,16 +438,19 @@ else
     tar xzf "$BUILD_DIR/repo.tar.gz" -C "$BUILD_DIR"
     SOLVER_SRC_DIR="$BUILD_DIR/amdbtx-main/solver"
 
-    # Install HIP development packages for compilation if not already present
-    if ! command -v hipcc >/dev/null 2>&1 && \
-       ! find /opt/rocm /opt/rocm-* -name 'hip_runtime.h' -print -quit 2>/dev/null | grep -q .; then
-        log "installing HIP development packages for solver compilation..."
-        for pkg_set in "rocm-hip-development" "hip-dev" "rocm-dev" "hip-devel"; do
-            if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
-                log "installed $pkg_set"
-                break
-            fi
-        done
+    # Install HIP development packages for compilation if not already present.
+    # build.sh prefers /opt/rocm's hipcc/headers when available (ROCm version matching runtime).
+    # Only install system dev packages if /opt/rocm lacks headers entirely.
+    if ! find /opt/rocm /opt/rocm-* -name 'hip_runtime.h' -print -quit 2>/dev/null | grep -q .; then
+        if ! command -v hipcc >/dev/null 2>&1; then
+            log "installing HIP development packages for solver compilation..."
+            for pkg_set in "hip-dev" "rocm-dev" "hip-devel" "rocm-hip-development"; do
+                if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
+                    log "installed $pkg_set"
+                    break
+                fi
+            done
+        fi
     fi
 
     log "compiling solver for detected GPU architecture..."
@@ -602,6 +605,8 @@ if [[ -n "$MISSING" ]]; then
             if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${EXTRA_ROCM_PACKAGES[@]}" libdrm-amdgpu1 libnuma1 libelf1 libzstd1 2>/dev/null; then
                 ROCM_APT_OK=1
                 log "apt install succeeded (external ROCm repo)"
+                # Install matching dev packages for solver compilation
+                sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hip-dev 2>/dev/null || true
             fi
         fi
     elif [[ "$ROCM_APT_OK" -eq 0 ]]; then

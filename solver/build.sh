@@ -8,17 +8,19 @@ SRC_DIR="${SCRIPT_DIR}/src"
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "$BUILD_DIR"
 
-# --- Find HIP compiler ---
+# --- Find HIP compiler (prefer /opt/rocm over system hipcc) ---
 HIPCC=""
-if command -v hipcc >/dev/null 2>&1; then
+for cand in /opt/rocm /opt/rocm-*; do
+    if [[ -f "$cand/bin/hipcc" ]]; then
+        HIPCC="$cand/bin/hipcc"
+        break
+    fi
+done
+if [[ -z "$HIPCC" ]] && command -v hipcc >/dev/null 2>&1; then
     HIPCC="hipcc"
 fi
 if [[ -z "$HIPCC" ]]; then
     for cand in /opt/rocm /opt/rocm-*; do
-        if [[ -f "$cand/bin/hipcc" ]]; then
-            HIPCC="$cand/bin/hipcc"
-            break
-        fi
         if [[ -f "$cand/lib/llvm/bin/clang++" ]]; then
             HIPCC="$cand/lib/llvm/bin/clang++"
             break
@@ -33,20 +35,19 @@ fi
 echo "Using HIP compiler: $HIPCC"
 
 # --- Find ROCm include/lib paths ---
+# Prefer /opt/rocm over hipconfig (which may point to system-installed older ROCm)
 ROCM_INCLUDE=""
 ROCM_LIB=""
-if command -v hipconfig >/dev/null 2>&1; then
+for cand in /opt/rocm /opt/rocm-*; do
+    if [[ -d "$cand/include/hip" ]]; then
+        ROCM_INCLUDE="$cand/include"
+        ROCM_LIB="$cand/lib"
+        break
+    fi
+done
+if [[ -z "$ROCM_INCLUDE" ]] && command -v hipconfig >/dev/null 2>&1; then
     ROCM_INCLUDE="$(hipconfig --hip-path 2>/dev/null)/include"
     ROCM_LIB="$(hipconfig --hip-path 2>/dev/null)/lib"
-fi
-if [[ -z "$ROCM_INCLUDE" ]]; then
-    for cand in /opt/rocm /opt/rocm-*; do
-        if [[ -d "$cand/include/hip" ]]; then
-            ROCM_INCLUDE="$cand/include"
-            ROCM_LIB="$cand/lib"
-            break
-        fi
-    done
 fi
 if [[ -z "$ROCM_INCLUDE" ]]; then
     # System install (Ubuntu 26.04+)
