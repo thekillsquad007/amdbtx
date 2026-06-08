@@ -65,10 +65,10 @@ echo "ROCm lib: $ROCM_LIB"
 # --- Determine GPU architecture ---
 ARCHS=""
 if command -v rocminfo >/dev/null 2>&1; then
-    ARCHS=$(rocminfo 2>/dev/null | awk '/gfx[0-9a-f]+/{match($0,/gfx[0-9a-f]+/); arch=substr($0,RSTART,RLENGTH); if(arch!="") gpus[arch]=1} END{for(a in gpus) print a}' | sort -u)
+    ARCHS=$(rocminfo 2>/dev/null | awk 'match($0,/gfx[0-9a-f]{3,}/){arch=substr($0,RSTART,RLENGTH); if(arch!="") gpus[arch]=1} END{for(a in gpus) print a}' | sort -u)
 fi
 if [[ -z "$ARCHS" ]] && command -v rocm-smi >/dev/null 2>&1; then
-    ARCHS=$(rocm-smi --showid 2>/dev/null | grep -oP 'gfx[0-9a-f]+' | sort -u)
+    ARCHS=$(rocm-smi --showid 2>/dev/null | grep -oP 'gfx[0-9a-f]{3,}' | sort -u)
 fi
 if [[ -z "$ARCHS" ]]; then
     # Fallback: compile for common targets
