@@ -176,9 +176,21 @@ static bool InitGPU() {
   int device_count = 0;
   hipError_t err = hipGetDeviceCount(&device_count);
   if (err != hipSuccess || device_count == 0) return false;
-  err = hipSetDevice(0);
+
+  int best_device = 0;
+  size_t best_mem = 0;
+  for (int i = 0; i < device_count; ++i) {
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, i) == hipSuccess) {
+      if (prop.totalGlobalMem > best_mem) {
+        best_mem = prop.totalGlobalMem;
+        best_device = i;
+      }
+    }
+  }
+  err = hipSetDevice(best_device);
   if (err != hipSuccess) return false;
-  g_gpu.device_id = 0;
+  g_gpu.device_id = best_device;
   g_gpu.initialized = true;
   return true;
 }

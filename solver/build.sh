@@ -80,6 +80,14 @@ if [[ -z "$ARCHS" ]]; then
     echo "Warning: could not detect GPU arch, compiling for all common targets"
 fi
 
+# Exclude integrated GPU architectures that cause runtime memory faults
+# on multi-GPU systems due to constant-memory context mismatch.
+ARCHS=$(echo "$ARCHS" | tr ' ' '\n' | grep -v 'gfx90c' | sort -u | tr '\n' ' ')
+if [[ -z "$ARCHS" ]]; then
+    echo "Error: no suitable GPU architecture found after filtering"
+    exit 1
+fi
+
 ARCH_FLAGS=""
 for arch in $ARCHS; do
     ARCH_FLAGS="$ARCH_FLAGS --offload-arch=$arch"
