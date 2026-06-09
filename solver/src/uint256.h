@@ -29,7 +29,13 @@ inline std::array<uint8_t, 32> ToCanonicalBytes(const Uint256& value) {
 
 inline Uint256 BytesToUint256(const uint8_t* bytes) {
     Uint256 out;
-    for (size_t i = 0; i < 32; ++i)
+    std::memcpy(out.data, bytes, 32);
+    return out;
+}
+
+inline Uint256 CanonicalBytesToUint256(const uint8_t* bytes) {
+    Uint256 out;
+    for (int i = 0; i < 32; ++i)
         out.data[i] = bytes[31 - i];
     return out;
 }

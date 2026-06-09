@@ -73,6 +73,30 @@ class Job:
             )
         raise ValueError(f"cannot parse notify params: type={type(params)}")
 
+    def should_replace(self, other: "Job") -> bool:
+        return bool(other.clean_jobs) or other.block_height != self.block_height
+
+    def merge_from(self, other: "Job") -> None:
+        """Apply same-height pool updates without resetting our nonce counter."""
+        saved_nonce = self.nonce64_start
+        self.job_id = other.job_id
+        self.version = other.version
+        self.prev_hash = other.prev_hash
+        self.merkle_root = other.merkle_root
+        self.time = other.time
+        self.bits = other.bits
+        self.target = other.target
+        self.seed_a = other.seed_a
+        self.seed_b = other.seed_b
+        self.block_height = other.block_height
+        self.matmul_n = other.matmul_n
+        self.matmul_b = other.matmul_b
+        self.matmul_r = other.matmul_r
+        self.epsilon_bits = other.epsilon_bits
+        self.clean_jobs = other.clean_jobs
+        self.received_at = other.received_at
+        self.nonce64_start = saved_nonce
+
 
 class StratumClient:
     def __init__(self, host: str, port: int, payout_address: str, worker_name: str,
@@ -169,7 +193,7 @@ class StratumClient:
         env: dict[str, Any] = {
             "BTX_MATMUL_BACKEND": self.cfg.get("solver_backend", "rocm"),
             "BTX_MATMUL_GPU_INPUTS": self.cfg.get("gpu_inputs", 0),
-            "BTX_MATMUL_SOLVE_BATCH_SIZE": self.cfg.get("solver_batch_size", 128),
+            "BTX_MATMUL_SOLVE_BATCH_SIZE": self.cfg.get("solver_batch_size", 1024),
             "BTX_MATMUL_PREPARE_PREFETCH_DEPTH": self.cfg.get("solver_prefetch_depth", 8),
             "BTX_MATMUL_PREPARE_WORKERS": self.cfg.get("solver_prepare_workers", 16),
             "BTX_MATMUL_PIPELINE_ASYNC": self.cfg.get("solver_pipeline_async", 1),
@@ -291,7 +315,7 @@ class StratumClient:
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime = f"{job.time:08x}"
         extranonce2 = "00" * self._extranonce2_size
-        params = [worker, job.job_id, extranonce2, ntime, nonce_hex, result.get("digest", "")]
+        params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
         deadline = time.time() + 30.0
@@ -300,8 +324,8 @@ class StratumClient:
             if resp.get("id") == msg_id:
                 if resp.get("error"):
                     self.shares_rejected += 1
-                    log.info("share REJECTED job=%s nonce=%s solver_digest=%s (a/r=%d/%d) error=%s",
-                             job.job_id, nonce_hex, result.get("digest", ""),
+                    log.info("share REJECTED job=%s nonce=%s (a/r=%d/%d) error=%s",
+                             job.job_id, nonce_hex,
                              self.shares_accepted, self.shares_rejected, resp["error"])
                 else:
                     self.shares_accepted += 1

@@ -32,9 +32,17 @@ private:
     CSHA256 outer;
 };
 
+inline void WriteLE16(uint8_t* ptr, uint16_t val) {
+    ptr[0] = uint8_t(val); ptr[1] = uint8_t(val >> 8);
+}
+
 inline void WriteLE32(uint8_t* ptr, uint32_t val) {
     ptr[0] = uint8_t(val); ptr[1] = uint8_t(val >> 8);
     ptr[2] = uint8_t(val >> 16); ptr[3] = uint8_t(val >> 24);
+}
+
+inline void WriteLE64(uint8_t* ptr, uint64_t val) {
+    for (int i = 0; i < 8; ++i) ptr[i] = uint8_t(val >> (i * 8));
 }
 
 inline uint32_t ReadLE32(const uint8_t* ptr) {

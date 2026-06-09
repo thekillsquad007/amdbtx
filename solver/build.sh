@@ -40,8 +40,15 @@ echo "Using HIP compiler: $HIPCC"
 ROCM_INCLUDE=""
 ROCM_LIB=""
 if command -v hipconfig >/dev/null 2>&1; then
-    ROCM_INCLUDE="$(hipconfig --hip-path 2>/dev/null)/include"
-    ROCM_LIB="$(hipconfig --hip-path 2>/dev/null)/lib"
+    for hipconfig_flag in --hip-path --path; do
+        HIP_PATH="$(hipconfig "$hipconfig_flag" 2>/dev/null | head -n1 | tr -d '\r' || true)"
+        # ROCm 7.x sometimes prints "HIP version: ..." instead of a directory.
+        if [[ -n "$HIP_PATH" && "$HIP_PATH" == /* && -d "$HIP_PATH/include/hip" ]]; then
+            ROCM_INCLUDE="$HIP_PATH/include"
+            ROCM_LIB="$HIP_PATH/lib"
+            break
+        fi
+    done
 fi
 if [[ -z "$ROCM_INCLUDE" ]]; then
     for cand in /opt/rocm /opt/rocm-*; do
@@ -75,8 +82,8 @@ if [[ -z "$ARCHS" ]] && command -v rocm-smi >/dev/null 2>&1; then
     ARCHS=$(rocm-smi --showid 2>/dev/null | grep -oP 'gfx[0-9a-f]{3,}' | sort -u)
 fi
 if [[ -z "$ARCHS" ]]; then
-    # Fallback: compile for common targets
-    ARCHS="gfx900 gfx906 gfx1030 gfx1100"
+    # Fallback: compile for common targets (include gfx1101 for RX 7800 XT)
+    ARCHS="gfx803 gfx900 gfx906 gfx1010 gfx1030 gfx1100 gfx1101 gfx1102"
     echo "Warning: could not detect GPU arch, compiling for all common targets"
 fi
 

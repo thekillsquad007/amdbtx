@@ -1,5 +1,6 @@
 #include "field.h"
 #include "sha256.h"
+#include <cassert>
 
 namespace field {
 
@@ -31,15 +32,14 @@ Element inv(Element a) {
     return result;
 }
 
+// Matches BTX::FromOracle: SHA-256(ToCanonicalBytes(seed) + index [+ retry]) per retry.
 Element from_oracle(const Uint256& seed, uint32_t index) {
-    uint8_t seed_bytes[32];
-    for (size_t i = 0; i < 32; ++i)
-        seed_bytes[i] = seed.data[31 - i];
+    auto seed_bytes = ToCanonicalBytes(seed);
     for (uint32_t retry = 0; retry < 256; ++retry) {
         CSHA256 hasher;
-        hasher.Write(seed_bytes, 32);
-        uint8_t index_le[4]; WriteLE32(index_le, index);
-        hasher.Write(index_le, 4);
+        hasher.Write(seed_bytes.data(), seed_bytes.size());
+        uint8_t idx_le[4]; WriteLE32(idx_le, index);
+        hasher.Write(idx_le, 4);
         if (retry > 0) {
             uint8_t retry_le[4]; WriteLE32(retry_le, retry);
             hasher.Write(retry_le, 4);
@@ -49,9 +49,9 @@ Element from_oracle(const Uint256& seed, uint32_t index) {
         if (candidate < MODULUS) return candidate;
     }
     CSHA256 hasher;
-    hasher.Write(seed_bytes, 32);
-    uint8_t index_le[4]; WriteLE32(index_le, index);
-    hasher.Write(index_le, 4);
+    hasher.Write(seed_bytes.data(), seed_bytes.size());
+    uint8_t idx_le[4]; WriteLE32(idx_le, index);
+    hasher.Write(idx_le, 4);
     const uint8_t fallback_tag[] = "oracle-fallback";
     hasher.Write(fallback_tag, sizeof(fallback_tag) - 1);
     uint8_t hash[32]; hasher.Finalize(hash);

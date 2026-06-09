@@ -48,7 +48,7 @@ worker_name: "${WORKER_NAME:-default}"
 gbt_solve_path: "SOLVER_PATH_PLACEHOLDER"
 solver_backend: "rocm"
 solver_threads: 8
-solver_batch_size: 128
+solver_batch_size: 1024
 solver_prefetch_depth: 8
 solver_prepare_workers: 16
 solver_pipeline_async: 1

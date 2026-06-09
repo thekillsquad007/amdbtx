@@ -12,12 +12,13 @@ static Uint256 HexToUint256(const std::string& hex) {
     Uint256 result;
     std::memset(result.data, 0, 32);
     std::string padded = hex;
-    while (padded.size() < 64) padded = "0" + padded;
-    if (padded.size() > 64) padded = padded.substr(padded.size() - 64);
+    while (padded.size() < 64) padded = padded + "0";
+    if (padded.size() > 64) padded = padded.substr(0, 64);
+    // Match BTX SetHex: first hex pair → data[31] (MSB), last → data[0] (LSB)
     for (int i = 0; i < 32; ++i) {
         unsigned int byte;
         std::sscanf(padded.c_str() + i * 2, "%02x", &byte);
-        result.data[i] = static_cast<uint8_t>(byte);
+        result.data[31 - i] = static_cast<uint8_t>(byte);
     }
     return result;
 }
@@ -25,7 +26,7 @@ static Uint256 HexToUint256(const std::string& hex) {
 static std::string Uint256ToHex(const Uint256& v) {
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    for (int i = 0; i < 32; ++i) oss << std::setw(2) << static_cast<unsigned>(v.data[i]);
+    for (int i = 31; i >= 0; --i) oss << std::setw(2) << static_cast<unsigned>(v.data[i]);
     return oss.str();
 }
 
@@ -59,14 +60,15 @@ static std::string extract_json_string(const std::string& s, const std::string& 
 
 static std::string extract_json_number(const std::string& s, const std::string& key) {
     auto pos = s.find("\"" + key + "\"");
-    if (pos == std::string::npos) return "0";
+    if (pos == std::string::npos) return "";
     auto colon = s.find(':', pos + key.size() + 2);
-    if (colon == std::string::npos) return "0";
+    if (colon == std::string::npos) return "";
     size_t start = colon + 1;
     while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) ++start;
     size_t end = start;
     if (end < s.size() && s[end] == '-') ++end;
     while (end < s.size() && (std::isdigit(s[end]) || s[end] == '.' || s[end] == 'e' || s[end] == 'E' || s[end] == '+' || s[end] == '-')) ++end;
+    if (end == start) return "";
     return s.substr(start, end - start);
 }
 
@@ -105,10 +107,14 @@ int main(int argc, char* argv[]) {
         int device_count = 0;
         hipError_t err = hipGetDeviceCount(&device_count);
         if (err == hipSuccess && device_count > 0) {
-            hipDeviceProp_t prop;
-            hipGetDeviceProperties(&prop, 0);
-            std::cerr << "HIP GPU detected: " << prop.name << " arch=" << prop.gcnArchName
-                      << " memory=" << (prop.totalGlobalMem / (1024*1024)) << "MB" << std::endl;
+            hipDeviceProp_t prop{};
+            if (hipGetDeviceProperties(&prop, 0) == hipSuccess) {
+                std::cerr << "HIP GPU detected: " << prop.name << " arch=" << prop.gcnArchName
+                          << " memory=" << (prop.totalGlobalMem / (1024*1024)) << "MB" << std::endl;
+            } else {
+                std::cerr << "HIP GPU enumeration failed, falling back to CPU" << std::endl;
+                config.backend = "cpu";
+            }
         } else {
             std::cerr << "No HIP GPU found, falling back to CPU" << std::endl;
             config.backend = "cpu";
@@ -128,9 +134,20 @@ int main(int argc, char* argv[]) {
     while (std::getline(std::cin, line)) {
         if (line.empty() || line[0] == '#') continue;
 
+        uint32_t job_n = config.matmul_n;
+        uint32_t job_b = config.matmul_b;
+        uint32_t job_r = config.matmul_r;
+
+        std::string jn_str = extract_json_number(line, "matmul_n");
+        if (!jn_str.empty()) job_n = static_cast<uint32_t>(std::stoul(jn_str));
+        std::string jb_str = extract_json_number(line, "matmul_b");
+        if (!jb_str.empty()) job_b = static_cast<uint32_t>(std::stoul(jb_str));
+        std::string jr_str = extract_json_number(line, "matmul_r");
+        if (!jr_str.empty()) job_r = static_cast<uint32_t>(std::stoul(jr_str));
+
         PowState state;
         std::memset(&state, 0, sizeof(state));
-        state.matmul_dim = static_cast<uint16_t>(config.matmul_n);
+        state.matmul_dim = static_cast<uint16_t>(job_n);
 
         uint64_t nonce_start = 0;
         uint64_t max_tries = 2000000;
@@ -163,37 +180,51 @@ int main(int argc, char* argv[]) {
         std::string st_str = extract_json_string(line, "share_target");
         if (!st_str.empty()) share_target = HexToUint256(st_str);
 
+        std::string bh_str = extract_json_number(line, "block_height");
+        state.height = bh_str.empty() ? 0 : std::stoi(bh_str);
         state.nonce = nonce_start;
+
+        std::string eb_str = extract_json_number(line, "epsilon_bits");
+        uint32_t job_epsilon_bits = config.epsilon_bits;
+        if (!eb_str.empty()) job_epsilon_bits = static_cast<uint32_t>(std::stoul(eb_str));
 
         Uint256 block_target = DeriveBlockTarget(state.bits);
 
         uint64_t tries_used = 0;
         double elapsed_s = 0;
         bool found;
+        bool cpu_fallback = false;
+        std::string backend_used = config.backend;
 
         if (config.backend == "hip") {
-            found = SolveGPU(state, config.matmul_n, config.matmul_b, config.matmul_r,
+            found = SolveGPU(state, job_n, job_b, job_r,
                              block_target, share_target, max_tries, max_seconds,
                              tries_used, elapsed_s,
-                             config.batch_size, config.epsilon_bits);
+                             config.batch_size, job_epsilon_bits, &cpu_fallback);
+            backend_used = cpu_fallback ? "cpu" : "hip";
         } else {
-            found = SolveCPU(state, config.matmul_n, config.matmul_b, config.matmul_r,
+            found = SolveCPU(state, job_n, job_b, job_r,
                              block_target, share_target,
-                             max_tries, max_seconds, tries_used, elapsed_s);
+                             max_tries, max_seconds, tries_used, elapsed_s,
+                             job_epsilon_bits);
+            backend_used = "cpu";
         }
 
         bool is_block = found && Uint256LE(state.digest, block_target);
+        uint64_t nonce64_end = found ? state.nonce
+            : (state.nonce > nonce_start ? state.nonce - 1 : nonce_start);
 
         std::cout << "{";
         std::cout << "\"found\":" << (found ? "true" : "false") << ",";
         std::cout << "\"nonce64\":" << state.nonce << ",";
-        std::cout << "\"nonce64_end\":" << state.nonce << ",";
+        std::cout << "\"nonce64_end\":" << nonce64_end << ",";
         if (found) {
             std::cout << "\"digest\":\"" << Uint256ToHex(state.digest) << "\",";
             std::cout << "\"is_block\":" << (is_block ? "true" : "false") << ",";
         }
         std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(2) << elapsed_s << ",";
-        std::cout << "\"tries_used\":" << tries_used;
+        std::cout << "\"tries_used\":" << tries_used << ",";
+        std::cout << "\"backend\":\"" << backend_used << "\"";
         std::cout << "}" << std::endl;
     }
 

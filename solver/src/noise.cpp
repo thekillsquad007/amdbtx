@@ -4,12 +4,14 @@
 namespace noise {
 
 Uint256 DeriveNoiseSeed(std::string_view domain_tag, const Uint256& sigma) {
+    // Match BTX: SHA-256(tag || ToCanonicalBytes(sigma))
     auto sigma_bytes = ToCanonicalBytes(sigma);
     CSHA256 hasher;
     hasher.Write(reinterpret_cast<const uint8_t*>(domain_tag.data()), domain_tag.size());
     hasher.Write(sigma_bytes.data(), sigma_bytes.size());
-    uint8_t digest[32]; hasher.Finalize(digest);
-    return BytesToUint256(digest);
+    uint8_t digest[32];
+    hasher.Finalize(digest);
+    return CanonicalBytesToUint256(digest);
 }
 
 static Matrix FromSeedRect(const Uint256& seed, uint32_t rows, uint32_t cols) {

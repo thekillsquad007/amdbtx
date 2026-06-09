@@ -36,11 +36,16 @@ amdbtx-miner (Python, pre-built wheel)
 
 btx-gbt-solve-hip (C++/HIP, pre-built binary)
   ├── main.cpp             ← CLI + daemon mode
-  ├── field.h              ← M31 field arithmetic (q = 2^31 - 1)
-  ├── matmul_kernel.hip    ← GPU matmul kernel (HIP/ROCm)
-  ├── noise.h              ← Noise generation from sigma
-  ├── transcript.h         ← Transcript compression + SHA-256d
-  └── sha256.h             ← SHA-256 implementation
+  ├── solve.h/cpp          ← SolveCPU (BTX reference algorithm), sigma derivation
+  ├── solve_gpu.hip        ← SolveGPU: batched GPU sigma gate + noise + transcript
+  ├── field.h/cpp          ← M31 field arithmetic (q = 2^31 - 1)
+  ├── matrix.h/cpp         ← Matrix operations (add/mul/block)
+  ├── noise.h/cpp          ← Noise generation from sigma (EL,ER,FL,FR)
+  ├── transcript.h/cpp     ← Transcript compression + SHA-256d
+  ├── uint256.h            ← 256-bit integer (data[0]=MSB, Bitcoin convention)
+  ├── sha256.h/cpp         ← SHA-256 + SHA-256d implementations
+  ├── gpu_sha256.h/hip     ← GPU SHA-256 + sigma/noise/compress kernels
+  └── hip_kernels.hip      ← Additional HIP kernels
 ```
 
 ## MatMul PoW Algorithm (BTX Spec)
@@ -54,14 +59,17 @@ btx-gbt-solve-hip (C++/HIP, pre-built binary)
 | Pre-hash epsilon (ε) | 18 | Sigma gate: target « ε |
 | Freivalds rounds (k) | 2 | False-positive < 2⁻⁶² |
 
-### Solve Pipeline (per nonce)
+### Solve Pipeline (per batch, matches BTX reference)
 
-1. **Sigma gate**: SHA-256 pre-hash; skip if digest ≥ target « ε
-2. **Noise gen**: Derive EL, ER, FL, FR from sigma via SHA-256 PRF
-3. **Noisy MatMul**: C' = (A+EL·ER) · (B+FL·FR), block decomposition b=16
-4. **Compression**: Inner-product per b×b block → ~131KB total
-5. **SHA-256d**: Rolling hash on compressed transcript
-6. **Check**: H(transcript) < target → found share
+1. **Base matrices**: A, B computed once from job seeds via `from_oracle`
+2. **Sigma gate**: SHA-256d pre-hash of header (version, prev_hash, merkle_root, time, bits, nonce64, dim, seed_a, seed_b); skip nonces where digest ≥ target « ε
+3. **Noise gen**: Derive E_L, E_R, F_L, F_R from sigma via SHA-256 PRF (`noise::DeriveNoiseSeed`)
+4. **Perturb**: A' = A + E_L·E_R, B' = B + F_L·F_R (low-rank, fixed A/B reused)
+5. **Block MatMul**: C' = A'·B' per b×b block (b=16, 32K blocks)
+6. **Compression**: Inner-product per block with compression vector → 1024 field elements
+7. **SHA-256d**: HashMatrixWords(c_prime_words) → c_prime_hash
+8. **Finalize**: SHA-256d(tag || sigma || c_prime_hash || dim || b) → digest
+9. **Check**: digest < target → found share
 
 ### M31 Reduction
 
@@ -181,6 +189,13 @@ pip install --user -e .
 | `config.example.yaml` | Config template | Yes | ~25 |
 | `src/amdbtx_miner/*` | Python wrapper (open) | Yes | ~150 |
 | `solver/src/*` | Solver source (C++/HIP) | Private | ~1500 |
+
+## Algorithm Verification
+
+The solver was verified against an independent Python implementation:
+- **n=16 (trivial case)**: digest matches Python within 1 nonce
+- **Component verification**: sigma, from_oracle, DeriveNoiseSeed, tag_EL all match Python
+- **BTX reference alignment**: SolveCPU matches BTX's `matmul::Solve` exactly (A,B computed once, no per-nonce seed derivation)
 
 **Distribution model**: Pre-built binaries download from GitHub releases. Python wrapper
 source included for transparency.

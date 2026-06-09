@@ -6,12 +6,14 @@
 namespace transcript {
 
 static Uint256 DeriveCompressionSeed(const Uint256& sigma) {
+    // Match BTX: SHA-256(tag || ToCanonicalBytes(sigma))
     auto sigma_bytes = ToCanonicalBytes(sigma);
     CSHA256 hasher;
     hasher.Write(reinterpret_cast<const uint8_t*>(COMPRESS_TAG.data()), COMPRESS_TAG.size());
     hasher.Write(sigma_bytes.data(), sigma_bytes.size());
-    uint8_t digest[32]; hasher.Finalize(digest);
-    return BytesToUint256(digest);
+    uint8_t digest[32];
+    hasher.Finalize(digest);
+    return CanonicalBytesToUint256(digest);
 }
 
 std::vector<field::Element> DeriveCompressionVector(const Uint256& sigma, uint32_t b) {
@@ -30,27 +32,43 @@ field::Element CompressBlock(const Matrix& block_bb, const std::vector<field::El
 }
 
 Uint256 HashMatrixWords(const field::Element* words, size_t count) {
+    // Match BTX CHash256 over LE element bytes.
     CSHA256 hasher;
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    if (count > 0) {
+        hasher.Write(reinterpret_cast<const uint8_t*>(words), count * sizeof(field::Element));
+    }
+#else
     for (size_t i = 0; i < count; ++i) {
-        uint8_t buf[4]; WriteLE32(buf, words[i]);
+        uint8_t buf[4];
+        WriteLE32(buf, words[i]);
         hasher.Write(buf, 4);
     }
-    uint8_t inner[32]; hasher.Finalize(inner);
-    uint8_t dbl[32]; CSHA256().Write(inner, 32).Finalize(dbl);
-    return BytesToUint256(dbl);
+#endif
+    uint8_t inner[32];
+    hasher.Finalize(inner);
+    uint8_t digest[32];
+    CSHA256().Write(inner, 32).Finalize(digest);
+    return BytesToUint256(digest);
 }
 
 Uint256 FinalizeProductCommittedDigest(const Uint256& c_prime_hash, const Uint256& sigma, uint32_t dim, uint32_t b) {
+    // Match BTX FinalizeProductCommittedDigestFromHash: tag || sigma.data || c_prime_hash.data || dim || b, then SHA256d.
     CSHA256 outer;
-    auto sigma_bytes = ToCanonicalBytes(sigma);
     outer.Write(reinterpret_cast<const uint8_t*>(PRODUCT_DIGEST_TAG.data()), PRODUCT_DIGEST_TAG.size());
-    outer.Write(sigma_bytes.data(), 32);
+    outer.Write(sigma.data, 32);
     outer.Write(c_prime_hash.data, 32);
-    uint8_t dim_buf[4]; WriteLE32(dim_buf, dim); outer.Write(dim_buf, 4);
-    uint8_t block_buf[4]; WriteLE32(block_buf, b); outer.Write(block_buf, 4);
-    uint8_t inner[32]; outer.Finalize(inner);
-    uint8_t result[32]; CSHA256().Write(inner, 32).Finalize(result);
-    return BytesToUint256(result);
+    uint8_t dim_buf[4];
+    WriteLE32(dim_buf, dim);
+    outer.Write(dim_buf, 4);
+    uint8_t block_buf[4];
+    WriteLE32(block_buf, b);
+    outer.Write(block_buf, 4);
+    uint8_t inner[32];
+    outer.Finalize(inner);
+    uint8_t digest[32];
+    CSHA256().Write(inner, 32).Finalize(digest);
+    return CanonicalBytesToUint256(digest);
 }
 
 Uint256 ComputeProductCommittedDigestFromPerturbed(const Matrix& A_prime, const Matrix& B_prime, uint32_t b, const Uint256& sigma) {
@@ -71,6 +89,30 @@ Uint256 ComputeProductCommittedDigestFromPerturbed(const Matrix& A_prime, const 
     }
     Uint256 c_prime_hash = HashMatrixWords(compressed_blocks.data(), compressed_blocks.size());
     return FinalizeProductCommittedDigest(c_prime_hash, sigma, n, b);
+}
+
+Uint256 ComputeTranscriptDigestFromPerturbed(const Matrix& A_prime, const Matrix& B_prime, uint32_t b, const Uint256& sigma) {
+    uint32_t n = A_prime.rows();
+    uint32_t blocks_per_axis = n / b;
+    auto compress_vec = DeriveCompressionVector(sigma, b);
+    CSHA256 hasher;
+    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
+        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
+            field::Element compressed_acc = 0;
+            for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
+                Matrix product = A_prime.block(i, ell, b) * B_prime.block(ell, j, b);
+                compressed_acc = field::add(compressed_acc, CompressBlock(product, compress_vec));
+                uint8_t buf[4];
+                WriteLE32(buf, compressed_acc);
+                hasher.Write(buf, 4);
+            }
+        }
+    }
+    uint8_t inner[32];
+    hasher.Finalize(inner);
+    uint8_t digest[32];
+    CSHA256().Write(inner, 32).Finalize(digest);
+    return CanonicalBytesToUint256(digest);
 }
 
 }

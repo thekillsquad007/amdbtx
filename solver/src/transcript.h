@@ -17,6 +17,8 @@ field::Element CompressBlock(const Matrix& block_bb, const std::vector<field::El
 
 Uint256 ComputeProductCommittedDigestFromPerturbed(const Matrix& A_prime, const Matrix& B_prime, uint32_t b, const Uint256& sigma);
 
+Uint256 ComputeTranscriptDigestFromPerturbed(const Matrix& A_prime, const Matrix& B_prime, uint32_t b, const Uint256& sigma);
+
 Uint256 HashMatrixWords(const field::Element* words, size_t count);
 
 Uint256 FinalizeProductCommittedDigest(const Uint256& c_prime_hash, const Uint256& sigma, uint32_t dim, uint32_t b);
