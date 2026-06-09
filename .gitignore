@@ -16,3 +16,11 @@ __pycache__/
 
 # Logs
 *.log
+
+# Local-only (agent notes, dev configs, ad-hoc debug scripts)
+AGENTS.md
+solo-config.yaml
+test_env.py
+test_ld_path.py
+test_solver_stderr.py
+test_solver_subprocess.py

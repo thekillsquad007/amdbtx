@@ -725,7 +725,7 @@ if [[ "$GPU_ARCH" == "gfx803" || "$GPU_NAME" == *"RX 4"* || "$GPU_NAME" == *"RX 
     GPU_PREFETCH=4
 fi
 
-# RDNA 2/3/4: larger batches keep the GPU fed (RX 7800 XT ~5 MH/s @ 1024)
+# RDNA 2/3/4: larger batches keep the GPU fed
 if [[ "$GPU_ARCH" == gfx103* || "$GPU_ARCH" == gfx110* || "$GPU_ARCH" == gfx115* ]]; then
     GPU_BATCH=1024
 fi

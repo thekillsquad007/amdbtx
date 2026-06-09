@@ -7,10 +7,17 @@ import sys
 import threading
 from pathlib import Path
 
-LD = os.environ.get(
-    "LD_LIBRARY_PATH",
-    "/home/aravindthana/.amdbtx-miner/runtime:/opt/rocm/lib:/opt/rocm-7.2.0/lib:/opt/rocm-7.2.3/lib",
-)
+def _default_ld_path() -> str:
+    parts = [
+        os.path.join(Path.home(), ".amdbtx-miner", "runtime"),
+        "/opt/rocm/lib",
+    ]
+    for ver in ("7.2.3", "7.2.0", "6.4.0"):
+        parts.append(f"/opt/rocm-{ver}/lib")
+    return ":".join(parts)
+
+
+LD = os.environ.get("LD_LIBRARY_PATH", _default_ld_path())
 
 JOB = {
     "version": 536870912,
