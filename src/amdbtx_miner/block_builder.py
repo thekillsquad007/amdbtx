@@ -300,6 +300,24 @@ def serialize_matmul_header(
     return bytes(header)
 
 
+def compute_template_merkle_root(
+    gbt: dict[str, Any],
+    payout_script: bytes,
+    *,
+    dev_script: bytes | None = None,
+    dev_fee_bps: int = 0,
+) -> str:
+    """Merkle root for coinbase + mempool txs (BTX GBT leaves merkleroot zero in challenge)."""
+    coinbase = build_coinbase_tx(
+        gbt, payout_script, dev_script=dev_script, dev_fee_bps=dev_fee_bps,
+    )
+    mempool_raw = [bytes.fromhex(tx["data"]) for tx in gbt.get("transactions", [])]
+    if gbt.get("default_witness_commitment"):
+        coinbase = regenerate_witness_commitment(coinbase, mempool_raw)
+    txids = [txid_from_raw(raw) for raw in [coinbase] + mempool_raw]
+    return merkle_root(txids)[::-1].hex()
+
+
 def assemble_block_hex(
     gbt: dict[str, Any],
     job,

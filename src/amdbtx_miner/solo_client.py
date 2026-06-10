@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from . import DEFAULT_SOLO_DEV_FEE_BPS, DEV_WALLET
-from .block_builder import assemble_block_hex, split_coinbase_value
+from .block_builder import assemble_block_hex, compute_template_merkle_root, split_coinbase_value
 from .rpc_client import BtxRpcClient, RpcError
 from .stratum_client import Job
 
@@ -153,6 +153,16 @@ class SoloClient:
             received_at=time.time(),
         )
 
+    def _apply_template_merkle(self, job: Job, gbt: dict[str, Any]) -> Job:
+        """GBT/challenge ship merkleroot=0; derive from coinbase + mempool (+ dev fee split)."""
+        payout_script = self._resolve_payout_script()
+        job.merkle_root = compute_template_merkle_root(
+            gbt, payout_script,
+            dev_script=self._dev_script,
+            dev_fee_bps=self.dev_fee_bps,
+        )
+        return job
+
     def _fetch_template(self, longpoll: bool) -> tuple[dict[str, Any], dict[str, Any]]:
         params: dict[str, Any] = {"rules": ["segwit"]}
         if longpoll and self._longpollid:
@@ -170,7 +180,7 @@ class SoloClient:
             return job
 
         gbt, challenge = self._fetch_template(longpoll=bool(self.cfg.get("gbt_longpoll", True)))
-        job = self._job_from_template(gbt, challenge)
+        job = self._apply_template_merkle(self._job_from_template(gbt, challenge), gbt)
         self._gbt_by_job[job.job_id] = gbt
         log.info(
             "solo template job=%s height=%d prev=%s... merkle=%s...",
@@ -181,7 +191,7 @@ class SoloClient:
     def poll_template(self) -> None:
         try:
             gbt, challenge = self._fetch_template(longpoll=False)
-            job = self._job_from_template(gbt, challenge)
+            job = self._apply_template_merkle(self._job_from_template(gbt, challenge), gbt)
             self._gbt_by_job[job.job_id] = gbt
             self._current_job = job
         except Exception as e:
