@@ -4,6 +4,7 @@ import os
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -232,3 +233,133 @@ class GBTSolveWrapper:
 
     def stop(self):
         self._stop_proc()
+
+
+class MultiGPUSolver:
+    """One HIP solver subprocess per GPU; nonce ranges are partitioned each round."""
+
+    def __init__(
+        self,
+        solver_path: str,
+        backend: str = "rocm",
+        threads: int = 8,
+        prepare_workers: int = 16,
+        batch_size: int = 1024,
+        prefetch_depth: int = 8,
+        pipeline_async: int = 1,
+        gpu_inputs: int = 0,
+        gpu_devices: list[int] | None = None,
+        runtime_ld_path: str = "",
+    ):
+        self.gpu_devices = list(gpu_devices or [0])
+        self.solvers: list[GBTSolveWrapper] = []
+        for device in self.gpu_devices:
+            self.solvers.append(
+                GBTSolveWrapper(
+                    solver_path=solver_path,
+                    backend=backend,
+                    threads=threads,
+                    prepare_workers=prepare_workers,
+                    batch_size=batch_size,
+                    prefetch_depth=prefetch_depth,
+                    pipeline_async=pipeline_async,
+                    gpu_inputs=gpu_inputs,
+                    gpu_device=device,
+                    runtime_ld_path=runtime_ld_path,
+                )
+            )
+        if len(self.solvers) > 1:
+            log.info(
+                "multi-GPU mining: %d solvers on devices %s",
+                len(self.solvers), self.gpu_devices,
+            )
+
+    @property
+    def num_gpus(self) -> int:
+        return len(self.solvers)
+
+    def _merge_results(self, results: list[dict], *, wall_elapsed: float) -> dict:
+        total_tries = sum(int(r.get("tries_used", 0) or 0) for r in results)
+        total_gate = sum(int(r.get("gate_passes", 0) or 0) for r in results)
+        work = total_gate if total_gate else total_tries
+        per_gpu_khps = []
+        for r in results:
+            elapsed = float(r.get("elapsed_s", 0) or 0)
+            gate = int(r.get("gate_passes", 0) or 0)
+            tries = int(r.get("tries_used", 0) or 0)
+            w = gate if gate else tries
+            per_gpu_khps.append(w / elapsed / 1000 if elapsed > 0 else 0.0)
+
+        merged = {
+            "found": False,
+            "tries_used": total_tries,
+            "gate_passes": total_gate,
+            "elapsed_s": wall_elapsed,
+            "per_gpu_khps": per_gpu_khps,
+            "gpu_devices": list(self.gpu_devices),
+            "num_gpus": self.num_gpus,
+        }
+        if wall_elapsed > 0 and work > 0:
+            merged["matmul_khps_total"] = work / wall_elapsed / 1000
+
+        errors = [r.get("error") for r in results if r.get("error")]
+        if errors and len(errors) == len(results):
+            merged["error"] = errors[0]
+
+        backends = {r.get("backend") for r in results if r.get("backend")}
+        if backends:
+            merged["backend"] = "+".join(sorted(backends))
+
+        found = [r for r in results if r.get("found")]
+        if found:
+            blocks = [r for r in found if r.get("is_block")]
+            winner = blocks[0] if blocks else found[0]
+            merged.update(winner)
+            merged["found"] = True
+            merged["per_gpu_khps"] = per_gpu_khps
+            merged["gpu_devices"] = list(self.gpu_devices)
+            merged["num_gpus"] = self.num_gpus
+            if wall_elapsed > 0 and work > 0:
+                merged["matmul_khps_total"] = work / wall_elapsed / 1000
+        return merged
+
+    def solve(self, job, nonce_start: int = 0, max_tries: int = 20_000_000,
+              max_seconds: float = 5.0) -> dict:
+        if not self.solvers:
+            return {"found": False, "error": "no solvers configured"}
+
+        if len(self.solvers) == 1:
+            return self.solvers[0].solve(
+                job, nonce_start=nonce_start, max_tries=max_tries, max_seconds=max_seconds,
+            )
+
+        results: list[dict] = []
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=len(self.solvers)) as pool:
+            futures = {
+                pool.submit(
+                    solver.solve,
+                    job,
+                    nonce_start + idx * max_tries,
+                    max_tries,
+                    max_seconds,
+                ): idx
+                for idx, solver in enumerate(self.solvers)
+            }
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    log.error("GPU %d solver failed: %s", self.gpu_devices[idx], e)
+                    result = {"found": False, "error": str(e), "gpu_index": idx}
+                else:
+                    result["gpu_index"] = idx
+                    result["gpu_device"] = self.gpu_devices[idx]
+                results.append(result)
+
+        return self._merge_results(results, wall_elapsed=time.time() - t0)
+
+    def stop(self):
+        for solver in self.solvers:
+            solver.stop()
