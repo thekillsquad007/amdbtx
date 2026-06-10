@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "amdbtx_miner"
 version = "1.0.0"
-description = "AMD GPU miner for MineBtx pool"
+description = "AMD GPU miner for BTX — MineBtx pool and solo (btxd) mining"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

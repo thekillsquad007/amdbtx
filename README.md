@@ -1,11 +1,12 @@
-# AMDBTX — AMD GPU Miner for MineBtx Pool
+# AMDBTX — AMD GPU Miner for BTX (Pool + Solo)
 
-A native AMD GPU miner for the [MineBtx](https://minebtx.com) pool using
-ROCm/HIP. Provides a HIP solver binary and a Python stratum wrapper.
+A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on the
+[MineBtx pool](https://minebtx.com) **or solo** against your own `btxd` node.
 
 - **Pool**: `stratum+tcp://stratum.minebtx.com:3333`
+- **Solo**: `getblocktemplate` + `getmatmulchallenge` + `submitblock` via JSON-RPC
 - **Algorithm**: MatMul PoW (n=512, b=16, r=8, M31 field, sigma gate)
-- **Dev fee**: 2% time-sliced (transparent, logged)
+- **Dev fee**: 2% time-sliced in pool mode only (transparent, logged)
 - **Dev wallet**: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 ---
@@ -89,9 +90,13 @@ amdbtx-miner
 
 ## Configuration
 
-Edit `~/.amdbtx-miner/config.yaml` (generated during install):
+Edit `~/.amdbtx-miner/config.yaml` (generated during install). See
+[`config.example.yaml`](config.example.yaml) for all options including solo mode.
+
+**Pool mode** (default):
 
 ```yaml
+mining_mode: "pool"
 pool_host: "stratum.minebtx.com"
 pool_port: 3333
 payout_address: "btx1z..."
@@ -114,8 +119,111 @@ log_level: "INFO"
 CLI flags override config values:
 
 ```bash
-amdbtx-miner --payout-address btx1z... --worker-name myrig --backend rocm
+amdbtx-miner --payout-address btx1z... --worker-name myrig --solver-backend rocm
 ```
+
+---
+
+## Solo Mining
+
+Solo mode mines directly against a synced BTX full node (`btxd`). The miner
+fetches block templates over JSON-RPC, runs the same HIP MatMul solver, and
+submits full blocks with `submitblock` when a solution meets **network**
+difficulty (not pool share difficulty). There is **no dev fee** in solo mode.
+
+### Requirements
+
+- A synced `btxd` node on **[BTX v0.32.3+](https://github.com/btxchain/btx/releases)**
+- RPC enabled with `getblocktemplate`, `getmatmulchallenge`, and `submitblock`
+- A BTX payout address (`btx1z...` or `btx1q...`) — block rewards go to this address
+- The same HIP solver binary used for pool mining
+
+### Local node (same machine)
+
+If `btxd` runs locally with cookie auth (default when no `rpcuser` is set):
+
+```yaml
+mining_mode: solo
+rpc_url: "http://127.0.0.1:19334"
+rpc_cookie_file: "~/.btx/.cookie"
+payout_address: "btx1z...YOUR_ADDRESS..."
+```
+
+```bash
+amdbtx-miner --solo --payout-address btx1z...YOUR_ADDRESS...
+```
+
+### Remote node (LAN or VPS)
+
+Use `rpcuser` / `rpcpassword` from the node's `btx.conf`. Cookie files only work
+on the machine where `btxd` created them.
+
+```yaml
+mining_mode: solo
+rpc_url: "http://192.168.1.15:19334"
+rpc_user: "miner"
+rpc_password: "your_rpc_password"
+payout_address: "btx1z...YOUR_ADDRESS..."
+gbt_longpoll: true
+gbt_longpoll_timeout: 60.0
+```
+
+```bash
+amdbtx-miner --solo \
+  --rpc-url http://192.168.1.15:19334 \
+  --rpc-user miner \
+  --rpc-password your_rpc_password \
+  --payout-address btx1z...YOUR_ADDRESS...
+```
+
+### How it works
+
+1. `getblocktemplate` + `getmatmulchallenge` — fetch the current block template and MatMul challenge (seeds, height, epsilon, merkle root).
+2. HIP solver — search nonces against **network** `bits` / target (same digest path as pool mining).
+3. `submitblock` — when `is_block=true`, assemble coinbase + mempool txs + MatMul header and submit the full block hex to your node.
+
+The miner polls for template updates each loop (new transactions, refreshed `nTime`)
+without resetting your nonce counter on the same block height.
+
+### Pool vs solo
+
+| | Pool | Solo |
+|---|------|------|
+| Work source | Stratum `mining.notify` | `getblocktemplate` + `getmatmulchallenge` |
+| Difficulty | Pool share target | Full network block target |
+| Submit | `mining.submit` (nonce + ntime) | `submitblock` (full block) |
+| Payout | Pool (PPLNS) | Full block reward to your address |
+| Dev fee | 2% time-sliced | None |
+
+### Expected logs
+
+```
+solo: connected to node height=125601 difficulty=0.035...
+solo template job=solo-125601-51619e6d8d37ab84 height=125601 ...
+FOUND! nonce=... digest=... is_block=true ...
+solo: BLOCK ACCEPTED height=125601 nonce=... digest=...
+```
+
+If you see `is_block=false`, the solver found a share-tier hit (not a valid block)
+and solo mode correctly skips `submitblock`.
+
+### When solo makes sense
+
+Solo competes against **total network hashrate**, not pool hashrate. It can be
+worth trying when network difficulty is low relative to your GPU's `matmul_khps`,
+or when you want the full block reward without pool fees. At typical single-GPU
+speeds on mainnet, blocks may be rare — check your `matmul_khps` in the solve logs
+and compare to network conditions on [BTXplorer](https://explorer.minebtx.com).
+
+### Solo troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `cannot reach btxd RPC` | Check `rpc_url`, firewall, and that `btxd` is running |
+| `no RPC credentials` | Set `rpc_user`/`rpc_password` (remote) or `rpc_cookie_file` (local) |
+| `cannot resolve coinbase script` | Ensure `validateaddress` works on the node, or set `coinbase_script_pubkey` in config |
+| `solo: submitblock rejected` | Node may have moved to a new tip — usually resolves on next template; check `btxd` logs |
+| `merkle mismatch` | Template changed while assembling — miner will pick up the new template next loop |
 
 ---
 
@@ -147,9 +255,10 @@ Output: `amdbtx-private-solver/build/btx-gbt-solve-hip`. Point `gbt_solve_path` 
 
 ---
 
-## Dev Fee
+## Dev Fee (pool mode only)
 
-Transparent 2% time-sliced dev fee (industry-standard approach):
+Transparent 2% time-sliced dev fee in pool mode (industry-standard approach).
+Solo mining has no dev fee.
 
 1. Mine with your address for ~58 minutes
 2. Switch authorization to dev wallet for ~2 minutes

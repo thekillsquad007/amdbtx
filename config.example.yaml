@@ -35,15 +35,24 @@ reconnect_max_s: 60.0
 log_level: "INFO"
 
 # --- Solo mining (mining_mode: solo) ---
-# Local node:
+# Mines against a synced btxd node (v0.32.3+). No pool, no dev fee.
+# Requires getblocktemplate + getmatmulchallenge + submitblock over RPC.
+# See README.md "Solo Mining" for full setup guide.
+#
+# Local node (cookie auth):
+# mining_mode: solo
 # rpc_url: "http://127.0.0.1:19334"
 # rpc_cookie_file: "~/.btx/.cookie"
-# Remote node (use rpc_user/rpc_password — cookie file is local-only):
+#
+# Remote node (username/password — cookie file is local-only):
 # mining_mode: solo
 # rpc_url: "http://192.168.1.15:19334"
 # rpc_user: "miner"
 # rpc_password: "your_rpc_password"
+#
+# Optional solo overrides:
 # btx_cli_path: "/usr/local/bin/btx-cli"
-# coinbase_script_pubkey: ""   # optional hex override for payout script
+# coinbase_script_pubkey: ""   # hex scriptPubKey if validateaddress is unavailable
 # gbt_longpoll: true
 # gbt_longpoll_timeout: 60.0
+# rpc_timeout: 120.0
