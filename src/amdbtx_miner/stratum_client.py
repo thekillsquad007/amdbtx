@@ -313,9 +313,15 @@ class StratumClient:
     def submit_share(self, job: Job, result: dict):
         worker = self.worker_name or self.payout_address
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
-        ntime = f"{job.time:08x}"
+        ntime_val = int(result.get("ntime") or job.time)
+        ntime = f"{ntime_val:08x}"
         extranonce2 = "00" * self._extranonce2_size
         params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
+        log.info(
+            "submit job=%s ntime=%s nonce=%s digest=%s target=%s",
+            job.job_id, ntime, nonce_hex,
+            result.get("digest", ""), (job.target or "")[:16],
+        )
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
         deadline = time.time() + 30.0

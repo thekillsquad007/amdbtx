@@ -285,10 +285,11 @@ def run_mining_loop(client, solver: GBTSolveWrapper, cfg: dict, *, solo: bool = 
                         )
 
                 log.info(
-                    "FOUND! nonce=%d digest=%s target=%s is_block=%s job=%s",
-                    result.get("nonce64"), result.get("digest", "")[:16],
+                    "FOUND! nonce=%d digest=%s target=%s is_block=%s job=%s ntime=%s",
+                    result.get("nonce64"), result.get("digest", ""),
                     solve_job.target[:16] if solve_job.target else "none",
                     result.get("is_block"), solve_job.job_id,
+                    result.get("ntime", solve_job.time),
                 )
                 if solo:
                     if result.get("is_block"):
@@ -298,20 +299,35 @@ def run_mining_loop(client, solver: GBTSolveWrapper, cfg: dict, *, solo: bool = 
 
             now = time.time()
             tries = result.get("tries_used", 0)
+            gate_passes = result.get("gate_passes", 0)
             elapsed = result.get("elapsed_s", 0)
-            khps = tries / elapsed / 1000 if elapsed > 0 else 0
+            # tries_used counts sigma scans; gate_passes is full matmul work (post ε gate).
+            work = gate_passes if gate_passes else tries
+            khps = work / elapsed / 1000 if elapsed > 0 else 0
+            gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
+
+            words_hits = result.get("words_hits", 0)
+            cpu_verify_misses = result.get("cpu_verify_misses", 0)
+            if words_hits or cpu_verify_misses:
+                log.info(
+                    "digest path: words_hits=%d cpu_verify_misses=%d share_target=%s",
+                    words_hits, cpu_verify_misses,
+                    (current_job.target[:16] if current_job.target else "none"),
+                )
 
             if now - last_log >= log_interval or result.get("found") or result.get("error"):
                 backend = result.get("backend", "?")
                 a = getattr(client, "shares_accepted", 0)
                 r = getattr(client, "shares_rejected", 0)
                 log.info(
-                    "solve: nonce=%d tries=%d elapsed=%.2fs khps=%.0f backend=%s "
-                    "found=%s shares=%d/%d",
-                    current_job.nonce64_start, tries, elapsed, khps, backend,
-                    result.get("found"), a, r,
+                    "solve: nonce=%d tries=%d gate=%d gate/s=%.0f elapsed=%.2fs "
+                    "matmul_khps=%.2f backend=%s found=%s shares=%d/%d "
+                    "target=%s",
+                    current_job.nonce64_start, tries, gate_passes, gate_per_s, elapsed,
+                    khps, backend, result.get("found"), a, r,
+                    (current_job.target[:12] if current_job.target else "none"),
                 )
                 last_log = now
 

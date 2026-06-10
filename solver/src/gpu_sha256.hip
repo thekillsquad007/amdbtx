@@ -266,7 +266,7 @@ __device__ void d_hash_matrix_words(const Element* words, uint32_t count, uint8_
     d_sha256_message(inner, 32, c_prime_data);
 }
 
-// Match transcript::FinalizeProductCommittedDigest + CanonicalBytesToUint256 output layout.
+// Match transcript::FinalizeProductCommittedDigest (BTX uint256 SHA256d layout).
 __device__ void d_finalize_product_digest(
     const uint8_t* sigma_data,
     const uint8_t* c_prime_data,
@@ -286,10 +286,7 @@ __device__ void d_finalize_product_digest(
 
     uint8_t inner[32];
     d_sha256_message(msg, pos, inner);
-    uint8_t digest_be[32];
-    d_sha256_message(inner, 32, digest_be);
-    for (int i = 0; i < 32; ++i)
-        digest_data[i] = digest_be[31 - i];
+    d_sha256_message(inner, 32, digest_data);
 }
 
 __global__ void HashTranscriptKernel(

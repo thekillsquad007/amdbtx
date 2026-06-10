@@ -23,13 +23,6 @@ static Uint256 HexToUint256(const std::string& hex) {
     return result;
 }
 
-static std::string Uint256ToHex(const Uint256& v) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for (int i = 31; i >= 0; --i) oss << std::setw(2) << static_cast<unsigned>(v.data[i]);
-    return oss.str();
-}
-
 static uint32_t ParseBits(const std::string& bits_str) {
     if (bits_str.size() > 2 && bits_str[0] == '0' && (bits_str[1] == 'x' || bits_str[1] == 'X'))
         return static_cast<uint32_t>(std::stoul(bits_str.substr(2), nullptr, 16));
@@ -191,6 +184,9 @@ int main(int argc, char* argv[]) {
         Uint256 block_target = DeriveBlockTarget(state.bits);
 
         uint64_t tries_used = 0;
+        uint64_t gate_passes = 0;
+        uint64_t words_hits = 0;
+        uint64_t cpu_verify_misses = 0;
         double elapsed_s = 0;
         bool found;
         bool cpu_fallback = false;
@@ -200,7 +196,8 @@ int main(int argc, char* argv[]) {
             found = SolveGPU(state, job_n, job_b, job_r,
                              block_target, share_target, max_tries, max_seconds,
                              tries_used, elapsed_s,
-                             config.batch_size, job_epsilon_bits, &cpu_fallback);
+                             config.batch_size, job_epsilon_bits, &cpu_fallback,
+                             &gate_passes, &words_hits, &cpu_verify_misses);
             backend_used = cpu_fallback ? "cpu" : "hip";
         } else {
             found = SolveCPU(state, job_n, job_b, job_r,
@@ -220,10 +217,17 @@ int main(int argc, char* argv[]) {
         std::cout << "\"nonce64_end\":" << nonce64_end << ",";
         if (found) {
             std::cout << "\"digest\":\"" << Uint256ToHex(state.digest) << "\",";
+            std::cout << "\"ntime\":" << state.time << ",";
             std::cout << "\"is_block\":" << (is_block ? "true" : "false") << ",";
         }
         std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(2) << elapsed_s << ",";
         std::cout << "\"tries_used\":" << tries_used << ",";
+        if (gate_passes > 0)
+            std::cout << "\"gate_passes\":" << gate_passes << ",";
+        if (words_hits > 0)
+            std::cout << "\"words_hits\":" << words_hits << ",";
+        if (cpu_verify_misses > 0)
+            std::cout << "\"cpu_verify_misses\":" << cpu_verify_misses << ",";
         std::cout << "\"backend\":\"" << backend_used << "\"";
         std::cout << "}" << std::endl;
     }

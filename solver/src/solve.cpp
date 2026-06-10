@@ -5,6 +5,8 @@
 #include <cstring>
 #include <array>
 #include <string>
+#include <sstream>
+#include <iomanip>
 
 // CompactSize serialization for HashWriter-compatible SHA-256
 static void WriteCompactSize(CSHA256& hasher, uint64_t val) {
@@ -67,36 +69,57 @@ void Uint256ToMsbBytes(const Uint256& v, uint8_t out[32]) {
         out[i] = v.data[31 - i];
 }
 
-static void ShiftLeftMsbBytesInPlace(uint8_t be[32], uint32_t bits) {
-    for (uint32_t s = 0; s < bits; ++s) {
-        uint8_t overflow = 0;
-        for (int i = 0; i < 32; ++i) {
-            uint8_t new_overflow = (be[i] & 0x80) ? 1 : 0;
-            be[i] = static_cast<uint8_t>((be[i] << 1) | overflow);
-            overflow = new_overflow;
-        }
-        if (overflow) {
-            std::memset(be, 0xFF, 32);
-            return;
-        }
-    }
-}
-
 Uint256 DerivePreHashTarget(const Uint256& target, uint32_t epsilon_bits) {
-    uint8_t be[32];
-    Uint256ToMsbBytes(target, be);
-    if (epsilon_bits > 0)
-        ShiftLeftMsbBytesInPlace(be, epsilon_bits);
-    Uint256 out;
-    for (int i = 0; i < 32; ++i)
-        out.data[31 - i] = be[i];
-    return out;
+    if (epsilon_bits == 0)
+        return target;
+    if (epsilon_bits >= 256) {
+        Uint256 zero;
+        return zero;
+    }
+
+    // Match BTX arith_uint256: data[0]=LSB, operator<<= on the full 256-bit integer.
+    uint64_t limb[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 8; ++j)
+            limb[i] |= uint64_t(target.data[i * 8 + j]) << (8 * j);
+    }
+
+    const uint32_t word_shift = epsilon_bits / 64;
+    const uint32_t bit_shift = epsilon_bits % 64;
+    uint64_t out[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        const int src = i - static_cast<int>(word_shift);
+        if (src < 0)
+            continue;
+        out[i] = limb[src] << bit_shift;
+        if (bit_shift > 0 && src > 0)
+            out[i] |= limb[src - 1] >> (64 - bit_shift);
+    }
+
+    Uint256 result;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 8; ++j)
+            result.data[i * 8 + j] = uint8_t((out[i] >> (8 * j)) & 0xFF);
+    }
+    return result;
 }
 
 bool Uint256LE(const Uint256& a, const Uint256& b) {
     for (int i = 31; i >= 0; --i) {
         if (a.data[i] < b.data[i]) return true;
         if (a.data[i] > b.data[i]) return false;
+    }
+    return true;
+}
+
+// Sigma from SHA-256 uses BytesToUint256 (data[0]=hash[0]=MSB). Pool targets use
+// HexToUint256 (data[31]=MSB). Compare both in MSB-first byte order for the ε gate.
+static bool SigmaLE(const Uint256& sigma_sha, const Uint256& target_hex) {
+    for (int i = 0; i < 32; ++i) {
+        uint8_t s = sigma_sha.data[i];
+        uint8_t t = target_hex.data[31 - i];
+        if (s < t) return true;
+        if (s > t) return false;
     }
     return true;
 }
@@ -176,10 +199,16 @@ static Matrix FromSeed(const Uint256& seed, uint32_t n) {
     return out;
 }
 
-bool ComputeDigestForNonce(PowState& state, uint32_t n, uint32_t b, uint32_t r, Uint256& out_digest) {
-    const bool use_v2 = (state.height >= 125000);
-    Matrix A_copy(n, n), B_copy(n, n);
-    if (use_v2) {
+std::string Uint256ToHex(const Uint256& v) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (int i = 31; i >= 0; --i)
+        oss << std::setw(2) << static_cast<unsigned>(v.data[i]);
+    return oss.str();
+}
+
+void PrepareNonceSeeds(PowState& state) {
+    if (state.height >= 125000) {
         state.seed_a = DeterministicMatMulSeedV2(
             state.previous_block_hash, state.height,
             state.version, state.merkle_root,
@@ -190,20 +219,66 @@ bool ComputeDigestForNonce(PowState& state, uint32_t n, uint32_t b, uint32_t r, 
             state.version, state.merkle_root,
             state.time, state.bits,
             state.nonce, state.matmul_dim, 1);
-        A_copy = FromSeed(state.seed_a, n);
-        B_copy = FromSeed(state.seed_b, n);
+    }
+}
+
+static void BuildPerturbedMatrices(
+    PowState& state, uint32_t n, uint32_t b, uint32_t r,
+    Matrix& a_prime, Matrix& b_prime, Uint256& sigma)
+{
+    Matrix a_copy(n, n), b_copy(n, n);
+    PrepareNonceSeeds(state);
+    if (state.height >= 125000) {
+        a_copy = FromSeed(state.seed_a, n);
+        b_copy = FromSeed(state.seed_b, n);
     } else {
-        A_copy = FromSeed(state.seed_a, n);
-        B_copy = FromSeed(state.seed_b, n);
+        a_copy = FromSeed(state.seed_a, n);
+        b_copy = FromSeed(state.seed_b, n);
     }
 
-    Uint256 sigma = DeriveSigma(state);
+    sigma = DeriveSigma(state);
     noise::NoisePair np = noise::Generate(sigma, n, r);
-    const Matrix E = np.E_L * np.E_R;
-    const Matrix F = np.F_L * np.F_R;
-    const Matrix A_prime = A_copy + E;
-    const Matrix B_prime = B_copy + F;
-    out_digest = transcript::ComputeProductCommittedDigestFromPerturbed(A_prime, B_prime, b, sigma);
+    const Matrix e = np.E_L * np.E_R;
+    const Matrix f = np.F_L * np.F_R;
+    a_prime = a_copy + e;
+    b_prime = b_copy + f;
+}
+
+uint32_t CountCompressedWordDiffs(
+    PowState& state, uint32_t n, uint32_t b, uint32_t r,
+    const field::Element* gpu_words, size_t word_count)
+{
+    Matrix a_prime(n, n), b_prime(n, n);
+    Uint256 sigma;
+    BuildPerturbedMatrices(state, n, b, r, a_prime, b_prime, sigma);
+
+    const uint32_t blocks_per_axis = n / b;
+    const size_t expected = size_t(blocks_per_axis) * blocks_per_axis;
+    if (word_count != expected) return static_cast<uint32_t>(expected);
+
+    auto compress_vec = transcript::DeriveCompressionVector(sigma, b);
+    uint32_t diffs = 0;
+    size_t idx = 0;
+    for (uint32_t i = 0; i < blocks_per_axis; ++i) {
+        for (uint32_t j = 0; j < blocks_per_axis; ++j) {
+            field::Element compressed_acc = 0;
+            for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
+                Matrix product = a_prime.block(i, ell, b) * b_prime.block(ell, j, b);
+                compressed_acc = field::add(
+                    compressed_acc, transcript::CompressBlock(product, compress_vec));
+            }
+            if (compressed_acc != gpu_words[idx]) ++diffs;
+            ++idx;
+        }
+    }
+    return diffs;
+}
+
+bool ComputeDigestForNonce(PowState& state, uint32_t n, uint32_t b, uint32_t r, Uint256& out_digest) {
+    Matrix a_prime(n, n), b_prime(n, n);
+    Uint256 sigma;
+    BuildPerturbedMatrices(state, n, b, r, a_prime, b_prime, sigma);
+    out_digest = transcript::ComputeProductCommittedDigestFromPerturbed(a_prime, b_prime, b, sigma);
     return true;
 }
 
@@ -215,7 +290,8 @@ bool SolveCPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
 {
     auto t0 = std::chrono::steady_clock::now();
     tries_used = 0;
-    const Uint256 pre_hash_target = DerivePreHashTarget(share_target, epsilon_bits);
+    const bool use_v2 = (state.height >= 125000);
+    const Uint256 pre_hash_target = DerivePreHashTarget(block_target, epsilon_bits);
 
     while (max_tries > 0) {
         auto now = std::chrono::steady_clock::now();
@@ -226,8 +302,20 @@ bool SolveCPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         }
 
         if (epsilon_bits > 0) {
+            if (use_v2) {
+                state.seed_a = DeterministicMatMulSeedV2(
+                    state.previous_block_hash, state.height,
+                    state.version, state.merkle_root,
+                    state.time, state.bits,
+                    state.nonce, state.matmul_dim, 0);
+                state.seed_b = DeterministicMatMulSeedV2(
+                    state.previous_block_hash, state.height,
+                    state.version, state.merkle_root,
+                    state.time, state.bits,
+                    state.nonce, state.matmul_dim, 1);
+            }
             const Uint256 sigma = DeriveSigma(state);
-            if (!Uint256LE(sigma, pre_hash_target)) {
+            if (!SigmaLE(sigma, pre_hash_target)) {
                 --max_tries;
                 ++tries_used;
                 if (state.nonce == UINT64_MAX) break;

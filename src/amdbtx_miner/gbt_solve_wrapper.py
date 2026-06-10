@@ -97,6 +97,7 @@ class GBTSolveWrapper:
             "--daemon",
             "--backend", backend_arg,
             "--batch-size", str(self.batch_size),
+            "--epsilon-bits", "18",
         ]
         try:
             self.proc = subprocess.Popen(
@@ -158,7 +159,8 @@ class GBTSolveWrapper:
         from .stratum_client import Job
 
         if isinstance(job, Job):
-            share_target = job.target if job.target else ("00" + "ff" * 31)
+            # Pool must supply params[6]; hard fallback avoids false share hits.
+            share_target = job.target if job.target else ("ff" * 64)
             payload = {
                 "version": job.version,
                 "prev_hash": job.prev_hash,
@@ -178,7 +180,7 @@ class GBTSolveWrapper:
                 "share_target": share_target,
             }
         elif isinstance(job, dict):
-            share_target = job.get("target", job.get("share_target", "00" + "ff" * 31))
+            share_target = job.get("target", job.get("share_target", "ff" * 64))
             payload = {
                 "version": int(job.get("version", 536870912)),
                 "prev_hash": job.get("prev_hash", "0" * 64),

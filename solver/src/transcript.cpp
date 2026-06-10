@@ -68,7 +68,16 @@ Uint256 FinalizeProductCommittedDigest(const Uint256& c_prime_hash, const Uint25
     outer.Finalize(inner);
     uint8_t digest[32];
     CSHA256().Write(inner, 32).Finalize(digest);
-    return CanonicalBytesToUint256(digest);
+    // Match BTX: CSHA256::Finalize(result.begin()) — not CanonicalBytesToUint256.
+    return BytesToUint256(digest);
+}
+
+Uint256 ComputeProductCommittedDigestFromWords(
+    const field::Element* words, size_t count,
+    const Uint256& sigma, uint32_t dim, uint32_t b)
+{
+    const Uint256 c_prime_hash = HashMatrixWords(words, count);
+    return FinalizeProductCommittedDigest(c_prime_hash, sigma, dim, b);
 }
 
 Uint256 ComputeProductCommittedDigestFromPerturbed(const Matrix& A_prime, const Matrix& B_prime, uint32_t b, const Uint256& sigma) {
