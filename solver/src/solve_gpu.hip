@@ -1,5 +1,6 @@
 #include "solve.h"
 #include "sha256.h"
+#include "transcript.h"
 #include "gpu_sha256.h"
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -27,6 +28,20 @@ __host__ __device__ __forceinline__ Element GPUFieldAdd(Element a, Element b) {
 
 __host__ __device__ __forceinline__ Element GPUFieldMul(Element a, Element b) {
     return GPUReduce64(uint64_t(a) * b);
+}
+
+// Match field::dot: accumulate up to 4 products, then reduce (not per-product reduce).
+__device__ Element GPUFieldDot(const Element* a, const Element* b, uint32_t len) {
+    uint64_t acc = 0;
+    uint32_t pending = 0;
+    for (uint32_t i = 0; i < len; ++i) {
+        acc += uint64_t(a[i]) * b[i];
+        if (++pending == 4) {
+            acc = GPUReduce64(acc);
+            pending = 0;
+        }
+    }
+    return GPUReduce64(acc);
 }
 
 constexpr uint32_t MAX_BLOCK_THREADS = 256;
@@ -60,13 +75,11 @@ __global__ void BuildPerturbedMatrixKernel(
     uint32_t col = local_index % n;
     const Element* nl = noise_left + size_t(batch_index) * noise_left_elements;
     const Element* nr = noise_right + size_t(batch_index) * noise_right_elements;
-    uint64_t acc = 0;
-    uint32_t pending = 0;
+    Element acc = 0;
     for (uint32_t k = 0; k < r; ++k) {
-        acc += uint64_t(nl[row * r + k]) * nr[k * n + col];
-        if (++pending == 4) { acc = GPUReduce64(acc); pending = 0; }
+        acc = GPUFieldAdd(acc, GPUReduce64(uint64_t(nl[row * r + k]) * nr[k * n + col]));
     }
-    output[gid] = GPUFieldAdd(base_matrix[local_index], GPUReduce64(acc));
+    output[gid] = GPUFieldAdd(base_matrix[local_index], acc);
 }
 
 // Per-nonce base variant: each batch entry uses its OWN base matrix.
@@ -90,13 +103,11 @@ __global__ void BuildPerturbedMatrixBatchBaseKernel(
     const Element* base = base_batch + size_t(batch_index) * matrix_elements;
     const Element* nl = noise_left + size_t(batch_index) * noise_left_elements;
     const Element* nr = noise_right + size_t(batch_index) * noise_right_elements;
-    uint64_t acc = 0;
-    uint32_t pending = 0;
+    Element acc = 0;
     for (uint32_t k = 0; k < r; ++k) {
-        acc += uint64_t(nl[row * r + k]) * nr[k * n + col];
-        if (++pending == 4) { acc = GPUReduce64(acc); pending = 0; }
+        acc = GPUFieldAdd(acc, GPUReduce64(uint64_t(nl[row * r + k]) * nr[k * n + col]));
     }
-    output[gid] = GPUFieldAdd(base[local_index], GPUReduce64(acc));
+    output[gid] = GPUFieldAdd(base[local_index], acc);
 }
 
 
@@ -132,25 +143,25 @@ __global__ void ComputeCompressedWordsFusedKernel(
     uint32_t row = i * block_size + x;
     uint32_t col = j * block_size + y;
     size_t row_offset = size_t(row) * n;
-    Element compress_coeff = active ? compress_vec[tid] : 0;
     Element running_total = 0;
     for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
-        Element partial = 0;
         if (active) {
             uint32_t middle_base = ell * block_size;
-            uint64_t acc = 0;
-            uint32_t pending = 0;
+            Element dot_acc = 0;
             for (uint32_t k = 0; k < block_size; ++k) {
-                acc += uint64_t(matrix_a[row_offset + (middle_base + k)]) * matrix_b[size_t(middle_base + k) * n + col];
-                if (++pending == 4) { acc = GPUReduce64(acc); pending = 0; }
+                dot_acc = GPUFieldAdd(
+                    dot_acc,
+                    GPUReduce64(uint64_t(matrix_a[row_offset + (middle_base + k)])
+                                * matrix_b[size_t(middle_base + k) * n + col]));
             }
-            partial = GPUFieldMul(GPUReduce64(acc), compress_coeff);
+            partials[tid] = dot_acc;
+        } else {
+            partials[tid] = 0;
         }
-        partials[tid] = partial;
         __syncthreads();
-        ReducePartialsInPlace(partials, tid);
         if (tid == 0) {
-            running_total = GPUFieldAdd(running_total, partials[0]);
+            const Element compress_block = GPUFieldDot(partials, compress_vec, active_threads);
+            running_total = GPUFieldAdd(running_total, compress_block);
             if constexpr (PrefixMode) {
                 output[output_offset + ell] = running_total;
             }
@@ -258,9 +269,13 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
               uint64_t& max_tries, double max_seconds,
               uint64_t& tries_used, double& elapsed_s,
               uint32_t batch_size, uint32_t epsilon_bits,
-              bool* cpu_fallback)
+              bool* cpu_fallback, uint64_t* gate_passes,
+              uint64_t* words_hits, uint64_t* cpu_verify_misses)
 {
   if (cpu_fallback) *cpu_fallback = false;
+  if (gate_passes) *gate_passes = 0;
+  if (words_hits) *words_hits = 0;
+  if (cpu_verify_misses) *cpu_verify_misses = 0;
   if (!InitGPU()) {
     std::fprintf(stderr, "InitGPU failed, using CPU backend\n");
     if (cpu_fallback) *cpu_fallback = true;
@@ -285,8 +300,8 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     uint32_t words_per_request = pair_count_per_request;
     uint32_t thread_count = ResolveThreadCount(b);
 
-    // Sigma gate: sigma <= share_target << epsilon_bits (matches BTX pre-hash gate).
-    const Uint256 pre_hash_target = DerivePreHashTarget(share_target, epsilon_bits);
+    // Pre-hash gate: sigma <= block_target << epsilon_bits (BTX block-tier rule).
+    const Uint256 pre_hash_target = DerivePreHashTarget(block_target, epsilon_bits);
     uint8_t sigma_gate_threshold_be[32];
     Uint256ToMsbBytes(pre_hash_target, sigma_gate_threshold_be);
 
@@ -314,8 +329,8 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     uint8_t* d_sigma_gate_threshold{nullptr}; size_t cap_sigma_gate{0};
     uint8_t* d_digest_batch{nullptr}; size_t cap_digest{0};
     int32_t* d_results{nullptr}; size_t cap_results{0};
-    uint8_t* d_block_target{nullptr};
-    uint8_t* d_share_target{nullptr};
+    uint8_t* d_block_target{nullptr}; size_t cap_block_target{0};
+    uint8_t* d_share_target{nullptr}; size_t cap_share_target{0};
 
     auto cleanup = [&]() {
         hipFree(d_base_a); hipFree(d_base_b);
@@ -418,8 +433,8 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
   }
   hipMemcpy(d_sigma_gate_threshold, sigma_gate_threshold_be, 32, hipMemcpyHostToDevice);
 
-  if (hipMalloc(&d_block_target, 32) != hipSuccess ||
-      hipMalloc(&d_share_target, 32) != hipSuccess) {
+  if (!EnsureBufferU8(d_block_target, cap_block_target, 32) ||
+      !EnsureBufferU8(d_share_target, cap_share_target, 32)) {
       cleanup();
       return SolveCPU(state, n, b, r, block_target, share_target,
                       max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
@@ -434,9 +449,10 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         double elapsed = std::chrono::duration<double>(now - t0).count();
         if (max_seconds > 0 && elapsed >= max_seconds) break;
 
-    // Reset gate counter
+    // Reset gate counter (must complete before the gate kernel writes).
     uint32_t zero = 0;
     hipMemcpy(d_gate_count, &zero, sizeof(zero), hipMemcpyHostToDevice);
+    hipDeviceSynchronize();
 
     uint64_t this_batch = batch_size;
     if (this_batch > max_tries) this_batch = max_tries;
@@ -454,11 +470,62 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             this_batch, d_gate_count, d_sigma_nonces, d_sigma_batch);
     }
 
+    hipError_t gate_err = hipGetLastError();
+    if (gate_err == hipSuccess) gate_err = hipDeviceSynchronize();
+    if (gate_err != hipSuccess) {
+        std::fprintf(stderr, "HIP gate error, falling back to CPU: %s\n",
+                     hipGetErrorString(gate_err));
+        cleanup();
+        g_gpu.initialized = false;
+        if (cpu_fallback) *cpu_fallback = true;
+        return SolveCPU(state, n, b, r, block_target, share_target,
+                        max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
+    }
+
     uint32_t actual_batch = 0;
     hipMemcpy(&actual_batch, d_gate_count, sizeof(actual_batch), hipMemcpyDeviceToHost);
+    if (actual_batch > this_batch) actual_batch = static_cast<uint32_t>(this_batch);
     current_nonce += this_batch;
 
     if (actual_batch == 0) continue;
+    if (gate_passes) *gate_passes += actual_batch;
+
+    std::vector<uint64_t> host_nonces(actual_batch);
+    hipMemcpy(host_nonces.data(), d_sigma_nonces,
+              actual_batch * sizeof(uint64_t), hipMemcpyDeviceToHost);
+
+    // Re-derive V2 seeds/sigma on CPU so GPU matmul uses pool-identical inputs.
+    if (use_v2) {
+        std::vector<uint8_t> cpu_sigma(size_t(actual_batch) * 32);
+        std::vector<uint8_t> cpu_seed_a(size_t(actual_batch) * 32);
+        std::vector<uint8_t> cpu_seed_b(size_t(actual_batch) * 32);
+        for (uint32_t bi = 0; bi < actual_batch; ++bi) {
+            PowState nonce_state = state;
+            nonce_state.nonce = host_nonces[bi];
+            nonce_state.seed_a = DeterministicMatMulSeedV2(
+                state.previous_block_hash, state.height,
+                state.version, state.merkle_root,
+                state.time, state.bits,
+                nonce_state.nonce, state.matmul_dim, 0);
+            nonce_state.seed_b = DeterministicMatMulSeedV2(
+                state.previous_block_hash, state.height,
+                state.version, state.merkle_root,
+                state.time, state.bits,
+                nonce_state.nonce, state.matmul_dim, 1);
+            const Uint256 sigma = DeriveSigma(nonce_state);
+            std::memcpy(cpu_seed_a.data() + size_t(bi) * 32,
+                        nonce_state.seed_a.data, 32);
+            std::memcpy(cpu_seed_b.data() + size_t(bi) * 32,
+                        nonce_state.seed_b.data, 32);
+            std::memcpy(cpu_sigma.data() + size_t(bi) * 32, sigma.data, 32);
+        }
+        hipMemcpy(d_seed_a_compact, cpu_seed_a.data(), cpu_seed_a.size(),
+                  hipMemcpyHostToDevice);
+        hipMemcpy(d_seed_b_compact, cpu_seed_b.data(), cpu_seed_b.size(),
+                  hipMemcpyHostToDevice);
+        hipMemcpy(d_sigma_batch, cpu_sigma.data(), cpu_sigma.size(),
+                  hipMemcpyHostToDevice);
+    }
 
         size_t batch_needed_ma = size_t(actual_batch) * matrix_elements;
 
@@ -540,19 +607,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             n, b, blocks_per_axis, pair_count_per_request,
             words_per_request, matrix_elements, compress_elements, d_output);
 
-    if (!EnsureBufferU8(d_digest_batch, cap_digest, size_t(actual_batch) * 32) ||
-        !EnsureBufferI32(d_results, cap_results, actual_batch))
-    {
-        cleanup();
-        return SolveCPU(state, n, b, r, block_target, share_target,
-                        max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
-    }
-
-    gpasha::HashTranscriptKernel_launch(
-        d_output, d_sigma_batch, words_per_request, n, b, actual_batch, d_digest_batch);
-    gpasha::CompareDigestsKernel_launch(
-        d_digest_batch, d_block_target, d_share_target, actual_batch, d_results);
-
     hipError_t err = hipGetLastError();
     if (err == hipSuccess) err = hipDeviceSynchronize();
     if (err != hipSuccess) {
@@ -564,37 +618,54 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
                             max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
         }
 
-    std::vector<int32_t> host_results(actual_batch);
-    hipMemcpy(host_results.data(), d_results,
-              actual_batch * sizeof(int32_t), hipMemcpyDeviceToHost);
+    // GPU matmul words + CPU sigma/transcript pre-filter (pool-valid digests only).
+    std::vector<Element> host_words(size_t(actual_batch) * words_per_request);
+    hipMemcpy(host_words.data(), d_output,
+              host_words.size() * sizeof(Element), hipMemcpyDeviceToHost);
 
-    bool any_hit = false;
+    uint32_t miss_logs = 0;
     for (uint32_t bi = 0; bi < actual_batch; ++bi) {
-        if (host_results[bi] != 0) { any_hit = true; break; }
-    }
+        PowState verify = state;
+        verify.nonce = host_nonces[bi];
+        PrepareNonceSeeds(verify);
 
-    if (any_hit) {
-        std::vector<uint64_t> host_nonces(actual_batch);
-        hipMemcpy(host_nonces.data(), d_sigma_nonces,
-                  actual_batch * sizeof(uint64_t), hipMemcpyDeviceToHost);
+        const Uint256 sigma = DeriveSigma(verify);
+        const Uint256 words_digest = transcript::ComputeProductCommittedDigestFromWords(
+            host_words.data() + size_t(bi) * words_per_request,
+            words_per_request, sigma, n, b);
+        const bool words_block = Uint256LE(words_digest, block_target);
+        const bool words_share = !words_block && Uint256LE(words_digest, share_target);
+        if (!words_block && !words_share) continue;
+        if (words_hits) ++(*words_hits);
 
-        for (uint32_t bi = 0; bi < actual_batch; ++bi) {
-            if (host_results[bi] == 0) continue;
-
-            PowState verify = state;
-            verify.nonce = host_nonces[bi];
-            Uint256 cpu_digest;
-            ComputeDigestForNonce(verify, n, b, r, cpu_digest);
-            if (!Uint256LE(cpu_digest, block_target) && !Uint256LE(cpu_digest, share_target))
-                continue;
-
-            state = verify;
-            state.digest = cpu_digest;
-            auto t1 = std::chrono::steady_clock::now();
-            elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-            cleanup();
-            return true;
+        Uint256 cpu_digest;
+        ComputeDigestForNonce(verify, n, b, r, cpu_digest);
+        const bool is_block = Uint256LE(cpu_digest, block_target);
+        const bool is_share = !is_block && Uint256LE(cpu_digest, share_target);
+        if (!is_block && !is_share) {
+            if (cpu_verify_misses) ++(*cpu_verify_misses);
+            if (miss_logs < 2) {
+                const uint32_t word_diffs = CountCompressedWordDiffs(
+                    verify, n, b, r,
+                    host_words.data() + size_t(bi) * words_per_request,
+                    words_per_request);
+                std::fprintf(stderr,
+                    "digest verify miss nonce=%llu words=%s full=%s word_diffs=%u/%zu\n",
+                    static_cast<unsigned long long>(verify.nonce),
+                    Uint256ToHex(words_digest).substr(0, 16).c_str(),
+                    Uint256ToHex(cpu_digest).substr(0, 16).c_str(),
+                    word_diffs, size_t(words_per_request));
+                ++miss_logs;
+            }
+            continue;
         }
+
+        state = verify;
+        state.digest = cpu_digest;
+        auto t1 = std::chrono::steady_clock::now();
+        elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+        cleanup();
+        return true;
     }
     }
 

@@ -72,9 +72,8 @@ def finalize_product_digest_raw(sigma_raw, c_prime_raw, dim, b):
     buf += struct.pack("<I", dim)
     buf += struct.pack("<I", b)
     inner = hashlib.sha256(bytes(buf)).digest()
-    digest_raw = sha256d(inner)
-    # Pool/stratum targets use SetHex layout (MSB at data[31]).
-    return bytes(digest_raw[31 - i] for i in range(32))
+    # BTX FinalizeProductCommittedDigestFromHash: SHA256d into uint256.data (no byte swap).
+    return sha256d(inner)
 
 
 def main():

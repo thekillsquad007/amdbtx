@@ -23,6 +23,10 @@ Uint256 HashMatrixWords(const field::Element* words, size_t count);
 
 Uint256 FinalizeProductCommittedDigest(const Uint256& c_prime_hash, const Uint256& sigma, uint32_t dim, uint32_t b);
 
+Uint256 ComputeProductCommittedDigestFromWords(
+    const field::Element* words, size_t count,
+    const Uint256& sigma, uint32_t dim, uint32_t b);
+
 }
 
 #endif
