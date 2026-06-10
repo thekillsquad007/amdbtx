@@ -530,6 +530,41 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     hipMemcpy(host_nonces.data(), d_sigma_nonces,
               actual_batch * sizeof(uint64_t), hipMemcpyDeviceToHost);
 
+    // Re-derive V2 seeds/sigma on CPU so GPU matmul matches pool/btxd consensus.
+    // Gate kernel compacted seeds are not byte-identical to Uint256.data() inputs
+    // expected by GenerateMatrixKernel + noise derivation.
+    if (use_v2) {
+        std::vector<uint8_t> cpu_sigma(size_t(actual_batch) * 32);
+        std::vector<uint8_t> cpu_seed_a(size_t(actual_batch) * 32);
+        std::vector<uint8_t> cpu_seed_b(size_t(actual_batch) * 32);
+        for (uint32_t bi = 0; bi < actual_batch; ++bi) {
+            PowState nonce_state = state;
+            nonce_state.nonce = host_nonces[bi];
+            nonce_state.seed_a = DeterministicMatMulSeedV2(
+                state.previous_block_hash, state.height,
+                state.version, state.merkle_root,
+                state.time, state.bits,
+                nonce_state.nonce, state.matmul_dim, 0);
+            nonce_state.seed_b = DeterministicMatMulSeedV2(
+                state.previous_block_hash, state.height,
+                state.version, state.merkle_root,
+                state.time, state.bits,
+                nonce_state.nonce, state.matmul_dim, 1);
+            const Uint256 sigma = DeriveSigma(nonce_state);
+            std::memcpy(cpu_seed_a.data() + size_t(bi) * 32,
+                        nonce_state.seed_a.data, 32);
+            std::memcpy(cpu_seed_b.data() + size_t(bi) * 32,
+                        nonce_state.seed_b.data, 32);
+            std::memcpy(cpu_sigma.data() + size_t(bi) * 32, sigma.data, 32);
+        }
+        hipMemcpy(d_seed_a_compact, cpu_seed_a.data(), cpu_seed_a.size(),
+                  hipMemcpyHostToDevice);
+        hipMemcpy(d_seed_b_compact, cpu_seed_b.data(), cpu_seed_b.size(),
+                  hipMemcpyHostToDevice);
+        hipMemcpy(d_sigma_batch, cpu_sigma.data(), cpu_sigma.size(),
+                  hipMemcpyHostToDevice);
+    }
+
         size_t batch_needed_ma = size_t(actual_batch) * matrix_elements;
 
         if (!EnsureBufferU8(d_sigma_batch, cap_sigma, size_t(actual_batch) * 32) ||
@@ -551,7 +586,7 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         }
 
         if (use_v2) {
-            // Generate per-nonce A and B from V2 seeds (compacted on GPU by sigma gate)
+            // Generate per-nonce A and B from CPU-rederived V2 seeds
             gpasha::GenerateMatrixKernel_launch(
                 d_seed_a_compact, actual_batch, n, d_matrix_a);
             gpasha::GenerateMatrixKernel_launch(
