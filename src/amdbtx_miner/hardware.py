@@ -361,6 +361,59 @@ def pick_best_gpu_index(gpus: list[dict]) -> int:
     return 0
 
 
+def parse_gpu_devices_spec(value: Any) -> list[int] | str | None:
+    """Normalize gpu_devices config/CLI value. Returns 'all', list of ints, or None."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.lower() == "all":
+            return "all"
+        return [int(part.strip()) for part in stripped.split(",") if part.strip()]
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, list):
+        return [int(x) for x in value]
+    raise ValueError(f"invalid gpu_devices value: {value!r}")
+
+
+def resolve_gpu_devices(cfg: dict, gpu_info: dict) -> list[int]:
+    """Pick which GPU indices to mine on.
+
+    Priority:
+    1. gpu_devices: \"all\", [0, 1], or \"0,1\"
+    2. gpu_device >= 0 (single forced GPU)
+    3. auto (-1): best dGPU when multiple are present, else GPU 0
+    """
+    gpus = gpu_info.get("gpus") or []
+    num_detected = len(gpus)
+    if num_detected == 0:
+        num_detected = 1
+
+    spec = parse_gpu_devices_spec(cfg.get("gpu_devices"))
+    if spec == "all":
+        if not gpus:
+            log.warning("gpu_devices=all but no GPUs detected; using GPU 0")
+            return [0]
+        return list(range(len(gpus)))
+    if isinstance(spec, list) and spec:
+        for idx in spec:
+            if idx < 0 or (gpus and idx >= len(gpus)):
+                log.warning("gpu_devices includes GPU %d (detected %d); using anyway", idx, len(gpus))
+        return spec
+
+    forced = int(cfg.get("gpu_device", -1))
+    if forced >= 0:
+        return [forced]
+
+    if len(gpus) > 1:
+        best = pick_best_gpu_index(gpus)
+        return [best if best >= 0 else 0]
+    return [0]
+
+
 def hardware_summary_string(hw: dict[str, Any]) -> str:
     bits = []
     if hw.get("cpu_model"):

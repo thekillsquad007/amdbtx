@@ -8,17 +8,17 @@ from pathlib import Path
 
 try:
     from .config import load_config, validate_config
-    from .hardware import detect_gpu_info, pick_best_gpu_index
+    from .hardware import detect_gpu_info, resolve_gpu_devices
     from .stratum_client import StratumClient, Job
     from .solo_client import SoloClient
-    from .gbt_solve_wrapper import GBTSolveWrapper
+    from .gbt_solve_wrapper import GBTSolveWrapper, MultiGPUSolver
     from . import __version__, USER_AGENT, DEV_WALLET
 except ImportError:
     from config import load_config, validate_config
-    from hardware import detect_gpu_info, pick_best_gpu_index
+    from hardware import detect_gpu_info, resolve_gpu_devices
     from stratum_client import StratumClient, Job
     from solo_client import SoloClient
-    from gbt_solve_wrapper import GBTSolveWrapper
+    from gbt_solve_wrapper import GBTSolveWrapper, MultiGPUSolver
     __version__ = "1.0.0"
     USER_AGENT = f"amdbtx-miner/{__version__}"
     DEV_WALLET = "btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
@@ -51,7 +51,12 @@ def parse_args():
     p.add_argument("--solver-backend", default=None, choices=["rocm", "cpu"])
     p.add_argument("--solver-threads", type=int, default=None)
     p.add_argument("--solver-batch-size", type=int, default=None)
-    p.add_argument("--gpu-device", type=int, default=-1, help="GPU device index (-1 = auto)")
+    p.add_argument("--gpu-device", type=int, default=-1, help="GPU device index (-1 = auto, single GPU)")
+    p.add_argument(
+        "--gpu-devices",
+        default=None,
+        help="Comma-separated GPU indices or 'all' for multi-GPU (e.g. 0,1). Overrides --gpu-device.",
+    )
     p.add_argument("--benchmark", action="store_true", help="run benchmark to find optimal config")
     p.add_argument("--solo", action="store_true", help="solo mine against a btxd node (local or remote)")
     p.add_argument("--rpc-url", default=None, help="btxd JSON-RPC URL (solo mode), e.g. http://192.168.1.15:19334")
@@ -178,8 +183,8 @@ def run_benchmark(cfg: dict, config_path: str = ""):
     return best[1]
 
 
-def _make_solver(cfg: dict, solver_path: Path, gpu_device: int) -> GBTSolveWrapper:
-    return GBTSolveWrapper(
+def _make_solver(cfg: dict, solver_path: Path, gpu_devices: list[int]) -> MultiGPUSolver:
+    return MultiGPUSolver(
         solver_path=str(solver_path),
         backend=cfg.get("solver_backend", "rocm"),
         threads=cfg.get("solver_threads", 8),
@@ -188,12 +193,20 @@ def _make_solver(cfg: dict, solver_path: Path, gpu_device: int) -> GBTSolveWrapp
         prefetch_depth=cfg.get("solver_prefetch_depth", 8),
         pipeline_async=cfg.get("solver_pipeline_async", 1),
         gpu_inputs=cfg.get("gpu_inputs", 0),
-        gpu_device=gpu_device,
+        gpu_devices=gpu_devices,
         runtime_ld_path=cfg.get("runtime_ld_path", ""),
     )
 
 
-def run_mining_loop(client, solver: GBTSolveWrapper, cfg: dict, *, solo: bool = False):
+def _format_khps_line(result: dict, khps: float) -> str:
+    per_gpu = result.get("per_gpu_khps")
+    if per_gpu and len(per_gpu) > 1:
+        parts = "+".join(f"{v:.2f}" for v in per_gpu)
+        return f"matmul_khps={khps:.2f} total ({parts} per GPU)"
+    return f"matmul_khps={khps:.2f}"
+
+
+def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = False):
     fee_check = None
     if not solo:
         last_fee_switch = time.time()
@@ -303,7 +316,10 @@ def run_mining_loop(client, solver: GBTSolveWrapper, cfg: dict, *, solo: bool = 
             elapsed = result.get("elapsed_s", 0)
             # tries_used counts sigma scans; gate_passes is full matmul work (post ε gate).
             work = gate_passes if gate_passes else tries
-            khps = work / elapsed / 1000 if elapsed > 0 else 0
+            if result.get("matmul_khps_total") is not None:
+                khps = float(result["matmul_khps_total"])
+            else:
+                khps = work / elapsed / 1000 if elapsed > 0 else 0
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
@@ -321,12 +337,13 @@ def run_mining_loop(client, solver: GBTSolveWrapper, cfg: dict, *, solo: bool = 
                 backend = result.get("backend", "?")
                 a = getattr(client, "shares_accepted", 0)
                 r = getattr(client, "shares_rejected", 0)
+                khps_line = _format_khps_line(result, khps)
+                gpu_tag = f" gpus={solver.num_gpus}" if solver.num_gpus > 1 else ""
                 log.info(
                     "solve: nonce=%d tries=%d gate=%d gate/s=%.0f elapsed=%.2fs "
-                    "matmul_khps=%.2f backend=%s found=%s shares=%d/%d "
-                    "target=%s",
+                    "%s backend=%s%s found=%s shares=%d/%d target=%s",
                     current_job.nonce64_start, tries, gate_passes, gate_per_s, elapsed,
-                    khps, backend, result.get("found"), a, r,
+                    khps_line, backend, gpu_tag, result.get("found"), a, r,
                     (current_job.target[:12] if current_job.target else "none"),
                 )
                 last_log = now
@@ -376,11 +393,14 @@ def run_mining_loop(client, solver: GBTSolveWrapper, cfg: dict, *, solo: bool = 
                 )
                 current_job.merge_from(new_job)
 
-            nonce_end = result.get("nonce64_end")
-            if nonce_end is not None and nonce_end > solve_job.nonce64_start:
-                next_nonce_start = nonce_end + 1
+            if solver.num_gpus > 1:
+                next_nonce_start = solve_job.nonce64_start + nonces_per_slice * solver.num_gpus
             else:
-                next_nonce_start = solve_job.nonce64_start + nonces_per_slice
+                nonce_end = result.get("nonce64_end")
+                if nonce_end is not None and nonce_end > solve_job.nonce64_start:
+                    next_nonce_start = nonce_end + 1
+                else:
+                    next_nonce_start = solve_job.nonce64_start + nonces_per_slice
 
             if current_job.prev_hash == solve_job.prev_hash:
                 current_job.nonce64_start = next_nonce_start
@@ -440,6 +460,8 @@ def run_miner():
         cfg["solver_batch_size"] = args.solver_batch_size
     if args.gpu_device >= 0:
         cfg["gpu_device"] = args.gpu_device
+    if args.gpu_devices is not None:
+        cfg["gpu_devices"] = args.gpu_devices
     if args.log_level:
         cfg["log_level"] = args.log_level
     if args.solo:
@@ -474,15 +496,13 @@ def run_miner():
     else:
         log.warning("No AMD GPU detected — solver will likely fail with backend=rocm")
 
-    gpu_device = cfg.get("gpu_device", -1)
-    if gpu_device < 0:
-        gpus = gpu_info.get("gpus", [])
-        if gpus:
-            gpu_device = pick_best_gpu_index(gpus)
-            if len(gpus) > 1:
-                log.info("auto-selected GPU %d (dGPU with most VRAM)", gpu_device)
+    gpu_devices = resolve_gpu_devices(cfg, gpu_info)
+    if len(gpu_devices) == 1:
+        log.info("mining on GPU %d", gpu_devices[0])
+    else:
+        log.info("multi-GPU mining on devices %s (hashrate stacks)", gpu_devices)
 
-    solver = _make_solver(cfg, solver_path, gpu_device)
+    solver = _make_solver(cfg, solver_path, gpu_devices)
 
     mining_mode = cfg.get("mining_mode", "pool")
     if mining_mode == "solo":

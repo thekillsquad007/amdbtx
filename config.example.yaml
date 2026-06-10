@@ -22,9 +22,13 @@ solver_prefetch_depth: 8
 solver_pipeline_async: 1
 gpu_inputs: 0
 
-# GPU device selection (-1 = auto). Set to 0/1/.. to force a specific GPU
-# on multi-GPU systems (e.g. laptops with iGPU+dGPU).
+# GPU device selection (-1 = auto, single best GPU). Set to 0/1/.. to force one GPU.
 gpu_device: -1
+
+# Multi-GPU: set gpu_devices to mine on several cards in parallel (hashrate stacks).
+# Examples: "all", "0,1", or [0, 1]. Overrides gpu_device when set.
+# gpu_devices: "all"
+# gpu_devices: "0,1"
 
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0

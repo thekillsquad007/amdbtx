@@ -108,7 +108,8 @@ solver_prepare_workers: 16
 solver_batch_size: 128
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
-gpu_device: -1           # -1 = auto, 0/1/.. = force specific GPU (laptop iGPU+dGPU)
+gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU
+# gpu_devices: "all"     # multi-GPU: "all", "0,1", or [0, 1] — hashrate stacks
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0
 reconnect_initial_s: 1.0
@@ -121,6 +122,80 @@ CLI flags override config values:
 ```bash
 amdbtx-miner --payout-address btx1z... --worker-name myrig --solver-backend rocm
 ```
+
+### Multi-GPU
+
+On rigs with multiple AMD GPUs, the miner can run **one HIP solver per card**.
+Each GPU searches a disjoint nonce range in parallel — **effective hashrate stacks**
+for both pool and solo (2× 0.30 kH/s cards ≈ 0.60 kH/s total).
+
+#### How to enable multi-GPU
+
+**1. Confirm GPUs are visible**
+
+```bash
+rocminfo | grep -E 'Marketing Name|gfx'
+# or
+rocm-smi --showproductname
+```
+
+You should see one entry per card (e.g. `gfx1100` for RX 7800 XT). Note the
+device indices — usually `0`, `1`, … in probe order.
+
+**2. Edit config** (`~/.amdbtx-miner/config.yaml`)
+
+```yaml
+# Mine on every detected AMD GPU:
+gpu_devices: "all"
+
+# Or pick specific cards (skip an iGPU or a busy display GPU):
+# gpu_devices: "0,1"
+```
+
+**3. Start the miner** (pool or solo — same `gpu_devices` setting)
+
+Pool:
+
+```bash
+amdbtx-miner --config ~/.amdbtx-miner/config.yaml
+```
+
+Solo:
+
+```bash
+amdbtx-miner --solo \
+  --rpc-url http://192.168.1.15:19334 \
+  --rpc-user miner --rpc-password YOUR_PASSWORD \
+  --payout-address btx1z... \
+  --gpu-devices all
+```
+
+CLI overrides config: `--gpu-devices 0,1` is equivalent to `gpu_devices: "0,1"`.
+
+**4. Verify in logs**
+
+Startup should show:
+
+```
+multi-GPU mining on devices [0, 1] (hashrate stacks)
+multi-GPU mining: 2 solvers on devices [0, 1]
+```
+
+During mining, look for combined hashrate:
+
+```
+matmul_khps=0.58 total (0.29+0.29 per GPU) backend=hip gpus=2
+```
+
+**Behaviour**
+
+| Mode | Connection | Hashrate |
+|------|------------|----------|
+| Pool | One stratum worker; all GPUs submit shares | Stacks — pool sees sum of work |
+| Solo | One `btxd` RPC; first GPU to find a block submits | Stacks — ~2× faster expected block time |
+
+Leave `gpu_devices` unset to keep single-GPU mode: auto-pick the best card
+(useful on laptops with iGPU + dGPU where you only want the dGPU).
 
 ---
 
