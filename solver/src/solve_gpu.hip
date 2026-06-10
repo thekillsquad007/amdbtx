@@ -148,6 +148,7 @@ __global__ void ComputeCompressedWordsFusedKernel(
         if (active) {
             uint32_t middle_base = ell * block_size;
             Element dot_acc = 0;
+            #pragma unroll
             for (uint32_t k = 0; k < block_size; ++k) {
                 dot_acc = GPUFieldAdd(
                     dot_acc,
@@ -207,6 +208,61 @@ static bool EnsureBufferI32(int32_t*& ptr, size_t& capacity, size_t required) {
     return true;
 }
 
+struct GpuDevicePool {
+    Element* d_base_a{nullptr}; size_t cap_base_a{0};
+    Element* d_base_b{nullptr}; size_t cap_base_b{0};
+    Element* d_noise_e_l{nullptr}; size_t cap_nl{0};
+    Element* d_noise_e_r{nullptr}; size_t cap_nr{0};
+    Element* d_noise_f_l{nullptr}; size_t cap_fl{0};
+    Element* d_noise_f_r{nullptr}; size_t cap_fr{0};
+    Element* d_compress{nullptr}; size_t cap_cv{0};
+    Element* d_matrix_a{nullptr}; size_t cap_ma{0};
+    Element* d_matrix_b{nullptr}; size_t cap_mb{0};
+    Element* d_output{nullptr}; size_t cap_out{0};
+    uint8_t* d_sigma_batch{nullptr}; size_t cap_sigma{0};
+    uint8_t* d_noise_seeds{nullptr}; size_t cap_nseeds{0};
+    uint8_t* d_compress_seeds{nullptr}; size_t cap_cseeds{0};
+    uint32_t* d_gate_count{nullptr}; size_t cap_gate_count{0};
+    uint64_t* d_sigma_nonces{nullptr}; size_t cap_sigma_nonces{0};
+    gpasha::SigmaHeader* d_header{nullptr}; size_t cap_header{0};
+    gpasha::V2SeedParams* d_v2_params{nullptr}; size_t cap_v2_params{0};
+    uint8_t* d_seed_a_compact{nullptr}; size_t cap_seed_a{0};
+    uint8_t* d_seed_b_compact{nullptr}; size_t cap_seed_b{0};
+    uint8_t* d_sigma_gate_threshold{nullptr}; size_t cap_sigma_gate{0};
+    uint8_t* d_digest_batch{nullptr}; size_t cap_digest{0};
+    int32_t* d_results{nullptr}; size_t cap_results{0};
+    uint8_t* d_block_target{nullptr}; size_t cap_block_target{0};
+    uint8_t* d_share_target{nullptr}; size_t cap_share_target{0};
+
+    void Release() {
+        hipFree(d_base_a); d_base_a = nullptr; cap_base_a = 0;
+        hipFree(d_base_b); d_base_b = nullptr; cap_base_b = 0;
+        hipFree(d_noise_e_l); d_noise_e_l = nullptr; cap_nl = 0;
+        hipFree(d_noise_e_r); d_noise_e_r = nullptr; cap_nr = 0;
+        hipFree(d_noise_f_l); d_noise_f_l = nullptr; cap_fl = 0;
+        hipFree(d_noise_f_r); d_noise_f_r = nullptr; cap_fr = 0;
+        hipFree(d_compress); d_compress = nullptr; cap_cv = 0;
+        hipFree(d_matrix_a); d_matrix_a = nullptr; cap_ma = 0;
+        hipFree(d_matrix_b); d_matrix_b = nullptr; cap_mb = 0;
+        hipFree(d_output); d_output = nullptr; cap_out = 0;
+        hipFree(d_sigma_batch); d_sigma_batch = nullptr; cap_sigma = 0;
+        hipFree(d_noise_seeds); d_noise_seeds = nullptr; cap_nseeds = 0;
+        hipFree(d_compress_seeds); d_compress_seeds = nullptr; cap_cseeds = 0;
+        hipFree(d_gate_count); d_gate_count = nullptr; cap_gate_count = 0;
+        hipFree(d_sigma_nonces); d_sigma_nonces = nullptr; cap_sigma_nonces = 0;
+        hipFree(d_header); d_header = nullptr; cap_header = 0;
+        hipFree(d_v2_params); d_v2_params = nullptr; cap_v2_params = 0;
+        hipFree(d_seed_a_compact); d_seed_a_compact = nullptr; cap_seed_a = 0;
+        hipFree(d_seed_b_compact); d_seed_b_compact = nullptr; cap_seed_b = 0;
+        hipFree(d_sigma_gate_threshold); d_sigma_gate_threshold = nullptr; cap_sigma_gate = 0;
+        hipFree(d_digest_batch); d_digest_batch = nullptr; cap_digest = 0;
+        hipFree(d_results); d_results = nullptr; cap_results = 0;
+        hipFree(d_block_target); d_block_target = nullptr; cap_block_target = 0;
+        hipFree(d_share_target); d_share_target = nullptr; cap_share_target = 0;
+    }
+};
+static GpuDevicePool g_pool;
+
 struct GpuContext {
   bool initialized{false};
   int device_id{-1};
@@ -219,14 +275,17 @@ static bool InitGPU() {
   hipError_t err = hipGetDeviceCount(&device_count);
   if (err != hipSuccess || device_count == 0) return false;
 
+  // HIP_VISIBLE_DEVICES remaps to a single visible device — use index 0.
   int best_device = 0;
-  size_t best_mem = 0;
-  for (int i = 0; i < device_count; ++i) {
-    hipDeviceProp_t prop;
-    if (hipGetDeviceProperties(&prop, i) == hipSuccess) {
-      if (prop.totalGlobalMem > best_mem) {
-        best_mem = prop.totalGlobalMem;
-        best_device = i;
+  if (device_count > 1) {
+    size_t best_mem = 0;
+    for (int i = 0; i < device_count; ++i) {
+      hipDeviceProp_t prop;
+      if (hipGetDeviceProperties(&prop, i) == hipSuccess) {
+        if (prop.totalGlobalMem > best_mem) {
+          best_mem = prop.totalGlobalMem;
+          best_device = i;
+        }
       }
     }
   }
@@ -305,62 +364,43 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     uint8_t sigma_gate_threshold_be[32];
     Uint256ToMsbBytes(pre_hash_target, sigma_gate_threshold_be);
 
-    Element* d_base_a{nullptr}; size_t cap_base_a{0};
-    Element* d_base_b{nullptr}; size_t cap_base_b{0};
-    Element* d_noise_e_l{nullptr}; size_t cap_nl{0};
-    Element* d_noise_e_r{nullptr}; size_t cap_nr{0};
-    Element* d_noise_f_l{nullptr}; size_t cap_fl{0};
-    Element* d_noise_f_r{nullptr}; size_t cap_fr{0};
-    Element* d_compress{nullptr}; size_t cap_cv{0};
-    Element* d_matrix_a{nullptr}; size_t cap_ma{0};
-    Element* d_matrix_b{nullptr}; size_t cap_mb{0};
-    Element* d_output{nullptr}; size_t cap_out{0};
-    uint8_t* d_sigma_batch{nullptr}; size_t cap_sigma{0};
-    uint8_t* d_noise_seeds{nullptr}; size_t cap_nseeds{0};
-    uint8_t* d_compress_seeds{nullptr}; size_t cap_cseeds{0};
-    uint32_t* d_gate_count{nullptr}; size_t cap_gate_count{0};
-    uint64_t* d_sigma_nonces{nullptr}; size_t cap_sigma_nonces{0};
-    // V1 sigma header
-    gpasha::SigmaHeader* d_header{nullptr}; size_t cap_header{0};
-    // V2 params and seed output
-    gpasha::V2SeedParams* d_v2_params{nullptr}; size_t cap_v2_params{0};
-    uint8_t* d_seed_a_compact{nullptr}; size_t cap_seed_a{0};
-    uint8_t* d_seed_b_compact{nullptr}; size_t cap_seed_b{0};
-    uint8_t* d_sigma_gate_threshold{nullptr}; size_t cap_sigma_gate{0};
-    uint8_t* d_digest_batch{nullptr}; size_t cap_digest{0};
-    int32_t* d_results{nullptr}; size_t cap_results{0};
-    uint8_t* d_block_target{nullptr}; size_t cap_block_target{0};
-    uint8_t* d_share_target{nullptr}; size_t cap_share_target{0};
+    Element*& d_base_a = g_pool.d_base_a; size_t& cap_base_a = g_pool.cap_base_a;
+    Element*& d_base_b = g_pool.d_base_b; size_t& cap_base_b = g_pool.cap_base_b;
+    Element*& d_noise_e_l = g_pool.d_noise_e_l; size_t& cap_nl = g_pool.cap_nl;
+    Element*& d_noise_e_r = g_pool.d_noise_e_r; size_t& cap_nr = g_pool.cap_nr;
+    Element*& d_noise_f_l = g_pool.d_noise_f_l; size_t& cap_fl = g_pool.cap_fl;
+    Element*& d_noise_f_r = g_pool.d_noise_f_r; size_t& cap_fr = g_pool.cap_fr;
+    Element*& d_compress = g_pool.d_compress; size_t& cap_cv = g_pool.cap_cv;
+    Element*& d_matrix_a = g_pool.d_matrix_a; size_t& cap_ma = g_pool.cap_ma;
+    Element*& d_matrix_b = g_pool.d_matrix_b; size_t& cap_mb = g_pool.cap_mb;
+    Element*& d_output = g_pool.d_output; size_t& cap_out = g_pool.cap_out;
+    uint8_t*& d_sigma_batch = g_pool.d_sigma_batch; size_t& cap_sigma = g_pool.cap_sigma;
+    uint8_t*& d_noise_seeds = g_pool.d_noise_seeds; size_t& cap_nseeds = g_pool.cap_nseeds;
+    uint8_t*& d_compress_seeds = g_pool.d_compress_seeds; size_t& cap_cseeds = g_pool.cap_cseeds;
+    uint32_t*& d_gate_count = g_pool.d_gate_count; size_t& cap_gate_count = g_pool.cap_gate_count;
+    uint64_t*& d_sigma_nonces = g_pool.d_sigma_nonces; size_t& cap_sigma_nonces = g_pool.cap_sigma_nonces;
+    gpasha::SigmaHeader*& d_header = g_pool.d_header; size_t& cap_header = g_pool.cap_header;
+    gpasha::V2SeedParams*& d_v2_params = g_pool.d_v2_params; size_t& cap_v2_params = g_pool.cap_v2_params;
+    uint8_t*& d_seed_a_compact = g_pool.d_seed_a_compact; size_t& cap_seed_a = g_pool.cap_seed_a;
+    uint8_t*& d_seed_b_compact = g_pool.d_seed_b_compact; size_t& cap_seed_b = g_pool.cap_seed_b;
+    uint8_t*& d_sigma_gate_threshold = g_pool.d_sigma_gate_threshold; size_t& cap_sigma_gate = g_pool.cap_sigma_gate;
+    uint8_t*& d_digest_batch = g_pool.d_digest_batch; size_t& cap_digest = g_pool.cap_digest;
+    int32_t*& d_results = g_pool.d_results; size_t& cap_results = g_pool.cap_results;
+    uint8_t*& d_block_target = g_pool.d_block_target; size_t& cap_block_target = g_pool.cap_block_target;
+    uint8_t*& d_share_target = g_pool.d_share_target; size_t& cap_share_target = g_pool.cap_share_target;
 
-    auto cleanup = [&]() {
-        hipFree(d_base_a); hipFree(d_base_b);
-        hipFree(d_noise_e_l); hipFree(d_noise_e_r);
-        hipFree(d_noise_f_l); hipFree(d_noise_f_r);
-        hipFree(d_compress);
-        hipFree(d_matrix_a); hipFree(d_matrix_b);
-        hipFree(d_output);
-        hipFree(d_sigma_batch); hipFree(d_noise_seeds);
-        hipFree(d_compress_seeds);
-        hipFree(d_gate_count); hipFree(d_sigma_nonces);
-        hipFree(d_header); hipFree(d_v2_params);
-        hipFree(d_seed_a_compact); hipFree(d_seed_b_compact);
-        hipFree(d_sigma_gate_threshold);
-        hipFree(d_digest_batch);
-        hipFree(d_results);
-        hipFree(d_block_target);
-        hipFree(d_share_target);
-    };
+    auto release_pool = [&]() { g_pool.Release(); };
 
     if (!EnsureBuffer(d_base_a, cap_base_a, matrix_elements) ||
         !EnsureBuffer(d_base_b, cap_base_b, matrix_elements) ||
-        !EnsureBuffer(d_output, cap_out, words_per_request) ||
+        !EnsureBuffer(d_output, cap_out, size_t(batch_size) * words_per_request) ||
         !EnsureBufferU8(d_sigma_batch, cap_sigma, size_t(batch_size) * 32) ||
         !EnsureBufferU8(d_noise_seeds, cap_nseeds, size_t(batch_size) * 4 * 32) ||
         !EnsureBufferU8(d_compress_seeds, cap_cseeds, size_t(batch_size) * 32) ||
         !EnsureBufferI32(reinterpret_cast<int32_t*&>(d_gate_count), cap_gate_count, 1) ||
         !EnsureBuffer(reinterpret_cast<Element*&>(d_sigma_nonces), cap_sigma_nonces, batch_size))
     {
-        cleanup();
+        release_pool();
         if (cpu_fallback) *cpu_fallback = true;
         return SolveCPU(state, n, b, r, block_target, share_target,
                         max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
@@ -371,7 +411,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             !EnsureBufferU8(d_seed_a_compact, cap_seed_a, size_t(batch_size) * 32) ||
             !EnsureBufferU8(d_seed_b_compact, cap_seed_b, size_t(batch_size) * 32))
         {
-            cleanup();
             return SolveCPU(state, n, b, r, block_target, share_target,
                             max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
         }
@@ -380,7 +419,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             !EnsureBuffer(d_matrix_b, cap_mb, matrix_elements) ||
             !EnsureBuffer(reinterpret_cast<Element*&>(d_header), cap_header, 1))
         {
-            cleanup();
             return SolveCPU(state, n, b, r, block_target, share_target,
                             max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
         }
@@ -427,7 +465,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
 
   // Upload sigma gate threshold (MSB-first) to GPU
   if (!EnsureBufferU8(d_sigma_gate_threshold, cap_sigma_gate, 32)) {
-      cleanup();
       return SolveCPU(state, n, b, r, block_target, share_target,
                       max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
   }
@@ -435,7 +472,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
 
   if (!EnsureBufferU8(d_block_target, cap_block_target, 32) ||
       !EnsureBufferU8(d_share_target, cap_share_target, 32)) {
-      cleanup();
       return SolveCPU(state, n, b, r, block_target, share_target,
                       max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
   }
@@ -475,7 +511,7 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     if (gate_err != hipSuccess) {
         std::fprintf(stderr, "HIP gate error, falling back to CPU: %s\n",
                      hipGetErrorString(gate_err));
-        cleanup();
+        release_pool();
         g_gpu.initialized = false;
         if (cpu_fallback) *cpu_fallback = true;
         return SolveCPU(state, n, b, r, block_target, share_target,
@@ -494,39 +530,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     hipMemcpy(host_nonces.data(), d_sigma_nonces,
               actual_batch * sizeof(uint64_t), hipMemcpyDeviceToHost);
 
-    // Re-derive V2 seeds/sigma on CPU so GPU matmul uses pool-identical inputs.
-    if (use_v2) {
-        std::vector<uint8_t> cpu_sigma(size_t(actual_batch) * 32);
-        std::vector<uint8_t> cpu_seed_a(size_t(actual_batch) * 32);
-        std::vector<uint8_t> cpu_seed_b(size_t(actual_batch) * 32);
-        for (uint32_t bi = 0; bi < actual_batch; ++bi) {
-            PowState nonce_state = state;
-            nonce_state.nonce = host_nonces[bi];
-            nonce_state.seed_a = DeterministicMatMulSeedV2(
-                state.previous_block_hash, state.height,
-                state.version, state.merkle_root,
-                state.time, state.bits,
-                nonce_state.nonce, state.matmul_dim, 0);
-            nonce_state.seed_b = DeterministicMatMulSeedV2(
-                state.previous_block_hash, state.height,
-                state.version, state.merkle_root,
-                state.time, state.bits,
-                nonce_state.nonce, state.matmul_dim, 1);
-            const Uint256 sigma = DeriveSigma(nonce_state);
-            std::memcpy(cpu_seed_a.data() + size_t(bi) * 32,
-                        nonce_state.seed_a.data, 32);
-            std::memcpy(cpu_seed_b.data() + size_t(bi) * 32,
-                        nonce_state.seed_b.data, 32);
-            std::memcpy(cpu_sigma.data() + size_t(bi) * 32, sigma.data, 32);
-        }
-        hipMemcpy(d_seed_a_compact, cpu_seed_a.data(), cpu_seed_a.size(),
-                  hipMemcpyHostToDevice);
-        hipMemcpy(d_seed_b_compact, cpu_seed_b.data(), cpu_seed_b.size(),
-                  hipMemcpyHostToDevice);
-        hipMemcpy(d_sigma_batch, cpu_sigma.data(), cpu_sigma.size(),
-                  hipMemcpyHostToDevice);
-    }
-
         size_t batch_needed_ma = size_t(actual_batch) * matrix_elements;
 
         if (!EnsureBufferU8(d_sigma_batch, cap_sigma, size_t(actual_batch) * 32) ||
@@ -543,13 +546,12 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             !EnsureBuffer(d_base_a, cap_base_a, batch_needed_ma) ||
             !EnsureBuffer(d_base_b, cap_base_b, batch_needed_ma))
         {
-            cleanup();
             return SolveCPU(state, n, b, r, block_target, share_target,
                             max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
         }
 
         if (use_v2) {
-            // Generate per-nonce A and B from V2 seeds
+            // Generate per-nonce A and B from V2 seeds (compacted on GPU by sigma gate)
             gpasha::GenerateMatrixKernel_launch(
                 d_seed_a_compact, actual_batch, n, d_matrix_a);
             gpasha::GenerateMatrixKernel_launch(
@@ -611,32 +613,49 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     if (err == hipSuccess) err = hipDeviceSynchronize();
     if (err != hipSuccess) {
             std::fprintf(stderr, "HIP error, falling back to CPU: %s\n", hipGetErrorString(err));
-            cleanup();
+            release_pool();
             g_gpu.initialized = false;
             if (cpu_fallback) *cpu_fallback = true;
             return SolveCPU(state, n, b, r, block_target, share_target,
                             max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
         }
 
-    // GPU matmul words + CPU sigma/transcript pre-filter (pool-valid digests only).
-    std::vector<Element> host_words(size_t(actual_batch) * words_per_request);
-    hipMemcpy(host_words.data(), d_output,
-              host_words.size() * sizeof(Element), hipMemcpyDeviceToHost);
+    if (!EnsureBufferU8(d_digest_batch, cap_digest, size_t(actual_batch) * 32) ||
+        !EnsureBufferI32(d_results, cap_results, actual_batch))
+    {
+        return SolveCPU(state, n, b, r, block_target, share_target,
+                        max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
+    }
+
+    gpasha::HashTranscriptKernel_launch(
+        d_output, d_sigma_batch, words_per_request, n, b, actual_batch, d_digest_batch);
+    gpasha::CompareDigestsKernel_launch(
+        d_digest_batch, d_block_target, d_share_target, actual_batch, d_results);
+
+    hipError_t digest_err = hipGetLastError();
+    if (digest_err == hipSuccess) digest_err = hipDeviceSynchronize();
+    if (digest_err != hipSuccess) {
+        std::fprintf(stderr, "HIP digest error, falling back to CPU: %s\n",
+                     hipGetErrorString(digest_err));
+        release_pool();
+        g_gpu.initialized = false;
+        if (cpu_fallback) *cpu_fallback = true;
+        return SolveCPU(state, n, b, r, block_target, share_target,
+                        max_tries, max_seconds, tries_used, elapsed_s, epsilon_bits);
+    }
+
+    std::vector<int32_t> host_results(actual_batch);
+    hipMemcpy(host_results.data(), d_results,
+              actual_batch * sizeof(int32_t), hipMemcpyDeviceToHost);
 
     uint32_t miss_logs = 0;
     for (uint32_t bi = 0; bi < actual_batch; ++bi) {
+        if (host_results[bi] == 0) continue;
+        if (words_hits) ++(*words_hits);
+
         PowState verify = state;
         verify.nonce = host_nonces[bi];
         PrepareNonceSeeds(verify);
-
-        const Uint256 sigma = DeriveSigma(verify);
-        const Uint256 words_digest = transcript::ComputeProductCommittedDigestFromWords(
-            host_words.data() + size_t(bi) * words_per_request,
-            words_per_request, sigma, n, b);
-        const bool words_block = Uint256LE(words_digest, block_target);
-        const bool words_share = !words_block && Uint256LE(words_digest, share_target);
-        if (!words_block && !words_share) continue;
-        if (words_hits) ++(*words_hits);
 
         Uint256 cpu_digest;
         ComputeDigestForNonce(verify, n, b, r, cpu_digest);
@@ -645,14 +664,15 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         if (!is_block && !is_share) {
             if (cpu_verify_misses) ++(*cpu_verify_misses);
             if (miss_logs < 2) {
+                std::vector<Element> host_words(words_per_request);
+                hipMemcpy(host_words.data(),
+                          d_output + size_t(bi) * words_per_request,
+                          words_per_request * sizeof(Element), hipMemcpyDeviceToHost);
                 const uint32_t word_diffs = CountCompressedWordDiffs(
-                    verify, n, b, r,
-                    host_words.data() + size_t(bi) * words_per_request,
-                    words_per_request);
+                    verify, n, b, r, host_words.data(), words_per_request);
                 std::fprintf(stderr,
-                    "digest verify miss nonce=%llu words=%s full=%s word_diffs=%u/%zu\n",
+                    "digest verify miss nonce=%llu full=%s word_diffs=%u/%zu\n",
                     static_cast<unsigned long long>(verify.nonce),
-                    Uint256ToHex(words_digest).substr(0, 16).c_str(),
                     Uint256ToHex(cpu_digest).substr(0, 16).c_str(),
                     word_diffs, size_t(words_per_request));
                 ++miss_logs;
@@ -664,7 +684,6 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         state.digest = cpu_digest;
         auto t1 = std::chrono::steady_clock::now();
         elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-        cleanup();
         return true;
     }
     }
@@ -672,6 +691,5 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     state.nonce = current_nonce;
     auto t1 = std::chrono::steady_clock::now();
     elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-    cleanup();
     return false;
 }

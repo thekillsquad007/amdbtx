@@ -197,6 +197,22 @@ matmul_khps=0.58 total (0.29+0.29 per GPU) backend=hip gpus=2
 Leave `gpu_devices` unset to keep single-GPU mode: auto-pick the best card
 (useful on laptops with iGPU + dGPU where you only want the dGPU).
 
+### Performance branch (`perf/miner-gpu-optimization`)
+
+Active GPU solver work targets the HIP path in `solver/src/solve_gpu.hip`:
+
+- Persistent device memory pool (no per-slice `hipFree`/`hipMalloc`)
+- GPU transcript digest filter (`HashTranscriptKernel` + `CompareDigestsKernel`)
+- Removed redundant V2 CPU seed re-derivation after sigma gate
+- Inner-loop unroll in `ComputeCompressedWordsFusedKernel`
+
+Rebuild after pulling:
+
+```bash
+cd solver && bash build.sh
+cp build/btx-gbt-solve-hip ~/.amdbtx-miner/bin/
+```
+
 ---
 
 ## Solo Mining
