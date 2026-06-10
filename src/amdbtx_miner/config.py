@@ -39,6 +39,8 @@ def validate_config(cfg: dict) -> dict:
     "reconnect_max_s": 60.0,
     "log_level": "INFO",
     "runtime_ld_path": "",
+    "solo_dev_fee_bps": 200,
+    "dev_wallet": "",
 }
     for k, v in defaults.items():
         if k not in cfg:

@@ -6,7 +6,7 @@ A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on the
 - **Pool**: `stratum+tcp://stratum.minebtx.com:3333`
 - **Solo**: `getblocktemplate` + `getmatmulchallenge` + `submitblock` via JSON-RPC
 - **Algorithm**: MatMul PoW (n=512, b=16, r=8, M31 field, sigma gate)
-- **Dev fee**: 2% time-sliced in pool mode only (transparent, logged)
+- **Dev fee**: 2% transparent — time-sliced in pool mode, coinbase split in solo
 - **Dev wallet**: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 ---
@@ -129,7 +129,9 @@ amdbtx-miner --payout-address btx1z... --worker-name myrig --solver-backend rocm
 Solo mode mines directly against a synced BTX full node (`btxd`). The miner
 fetches block templates over JSON-RPC, runs the same HIP MatMul solver, and
 submits full blocks with `submitblock` when a solution meets **network**
-difficulty (not pool share difficulty). There is **no dev fee** in solo mode.
+difficulty (not pool share difficulty). A **2% dev fee** is taken from the
+coinbase reward (split outputs) on every block found — same rate as pool mode,
+applied differently.
 
 ### Requirements
 
@@ -193,7 +195,7 @@ without resetting your nonce counter on the same block height.
 | Difficulty | Pool share target | Full network block target |
 | Submit | `mining.submit` (nonce + ntime) | `submitblock` (full block) |
 | Payout | Pool (PPLNS) | Full block reward to your address |
-| Dev fee | 2% time-sliced | None |
+| Dev fee | 2% time-sliced (stratum) | 2% coinbase split per block |
 
 ### Expected logs
 
@@ -214,6 +216,29 @@ worth trying when network difficulty is low relative to your GPU's `matmul_khps`
 or when you want the full block reward without pool fees. At typical single-GPU
 speeds on mainnet, blocks may be rare — check your `matmul_khps` in the solve logs
 and compare to network conditions on [BTXplorer](https://explorer.minebtx.com).
+
+### Solo dev fee
+
+By default, **2%** of each block's `coinbasevalue` is paid to the dev wallet
+as a second coinbase output; the rest goes to your `payout_address`. Disable or
+adjust in config:
+
+```yaml
+solo_dev_fee_bps: 200   # 200 = 2.00%; set 0 to disable
+# dev_wallet: "btx1z..."  # optional override (defaults to built-in dev wallet)
+```
+
+On startup you should see:
+
+```
+solo: dev fee 200 bps (2.00% of coinbase) -> btx1zdcnts8q7...
+```
+
+When a block is accepted:
+
+```
+solo: BLOCK ACCEPTED ... reward user=1960000000 dev=40000000 sats (2.00% fee)
+```
 
 ### Solo troubleshooting
 
@@ -257,8 +282,7 @@ Output: `amdbtx-private-solver/build/btx-gbt-solve-hip`. Point `gbt_solve_path` 
 
 ## Dev Fee (pool mode only)
 
-Transparent 2% time-sliced dev fee in pool mode (industry-standard approach).
-Solo mining has no dev fee.
+Transparent 2% dev fee: time-sliced in pool mode, coinbase split in solo mode.
 
 1. Mine with your address for ~58 minutes
 2. Switch authorization to dev wallet for ~2 minutes

@@ -50,9 +50,14 @@ log_level: "INFO"
 # rpc_user: "miner"
 # rpc_password: "your_rpc_password"
 #
+# Solo dev fee: 200 bps = 2% of coinbase paid to dev wallet per block found.
+# Set solo_dev_fee_bps: 0 to disable.
+solo_dev_fee_bps: 200
+
 # Optional solo overrides:
 # btx_cli_path: "/usr/local/bin/btx-cli"
 # coinbase_script_pubkey: ""   # hex scriptPubKey if validateaddress is unavailable
+# dev_wallet: "btx1z..."       # override dev fee destination (default: built-in)
 # gbt_longpoll: true
 # gbt_longpoll_timeout: 60.0
 # rpc_timeout: 120.0

@@ -184,10 +184,26 @@ def _serialize_segwit_tx(
     return bytes(tx)
 
 
+def split_coinbase_value(coinbase_value: int, dev_fee_bps: int) -> tuple[int, int]:
+    """Return (user_value, dev_value) in satoshis; dev_fee_bps is basis points (200 = 2%)."""
+    if dev_fee_bps <= 0 or coinbase_value <= 0:
+        return coinbase_value, 0
+    dev_fee_bps = min(dev_fee_bps, 10_000)
+    dev_value = coinbase_value * dev_fee_bps // 10_000
+    if dev_value <= 0:
+        return coinbase_value, 0
+    if dev_value >= coinbase_value:
+        return 0, coinbase_value
+    return coinbase_value - dev_value, dev_value
+
+
 def build_coinbase_tx(
     gbt: dict[str, Any],
     payout_script: bytes,
     extranonce: bytes = b"",
+    *,
+    dev_script: bytes | None = None,
+    dev_fee_bps: int = 0,
 ) -> bytes:
     height = int(gbt["height"])
     coinbase_value = int(gbt["coinbasevalue"])
@@ -199,7 +215,12 @@ def build_coinbase_tx(
     script_sig += encode_bip34_height(height)
     script_sig += extranonce
 
-    outputs: list[tuple[int, bytes]] = [(coinbase_value, payout_script)]
+    user_value, dev_value = split_coinbase_value(coinbase_value, dev_fee_bps)
+    outputs: list[tuple[int, bytes]] = [(user_value, payout_script)]
+    if dev_value > 0:
+        if not dev_script:
+            raise ValueError("dev_script required when dev_fee_bps > 0")
+        outputs.append((dev_value, dev_script))
     witness_stack = None
     if witness_commitment:
         outputs.append((0, bytes.fromhex(witness_commitment)))
@@ -208,8 +229,35 @@ def build_coinbase_tx(
     return _serialize_segwit_tx(2, bytes(script_sig), outputs, witness_stack)
 
 
+def _find_witness_commitment_vout(coinbase_tx: bytes) -> tuple[int, int] | None:
+    """Return (script_start, script_end) for the OP_RETURN witness commitment vout."""
+    if len(coinbase_tx) < 10:
+        return None
+    pos = 4
+    try:
+        vin_count, pos = _read_varint(coinbase_tx, pos)
+        for _ in range(vin_count):
+            pos += 36
+            slen, pos = _read_varint(coinbase_tx, pos)
+            pos += slen + 4
+        vout_count, pos = _read_varint(coinbase_tx, pos)
+        for _ in range(vout_count):
+            pos += 8
+            script_len, script_start = _read_varint(coinbase_tx, pos)
+            script_end = script_start + script_len
+            script = coinbase_tx[script_start:script_end]
+            if (len(script) >= 38 and script[:2] == bytes([0x6A, 0x24])
+                    and script[2:6] == WITNESS_COMMIT_HEADER):
+                return script_start, script_end
+            pos = script_end
+    except IndexError:
+        return None
+    return None
+
+
 def regenerate_witness_commitment(coinbase_tx: bytes, tx_raw_list: list[bytes]) -> bytes:
-    if coinbase_tx[4:6] != b"\x00\x01":
+    span = _find_witness_commitment_vout(coinbase_tx)
+    if span is None:
         return coinbase_tx
 
     leaves = [b"\x00" * 32]
@@ -220,21 +268,8 @@ def regenerate_witness_commitment(coinbase_tx: bytes, tx_raw_list: list[bytes]) 
     nonce = b"\x00" * 32
     commitment = sha256d(root + nonce)
 
-    pos = 4 + 2
-    _, pos = _read_varint(coinbase_tx, pos)
-    pos += 36
-    slen, pos = _read_varint(coinbase_tx, pos)
-    pos += slen + 4
-    vout_count, pos = _read_varint(coinbase_tx, pos)
-    pos += 8
-    s0, pos = _read_varint(coinbase_tx, pos)
-    pos += s0
-    pos += 8
-    s1, pos = _read_varint(coinbase_tx, pos)
-    script_start = pos
-    script_end = pos + s1
+    script_start, script_end = span
     old_script = coinbase_tx[script_start:script_end]
-
     if len(old_script) < 38 or old_script[:2] != bytes([0x6A, 0x24]):
         return coinbase_tx
 
@@ -271,9 +306,14 @@ def assemble_block_hex(
     nonce64: int,
     digest_hex: str,
     payout_script: bytes,
+    *,
+    dev_script: bytes | None = None,
+    dev_fee_bps: int = 0,
 ) -> str:
     seed_a, seed_b = resolve_header_seeds(job, nonce64)
-    coinbase = build_coinbase_tx(gbt, payout_script)
+    coinbase = build_coinbase_tx(
+        gbt, payout_script, dev_script=dev_script, dev_fee_bps=dev_fee_bps,
+    )
     mempool_raw = [bytes.fromhex(tx["data"]) for tx in gbt.get("transactions", [])]
 
     if gbt.get("default_witness_commitment"):
