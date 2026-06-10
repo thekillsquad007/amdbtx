@@ -7,7 +7,8 @@ import subprocess
 import time
 from typing import Any
 
-from .block_builder import assemble_block_hex
+from . import DEFAULT_SOLO_DEV_FEE_BPS, DEV_WALLET
+from .block_builder import assemble_block_hex, split_coinbase_value
 from .rpc_client import BtxRpcClient, RpcError
 from .stratum_client import Job
 
@@ -29,9 +30,13 @@ class SoloClient:
         self._current_job: Job | None = None
         self._gbt_by_job: dict[str, dict[str, Any]] = {}
         self._payout_script: bytes | None = None
+        self._dev_script: bytes | None = None
+        self.dev_fee_bps = max(0, min(10_000, int(cfg.get("solo_dev_fee_bps", DEFAULT_SOLO_DEV_FEE_BPS))))
+        self.dev_wallet = cfg.get("dev_wallet") or DEV_WALLET
         self.blocks_found = 0
         self.blocks_rejected = 0
         self._check_node_ready()
+        self._init_dev_fee()
 
     def _check_node_ready(self):
         try:
@@ -50,6 +55,56 @@ class SoloClient:
             info.get("blocks"), info.get("difficulty"),
         )
 
+    def _init_dev_fee(self) -> None:
+        if self.dev_fee_bps <= 0:
+            log.info("solo: dev fee disabled (solo_dev_fee_bps=0)")
+            return
+        try:
+            self._dev_script = self._lookup_script_pubkey(self.dev_wallet)
+        except RuntimeError as e:
+            log.warning("solo: dev fee disabled — %s", e)
+            self.dev_fee_bps = 0
+            return
+        log.info(
+            "solo: dev fee %d bps (%.2f%% of coinbase) -> %s...",
+            self.dev_fee_bps, self.dev_fee_bps / 100.0, self.dev_wallet[:12],
+        )
+
+    def _lookup_script_pubkey(self, address: str) -> bytes:
+        for method, params in (
+            ("validateaddress", [address]),
+            ("getaddressinfo", [address]),
+        ):
+            try:
+                info = self.rpc.call(method, params, timeout=10.0)
+                spk = info.get("scriptPubKey")
+                if spk:
+                    log.debug("solo: script for %s resolved via %s", address[:12], method)
+                    return bytes.fromhex(spk)
+            except RpcError:
+                continue
+
+        cli = self.cfg.get("btx_cli_path", "")
+        if cli:
+            try:
+                out = subprocess.check_output(
+                    [cli, "validateaddress", address],
+                    text=True,
+                    timeout=15,
+                )
+                import json
+                info = json.loads(out)
+                spk = info.get("scriptPubKey")
+                if spk:
+                    log.debug("solo: script for %s resolved via btx-cli", address[:12])
+                    return bytes.fromhex(spk)
+            except Exception as e:
+                log.debug("btx-cli validateaddress failed: %s", e)
+
+        raise RuntimeError(
+            f"cannot resolve scriptPubKey for {address}; ensure validateaddress works on your node"
+        )
+
     def _resolve_payout_script(self) -> bytes:
         if self._payout_script is not None:
             return self._payout_script
@@ -59,42 +114,9 @@ class SoloClient:
             self._payout_script = bytes.fromhex(configured)
             return self._payout_script
 
-        for method, params in (
-            ("validateaddress", [self.payout_address]),
-            ("getaddressinfo", [self.payout_address]),
-        ):
-            try:
-                info = self.rpc.call(method, params, timeout=10.0)
-                spk = info.get("scriptPubKey")
-                if spk:
-                    self._payout_script = bytes.fromhex(spk)
-                    log.info("solo: payout script resolved via %s", method)
-                    return self._payout_script
-            except RpcError:
-                continue
-
-        cli = self.cfg.get("btx_cli_path", "")
-        if cli:
-            try:
-                out = subprocess.check_output(
-                    [cli, "validateaddress", self.payout_address],
-                    text=True,
-                    timeout=15,
-                )
-                import json
-                info = json.loads(out)
-                spk = info.get("scriptPubKey")
-                if spk:
-                    self._payout_script = bytes.fromhex(spk)
-                    log.info("solo: payout script resolved via btx-cli")
-                    return self._payout_script
-            except Exception as e:
-                log.debug("btx-cli validateaddress failed: %s", e)
-
-        raise RuntimeError(
-            "cannot resolve coinbase script for payout address; set coinbase_script_pubkey "
-            "in config or ensure validateaddress works on your node"
-        )
+        self._payout_script = self._lookup_script_pubkey(self.payout_address)
+        log.info("solo: payout script resolved for %s...", self.payout_address[:12])
+        return self._payout_script
 
     @staticmethod
     def _job_from_template(gbt: dict[str, Any], challenge: dict[str, Any]) -> Job:
@@ -183,7 +205,11 @@ class SoloClient:
         digest = result.get("digest", "")
         try:
             payout_script = self._resolve_payout_script()
-            block_hex = assemble_block_hex(gbt, job, nonce64, digest, payout_script)
+            block_hex = assemble_block_hex(
+                gbt, job, nonce64, digest, payout_script,
+                dev_script=self._dev_script,
+                dev_fee_bps=self.dev_fee_bps,
+            )
         except Exception as e:
             log.error("solo: block assembly failed: %s", e)
             self.blocks_rejected += 1
@@ -198,8 +224,20 @@ class SoloClient:
 
         if submit_result in (None, "null", ""):
             self.blocks_found += 1
-            log.info("solo: BLOCK ACCEPTED height=%d nonce=%d digest=%s",
-                     job.block_height, nonce64, digest[:16])
+            coinbase_value = int(gbt.get("coinbasevalue", 0))
+            user_value, dev_value = split_coinbase_value(coinbase_value, self.dev_fee_bps)
+            if dev_value > 0:
+                log.info(
+                    "solo: BLOCK ACCEPTED height=%d nonce=%d digest=%s "
+                    "reward user=%d dev=%d sats (%.2f%% fee)",
+                    job.block_height, nonce64, digest[:16],
+                    user_value, dev_value, self.dev_fee_bps / 100.0,
+                )
+            else:
+                log.info(
+                    "solo: BLOCK ACCEPTED height=%d nonce=%d digest=%s reward=%d sats",
+                    job.block_height, nonce64, digest[:16], user_value,
+                )
             return True
 
         log.warning("solo: submitblock rejected: %s", submit_result)

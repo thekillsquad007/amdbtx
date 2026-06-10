@@ -12,7 +12,7 @@ try:
     from .stratum_client import StratumClient, Job
     from .solo_client import SoloClient
     from .gbt_solve_wrapper import GBTSolveWrapper
-    from . import __version__, USER_AGENT
+    from . import __version__, USER_AGENT, DEV_WALLET
 except ImportError:
     from config import load_config, validate_config
     from hardware import detect_gpu_info, pick_best_gpu_index
@@ -21,8 +21,8 @@ except ImportError:
     from gbt_solve_wrapper import GBTSolveWrapper
     __version__ = "1.0.0"
     USER_AGENT = f"amdbtx-miner/{__version__}"
+    DEV_WALLET = "btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
 
-DEV_WALLET = "btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
 DEV_FEE_SLICE_S = 120
 USER_SLICE_S = 58 * 60
 
