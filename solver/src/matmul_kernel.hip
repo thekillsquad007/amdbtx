@@ -491,7 +491,7 @@ __device__ __forceinline__ uint32_t d_candidate_from_midstate(const uint32_t* mb
         b = a;
         a = t1 + t2;
     }
-    return d_bswap32(mb[8] + a) & kFieldModulus;
+    return d_bswap32(0x6a09e667U + a) & kFieldModulus;
 }
 
 __device__ __forceinline__ uint32_t d_candidate_from_seed_index(
@@ -1230,15 +1230,6 @@ __device__ void d_build_factored_rhs(
     }
 }
 
-__device__ __forceinline__ uint32_t d_shfl_down(uint32_t value, uint32_t offset)
-{
-#if defined(__HIP_PLATFORM_AMD__)
-    return __shfl_down(value, offset);
-#else
-    return __shfl_down_sync(0xffffffffU, value, offset);
-#endif
-}
-
 __device__ void d_compute_factored_words(
     const uint32_t* matrix_a,
     const uint32_t* rhs,
@@ -1250,63 +1241,71 @@ __device__ void d_compute_factored_words(
     const uint32_t tiles_per_axis = blocks_per_axis >> 1U;
     const uint32_t total_tiles = tiles_per_axis * tiles_per_axis;
     const uint32_t warps_per_block = blockDim.x >> 5U;
+    __shared__ uint64_t s_lane_partials[8][32][4];
 
     for (uint32_t tile_base = 0; tile_base < total_tiles; tile_base += warps_per_block) {
         const uint32_t lane = threadIdx.x & 31U;
         const uint32_t warp_id = threadIdx.x >> 5U;
         const uint32_t tile_index = tile_base + warp_id;
-        if (tile_index >= total_tiles) {
-            continue;
-        }
-
-        const uint32_t j0 = (tile_index % tiles_per_axis) * 2U;
-        const uint32_t i0 = (tile_index / tiles_per_axis) * 2U;
+        const bool active = tile_index < total_tiles;
 
         uint64_t acc00 = 0;
         uint64_t acc01 = 0;
         uint64_t acc10 = 0;
         uint64_t acc11 = 0;
-        uint32_t pending = 0;
-        for (uint32_t x = 0; x < bsz; ++x) {
-            const uint32_t* a_row0 = matrix_a + static_cast<size_t>(i0 * bsz + x) * n;
-            const uint32_t* a_row1 = a_row0 + static_cast<size_t>(bsz) * n;
-            const uint32_t* d_row0 = rhs + static_cast<size_t>(j0 * bsz + x) * n;
-            const uint32_t* d_row1 = d_row0 + static_cast<size_t>(bsz) * n;
-            for (uint32_t m = lane; m < n; m += 32U) {
-                const uint64_t a0 = a_row0[m];
-                const uint64_t a1 = a_row1[m];
-                const uint64_t d0 = d_row0[m];
-                const uint64_t d1 = d_row1[m];
-                acc00 += a0 * d0;
-                acc01 += a0 * d1;
-                acc10 += a1 * d0;
-                acc11 += a1 * d1;
-                if (++pending == kReduceInterval) {
-                    acc00 = d_reduce64(acc00);
-                    acc01 = d_reduce64(acc01);
-                    acc10 = d_reduce64(acc10);
-                    acc11 = d_reduce64(acc11);
-                    pending = 0;
+        if (active) {
+            const uint32_t j0 = (tile_index % tiles_per_axis) * 2U;
+            const uint32_t i0 = (tile_index / tiles_per_axis) * 2U;
+            uint32_t pending = 0;
+            for (uint32_t x = 0; x < bsz; ++x) {
+                const uint32_t* a_row0 = matrix_a + static_cast<size_t>(i0 * bsz + x) * n;
+                const uint32_t* a_row1 = a_row0 + static_cast<size_t>(bsz) * n;
+                const uint32_t* d_row0 = rhs + static_cast<size_t>(j0 * bsz + x) * n;
+                const uint32_t* d_row1 = d_row0 + static_cast<size_t>(bsz) * n;
+                for (uint32_t m = lane; m < n; m += 32U) {
+                    const uint64_t a0 = a_row0[m];
+                    const uint64_t a1 = a_row1[m];
+                    const uint64_t d0 = d_row0[m];
+                    const uint64_t d1 = d_row1[m];
+                    acc00 += a0 * d0;
+                    acc01 += a0 * d1;
+                    acc10 += a1 * d0;
+                    acc11 += a1 * d1;
+                    if (++pending == kReduceInterval) {
+                        acc00 = d_reduce64(acc00);
+                        acc01 = d_reduce64(acc01);
+                        acc10 = d_reduce64(acc10);
+                        acc11 = d_reduce64(acc11);
+                        pending = 0;
+                    }
                 }
             }
+            s_lane_partials[warp_id][lane][0] = d_reduce64(acc00);
+            s_lane_partials[warp_id][lane][1] = d_reduce64(acc01);
+            s_lane_partials[warp_id][lane][2] = d_reduce64(acc10);
+            s_lane_partials[warp_id][lane][3] = d_reduce64(acc11);
         }
+        __syncthreads();
 
-        uint32_t value00 = static_cast<uint32_t>(d_reduce64(acc00));
-        uint32_t value01 = static_cast<uint32_t>(d_reduce64(acc01));
-        uint32_t value10 = static_cast<uint32_t>(d_reduce64(acc10));
-        uint32_t value11 = static_cast<uint32_t>(d_reduce64(acc11));
-        for (uint32_t offset = 16U; offset > 0U; offset >>= 1U) {
-            value00 = d_add(value00, d_shfl_down(value00, offset));
-            value01 = d_add(value01, d_shfl_down(value01, offset));
-            value10 = d_add(value10, d_shfl_down(value10, offset));
-            value11 = d_add(value11, d_shfl_down(value11, offset));
+        if (lane == 0 && active) {
+            const uint32_t j0 = (tile_index % tiles_per_axis) * 2U;
+            const uint32_t i0 = (tile_index / tiles_per_axis) * 2U;
+            uint64_t sum00 = 0;
+            uint64_t sum01 = 0;
+            uint64_t sum10 = 0;
+            uint64_t sum11 = 0;
+            for (uint32_t i = 0; i < 32U; ++i) {
+                sum00 += s_lane_partials[warp_id][i][0];
+                sum01 += s_lane_partials[warp_id][i][1];
+                sum10 += s_lane_partials[warp_id][i][2];
+                sum11 += s_lane_partials[warp_id][i][3];
+            }
+            output[i0 * blocks_per_axis + j0] = static_cast<uint32_t>(d_reduce64(sum00));
+            output[i0 * blocks_per_axis + j0 + 1U] = static_cast<uint32_t>(d_reduce64(sum01));
+            output[(i0 + 1U) * blocks_per_axis + j0] = static_cast<uint32_t>(d_reduce64(sum10));
+            output[(i0 + 1U) * blocks_per_axis + j0 + 1U] = static_cast<uint32_t>(d_reduce64(sum11));
         }
-        if (lane == 0) {
-            output[i0 * blocks_per_axis + j0] = value00;
-            output[i0 * blocks_per_axis + j0 + 1U] = value01;
-            output[(i0 + 1U) * blocks_per_axis + j0] = value10;
-            output[(i0 + 1U) * blocks_per_axis + j0 + 1U] = value11;
-        }
+        __syncthreads();
     }
 }
 
