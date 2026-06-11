@@ -244,8 +244,10 @@ def _probe_solver_gpu(solver_path: str | None) -> dict[str, Any] | None:
     if not solver_path or not os.path.isfile(solver_path):
         return None
     env = {**os.environ, "HSA_ENABLE_DXG_DETECTION": "1"}
-    ld_parts = [str(Path.home() / ".amdbtx-miner" / "runtime"), "/opt/rocm/lib"]
-    ld_parts.extend(str(d) for d in sorted(Path("/opt").glob("rocm-*/lib")))
+    # WSL needs librocdxg from rocm-7.2.3+ before /opt/rocm/lib (often lacks DXG).
+    ld_parts = [str(Path.home() / ".amdbtx-miner" / "runtime"), "/usr/lib/wsl/lib"]
+    ld_parts.extend(str(d) for d in sorted(Path("/opt").glob("rocm-*/lib"), reverse=True))
+    ld_parts.append("/opt/rocm/lib")
     existing_ld = env.get("LD_LIBRARY_PATH", "")
     if existing_ld:
         ld_parts.extend(p for p in existing_ld.split(":") if p)

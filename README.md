@@ -204,6 +204,7 @@ Active GPU solver work targets the HIP path in `solver/src/solve_gpu.hip`:
 - Persistent device memory pool (no per-slice `hipFree`/`hipMalloc`)
 - GPU transcript digest filter (`HashTranscriptKernel` + `CompareDigestsKernel`)
 - V2 seeds/sigma re-derived on CPU after sigma gate (required for pool consensus)
+- HIP compute stream with single sync per batch (gate → matmul → digest pipelined)
 - Inner-loop unroll in `ComputeCompressedWordsFusedKernel`
 
 Rebuild after pulling:

@@ -231,6 +231,10 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
     current_job = None
     log_interval = 30
     last_log = 0
+    metrics_interval = 30
+    last_metrics = time.time()
+    metrics_gate = 0
+    metrics_elapsed = 0.0
 
     while True:
         try:
@@ -332,6 +336,28 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                     words_hits, cpu_verify_misses,
                     (current_job.target[:16] if current_job.target else "none"),
                 )
+
+            metrics_gate += work
+            metrics_elapsed += elapsed
+
+            if (
+                not solo
+                and now - last_metrics >= metrics_interval
+                and metrics_elapsed > 0
+                and hasattr(client, "report_metrics")
+            ):
+                solver_nps = metrics_gate / metrics_elapsed
+                if solver_nps > 0:
+                    try:
+                        client.report_metrics(
+                            solver_nps,
+                            getattr(client, "shares_accepted", 0),
+                        )
+                    except Exception as e:
+                        log.debug("report_metrics failed: %s", e)
+                metrics_gate = 0
+                metrics_elapsed = 0.0
+                last_metrics = now
 
             if now - last_log >= log_interval or result.get("found") or result.get("error"):
                 backend = result.get("backend", "?")

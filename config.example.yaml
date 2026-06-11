@@ -3,7 +3,7 @@
 # Mining mode: "pool" (stratum) or "solo" (local btxd node)
 mining_mode: "pool"
 
-pool_host: "stratum.minebtx.com"
+pool_host: "127.0.0.1"
 pool_port: 3333
 pool_tls: false
 

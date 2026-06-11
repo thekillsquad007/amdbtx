@@ -10,7 +10,7 @@ def load_config(path: Path) -> dict:
 def validate_config(cfg: dict) -> dict:
     defaults = {
         "mining_mode": "pool",
-        "pool_host": "stratum.minebtx.com",
+        "pool_host": "127.0.0.1",
         "pool_port": 3333,
         "pool_tls": False,
         "rpc_url": "http://127.0.0.1:19334",
