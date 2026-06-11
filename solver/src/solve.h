@@ -6,6 +6,7 @@
 #include "transcript.h"
 #include "uint256.h"
 #include <cstdint>
+#include <vector>
 
 struct PowState {
     int32_t version;
@@ -57,6 +58,9 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
               uint64_t& tries_used, double& elapsed_s,
               uint32_t batch_size = 128, uint32_t epsilon_bits = 18,
               bool* cpu_fallback = nullptr, uint64_t* gate_passes = nullptr,
-              uint64_t* words_hits = nullptr, uint64_t* cpu_verify_misses = nullptr);
+              uint64_t* words_hits = nullptr, uint64_t* cpu_verify_misses = nullptr,
+              std::vector<PowState>* solutions = nullptr,
+              uint32_t max_solutions = 1,
+              uint64_t* scanned_nonce_end = nullptr);
 
 #endif

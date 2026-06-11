@@ -106,7 +106,7 @@ def run_benchmark(cfg: dict, config_path: str = ""):
           f"slice={bench_tries} nonces / {bench_seconds:.0f}s per test\n")
 
     configs = []
-    for batch in (256, 512, 1024, 2048, 4096):
+    for batch in (512, 1024, 2048, 4096, 8192, 16384):
         configs.append({
             "solver_prepare_workers": bench_workers,
             "solver_threads": bench_threads,
@@ -202,8 +202,160 @@ def _format_khps_line(result: dict, khps: float) -> str:
     per_gpu = result.get("per_gpu_khps")
     if per_gpu and len(per_gpu) > 1:
         parts = "+".join(f"{v:.2f}" for v in per_gpu)
-        return f"matmul_khps={khps:.2f} total ({parts} per GPU)"
-    return f"matmul_khps={khps:.2f}"
+        return f"nonce_khps={khps:.2f} total ({parts} per GPU)"
+    return f"nonce_khps={khps:.2f}"
+
+
+def _drain_pool_messages(client) -> None:
+    if hasattr(client, "process_available_messages"):
+        try:
+            client.process_available_messages()
+        except Exception:
+            pass
+        return
+    if not getattr(client, "sock", None):
+        return
+    try:
+        client.sock.setblocking(False)
+        try:
+            while True:
+                msg = client._recv()
+                if hasattr(client, "_dispatch_message"):
+                    client._dispatch_message(msg)
+                else:
+                    client._handle_server_message(msg)
+        except (BlockingIOError, ConnectionError):
+            pass
+        finally:
+            client.sock.setblocking(True)
+    except Exception:
+        pass
+
+
+def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> None:
+    _drain_pool_messages(client)
+    if not solo and client._current_job is not None:
+        if client._current_job.job_id != solve_job.job_id:
+            log.info(
+                "submitting found share for rotated job_id %s (current=%s); "
+                "pool JobCache handles same-parent staleness",
+                solve_job.job_id, client._current_job.job_id,
+            )
+    log.info(
+        "FOUND! nonce=%d digest=%s target=%s is_block=%s job=%s ntime=%s",
+        result.get("nonce64"), result.get("digest", ""),
+        solve_job.target[:16] if solve_job.target else "none",
+        result.get("is_block"), solve_job.job_id,
+        result.get("ntime", solve_job.time),
+    )
+    client.submit_share(solve_job, result, wait=solo and bool(result.get("is_block")))
+
+
+def _accumulate_slice_stats(merged: dict, result: dict) -> None:
+    merged["tries_used"] = merged.get("tries_used", 0) + int(result.get("tries_used", 0) or 0)
+    merged["gate_passes"] = merged.get("gate_passes", 0) + int(result.get("gate_passes", 0) or 0)
+    merged["words_hits"] = merged.get("words_hits", 0) + int(result.get("words_hits", 0) or 0)
+    merged["cpu_verify_misses"] = (
+        merged.get("cpu_verify_misses", 0) + int(result.get("cpu_verify_misses", 0) or 0)
+    )
+    if result.get("backend"):
+        merged["backend"] = result["backend"]
+    if result.get("per_gpu_khps"):
+        merged["per_gpu_khps"] = result["per_gpu_khps"]
+    if result.get("num_gpus"):
+        merged["num_gpus"] = result["num_gpus"]
+    if result.get("error") and not merged.get("error"):
+        merged["error"] = result["error"]
+    elapsed = float(result.get("elapsed_s", 0) or 0)
+    if elapsed > 0:
+        merged["solver_elapsed_s"] = merged.get("solver_elapsed_s", 0.0) + elapsed
+
+
+def _solve_slice_continuous(
+    solver: MultiGPUSolver,
+    client,
+    solve_job: Job,
+    *,
+    solo: bool,
+    nonce_start: int,
+    nonces_per_slice: int,
+    max_seconds_per_slice: float,
+    max_shares_per_slice: int = 0,
+) -> dict:
+    """Scan a work slice; submit shares up to max_shares_per_slice (0 = unlimited)."""
+    slice_t0 = time.time()
+    slice_deadline = slice_t0 + max_seconds_per_slice
+    cursor = nonce_start
+    budget = nonces_per_slice
+    shares_in_slice = 0
+    merged: dict = {
+        "found": False,
+        "tries_used": 0,
+        "gate_passes": 0,
+        "words_hits": 0,
+        "cpu_verify_misses": 0,
+    }
+
+    while budget > 0 and time.time() < slice_deadline:
+        _drain_pool_messages(client)
+        remaining_sec = max(0.05, slice_deadline - time.time())
+        result = solver.solve(
+            solve_job,
+            nonce_start=cursor,
+            max_tries=budget,
+            max_seconds=remaining_sec,
+        )
+        _accumulate_slice_stats(merged, result)
+
+        if result.get("found"):
+            merged["found"] = True
+            solutions = result.get("solutions") or [result]
+            for solution in solutions:
+                shares_in_slice += 1
+                if solo:
+                    if solution.get("is_block"):
+                        _submit_pool_share(
+                            client, solve_job, solution, solo=True,
+                        )
+                else:
+                    _submit_pool_share(
+                        client, solve_job, solution, solo=False,
+                    )
+                if max_shares_per_slice and shares_in_slice >= max_shares_per_slice:
+                    break
+
+            nonce_end = result.get("nonce64_end")
+            if nonce_end is not None:
+                cursor = int(nonce_end) + 1
+            else:
+                cursor = int(result.get("nonce64", cursor)) + 1
+            used = int(result.get("tries_used", 0) or 0)
+            budget = max(0, budget - (used if used > 0 else 1))
+            if max_shares_per_slice and shares_in_slice >= max_shares_per_slice:
+                break
+            continue
+
+        nonce_end = result.get("nonce64_end")
+        if nonce_end is not None and int(nonce_end) >= cursor:
+            cursor = int(nonce_end) + 1
+            used = int(result.get("tries_used", 0) or 0)
+            if used > 0:
+                budget = max(0, budget - used)
+        break
+
+    merged["elapsed_s"] = time.time() - slice_t0
+    merged["shares_in_slice"] = shares_in_slice
+    merged["nonce64_end"] = cursor - 1 if cursor > nonce_start else nonce_start
+    work = merged.get("tries_used") or 0
+    solver_elapsed = merged.get("solver_elapsed_s") or merged["elapsed_s"]
+    if solver_elapsed > 0 and work > 0:
+        merged["nonce_khps_total"] = work / solver_elapsed / 1000
+    if shares_in_slice > 1:
+        log.info(
+            "slice submitted %d shares (continuous-feed; pool credits each at current vardiff)",
+            shares_in_slice,
+        )
+    return merged
 
 
 def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = False):
@@ -216,25 +368,30 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             nonlocal last_fee_switch, fee_active
             elapsed = time.time() - last_fee_switch
             if fee_active and elapsed >= DEV_FEE_SLICE_S:
-                client.send_authorize(cfg["payout_address"])
+                client.send_authorize(cfg["payout_address"], cfg.get("worker_name", "default"))
                 fee_active = False
                 last_fee_switch = time.time()
                 log.info("Dev fee: switched back to user address")
             elif not fee_active and elapsed >= USER_SLICE_S:
-                client.send_authorize(DEV_WALLET)
+                client.send_authorize(DEV_WALLET, cfg.get("worker_name", "default"))
                 fee_active = True
                 last_fee_switch = time.time()
                 log.info("Dev fee: switched to dev wallet (%s...)", DEV_WALLET[:12])
 
     nonces_per_slice = cfg.get("nonces_per_slice", 20_000_000)
     max_seconds_per_slice = cfg.get("solver_max_seconds_per_slice", 5.0)
+    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 1) or 0) if not solo else 0
+    if not solo and pool_max_shares == 1:
+        log.info(
+            "pool mode: 1 share/slice (dexbtx parity) — multi-share slices report "
+            "low solver_nps and keep vardiff at floor; raise pool_max_shares_per_slice "
+            "only after vardiff has ramped"
+        )
     current_job = None
     log_interval = 30
     last_log = 0
-    metrics_interval = 30
-    last_metrics = time.time()
-    metrics_gate = 0
-    metrics_elapsed = 0.0
+    if not solo and hasattr(client, "start_metrics_reporter"):
+        client.start_metrics_reporter(solver)
 
     while True:
         try:
@@ -270,58 +427,25 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 received_at=current_job.received_at,
             )
 
-            result = solver.solve(
+            result = _solve_slice_continuous(
+                solver,
+                client,
                 solve_job,
+                solo=solo,
                 nonce_start=solve_job.nonce64_start,
-                max_tries=nonces_per_slice,
-                max_seconds=max_seconds_per_slice,
+                nonces_per_slice=nonces_per_slice,
+                max_seconds_per_slice=max_seconds_per_slice,
+                max_shares_per_slice=pool_max_shares,
             )
-
-            if result.get("found"):
-                if not solo and getattr(client, "sock", None):
-                    try:
-                        client.sock.setblocking(False)
-                        try:
-                            while True:
-                                msg = client._recv()
-                                client._handle_server_message(msg)
-                        except (BlockingIOError, ConnectionError):
-                            pass
-                        finally:
-                            client.sock.setblocking(True)
-                    except Exception:
-                        pass
-
-                if not solo and client._current_job is not None:
-                    rotated = client._current_job.job_id != solve_job.job_id
-                    if rotated:
-                        log.info(
-                            "submitting found share for rotated job_id %s (current=%s); "
-                            "pool JobCache handles same-parent staleness",
-                            solve_job.job_id, client._current_job.job_id,
-                        )
-
-                log.info(
-                    "FOUND! nonce=%d digest=%s target=%s is_block=%s job=%s ntime=%s",
-                    result.get("nonce64"), result.get("digest", ""),
-                    solve_job.target[:16] if solve_job.target else "none",
-                    result.get("is_block"), solve_job.job_id,
-                    result.get("ntime", solve_job.time),
-                )
-                if solo:
-                    if result.get("is_block"):
-                        client.submit_share(solve_job, result)
-                else:
-                    client.submit_share(solve_job, result)
 
             now = time.time()
             tries = result.get("tries_used", 0)
             gate_passes = result.get("gate_passes", 0)
             elapsed = result.get("elapsed_s", 0)
             # tries_used counts sigma scans; gate_passes is full matmul work (post ε gate).
-            work = gate_passes if gate_passes else tries
-            if result.get("matmul_khps_total") is not None:
-                khps = float(result["matmul_khps_total"])
+            work = tries
+            if result.get("nonce_khps_total") is not None:
+                khps = float(result["nonce_khps_total"])
             else:
                 khps = work / elapsed / 1000 if elapsed > 0 else 0
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
@@ -337,27 +461,20 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                     (current_job.target[:16] if current_job.target else "none"),
                 )
 
-            metrics_gate += work
-            metrics_elapsed += elapsed
-
-            if (
-                not solo
-                and now - last_metrics >= metrics_interval
-                and metrics_elapsed > 0
-                and hasattr(client, "report_metrics")
-            ):
-                solver_nps = metrics_gate / metrics_elapsed
-                if solver_nps > 0:
-                    try:
-                        client.report_metrics(
-                            solver_nps,
-                            getattr(client, "shares_accepted", 0),
-                        )
-                    except Exception as e:
-                        log.debug("report_metrics failed: %s", e)
-                metrics_gate = 0
-                metrics_elapsed = 0.0
-                last_metrics = now
+            if work > 0 and elapsed > 0:
+                solver_elapsed = float(
+                    result.get("solver_elapsed_s") or elapsed
+                )
+                slice_nps = work / elapsed
+                gpu_nps = work / solver_elapsed if solver_elapsed > 0 else slice_nps
+                peak = max(
+                    float(getattr(solver, "_peak_gate_nps", 0) or 0),
+                    slice_nps,
+                    gpu_nps,
+                )
+                solver._peak_gate_nps = peak
+                if hasattr(solver, "last_observed_nps"):
+                    solver.last_observed_nps = peak
 
             if now - last_log >= log_interval or result.get("found") or result.get("error"):
                 backend = result.get("backend", "?")
@@ -365,12 +482,29 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 r = getattr(client, "shares_rejected", 0)
                 khps_line = _format_khps_line(result, khps)
                 gpu_tag = f" gpus={solver.num_gpus}" if solver.num_gpus > 1 else ""
+                pool_note = ""
+                if not solo:
+                    pool_diff = getattr(client, "_difficulty", None)
+                    submit_worker = getattr(client, "_submit_worker", "") or getattr(client, "worker_name", "")
+                    canonical = getattr(client, "_canonical_worker_name", "")
+                    worker_tag = submit_worker or "?"
+                    if canonical and canonical != submit_worker:
+                        worker_tag = f"{submit_worker} ({canonical})"
+                    if pool_diff is not None:
+                        pool_note = (
+                            f" pool_diff={pool_diff:g} worker={worker_tag}"
+                            " (dashboard n/s = shares × per-share credit;"
+                            " nonce_khps does not appear on pool; vardiff must ramp)"
+                        )
+                slice_shares = result.get("shares_in_slice", 0)
+                slice_tag = f" slice_shares={slice_shares}" if slice_shares else ""
                 log.info(
                     "solve: nonce=%d tries=%d gate=%d gate/s=%.0f elapsed=%.2fs "
-                    "%s backend=%s%s found=%s shares=%d/%d target=%s",
+                    "%s backend=%s%s found=%s shares=%d/%d target=%s%s%s",
                     current_job.nonce64_start, tries, gate_passes, gate_per_s, elapsed,
                     khps_line, backend, gpu_tag, result.get("found"), a, r,
                     (current_job.target[:12] if current_job.target else "none"),
+                    pool_note, slice_tag,
                 )
                 last_log = now
 
@@ -390,18 +524,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if solo:
                 client.poll_template()
             elif getattr(client, "sock", None):
-                try:
-                    client.sock.setblocking(False)
-                    try:
-                        while True:
-                            msg = client._recv()
-                            client._handle_server_message(msg)
-                    except (BlockingIOError, ConnectionError):
-                        pass
-                    finally:
-                        client.sock.setblocking(True)
-                except Exception:
-                    pass
+                _drain_pool_messages(client)
 
             if client._current_job is not None:
                 new_job = client._current_job
@@ -448,6 +571,8 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                         worker_name=cfg.get("worker_name", "default"),
                         cfg=cfg,
                     )
+                    if hasattr(client, "start_metrics_reporter"):
+                        client.start_metrics_reporter(solver)
                 current_job = None
             except Exception as e2:
                 log.error("Reconnect failed: %s", e2)

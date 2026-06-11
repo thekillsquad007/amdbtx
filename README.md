@@ -105,7 +105,7 @@ gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve-hip"
 solver_backend: "rocm"     # "rocm" or "cpu"
 solver_threads: 8
 solver_prepare_workers: 16
-solver_batch_size: 128
+solver_batch_size: 4096
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
 gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU
@@ -184,7 +184,7 @@ multi-GPU mining: 2 solvers on devices [0, 1]
 During mining, look for combined hashrate:
 
 ```
-matmul_khps=0.58 total (0.29+0.29 per GPU) backend=hip gpus=2
+nonce_khps=1380 total (690+690 per GPU) backend=hip gpus=2
 ```
 
 **Behaviour**
@@ -303,9 +303,9 @@ and solo mode correctly skips `submitblock`.
 ### When solo makes sense
 
 Solo competes against **total network hashrate**, not pool hashrate. It can be
-worth trying when network difficulty is low relative to your GPU's `matmul_khps`,
+worth trying when network difficulty is low relative to your GPU's `nonce_khps`,
 or when you want the full block reward without pool fees. At typical single-GPU
-speeds on mainnet, blocks may be rare — check your `matmul_khps` in the solve logs
+speeds on mainnet, blocks may be rare — check your `nonce_khps` in the solve logs
 and compare to network conditions on [BTXplorer](https://explorer.minebtx.com).
 
 ### Solo dev fee

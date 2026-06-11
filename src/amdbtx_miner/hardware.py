@@ -1,3 +1,5 @@
+import hashlib
+import json
 import subprocess
 import shutil
 import os
@@ -20,6 +22,40 @@ def _run(cmd: list[str]) -> str | None:
         return out.decode("utf-8", errors="replace").strip()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
+
+
+def _run_env(cmd: list[str], env: dict) -> str | None:
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT_SEC, env=env
+        )
+        return out.decode("utf-8", errors="replace").strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def _rocm_miner_env() -> dict[str, str]:
+    """ROC/HIP env for WSL DXG passthrough and distro ROCm installs."""
+    env = {**os.environ, "HSA_ENABLE_DXG_DETECTION": "1"}
+    ld_parts = [str(Path.home() / ".amdbtx-miner" / "runtime"), "/usr/lib/wsl/lib"]
+    ld_parts.extend(str(d) for d in sorted(Path("/opt").glob("rocm-*/lib"), reverse=True))
+    ld_parts.append("/opt/rocm/lib")
+    existing_ld = env.get("LD_LIBRARY_PATH", "")
+    if existing_ld:
+        ld_parts.extend(p for p in existing_ld.split(":") if p)
+    env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in ld_parts if os.path.isdir(p)))
+    return env
+
+
+def _resolve_rocm_smi() -> str | None:
+    rocm = shutil.which("rocm-smi")
+    if rocm:
+        return rocm
+    for d in sorted(Path("/opt").glob("rocm*/bin"), reverse=True):
+        candidate = d / "rocm-smi"
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 def _cpu_model() -> str | None:
@@ -68,116 +104,218 @@ def _os_string() -> str:
     return f"{sys} / {rel}"
 
 
-def _enumerate_amd_gpus() -> list[dict[str, Any]]:
-    gpus = []
-    env = {**os.environ, "HSA_ENABLE_DXG_DETECTION": "1"}
-
-    if shutil.which("rocm-smi"):
-        out = _run_env(["rocm-smi", "--showproductname", "--showid"], env)
-        if out:
-            gpu_name = ""
-            gpu_arch = ""
-            vram_mb = None
-            for line in out.split("\n"):
-                m = re.search(r"gfx[0-9a-f]+", line)
-                if m and not gpu_arch:
-                    gpu_arch = m.group()
-                if re.search(r"Card|GPU|product", line, re.IGNORECASE):
-                    name = re.sub(r"^.*?:\s*", "", line).strip()
-                    name = re.sub(r"\s*\(TM\)\s*|\s*\(R\)\s*", "", name)
-                    if name and name != "None":
-                        gpu_name = name
-            vram_out = _run_env(["rocm-smi", "--showmeminfo", "vram"], env)
-            if vram_out:
-                vm = re.search(r"(\d+)\s*(?:MiB|MB)", vram_out)
-                if vm:
-                    try:
-                        vram_mb = int(vm.group(1))
-                    except ValueError:
-                        pass
-            if gpu_arch:
-                gpus.append({
-                    "model": gpu_name or "AMD GPU",
-                    "vram_gb": round(vram_mb / 1024, 2) if vram_mb else None,
-                    "compute_capability": gpu_arch,
-                    "gpu_uuid": f"amdgpu-{gpu_arch}",
-                    "pcie_link": None,
-                })
-
-    if not gpus:
-        rocminfo_path = shutil.which("rocminfo")
-        if not rocminfo_path:
-            for d in sorted(Path("/opt").glob("rocm*/bin")):
-                candidate = d / "rocminfo"
-                if candidate.is_file():
-                    rocminfo_path = str(candidate)
-                    break
-        if rocminfo_path:
-            try:
-                result = subprocess.run(
-                    [rocminfo_path], capture_output=True, text=True, timeout=10, env=env
-                )
-                if result.returncode == 0:
-                    current_agent = {}
-                    gpus_list = []
-                    for line in result.stdout.splitlines():
-                        stripped = line.strip()
-                        if re.match(r"^Agent\s+\d+", stripped):
-                            if current_agent.get("gpu_arch") and current_agent.get("is_gpu"):
-                                gpus_list.append(current_agent)
-                            current_agent = {"gpu_arch": "", "marketing_name": "", "is_gpu": False, "vram_mb": None}
-                        m = re.search(r"gfx[0-9a-f]+", stripped)
-                        if m and not current_agent.get("gpu_arch"):
-                            current_agent["gpu_arch"] = m.group()
-                        if "Device Type:" in stripped and "GPU" in stripped:
-                            current_agent["is_gpu"] = True
-                        if "Marketing Name:" in stripped:
-                            name = stripped.split(":", 1)[1].strip()
-                            name = re.sub(r"\s*\(TM\)\s*|\s*\(R\)\s*", "", name)
-                            if name and name != "None":
-                                current_agent["marketing_name"] = name
-                        mem_match = re.match(r"Size:\s*(\d+)\s*(KB|MB|GB)", stripped)
-                        if mem_match and not current_agent.get("vram_mb"):
-                            val = int(mem_match.group(1))
-                            unit = mem_match.group(2)
-                            if unit == "KB":
-                                current_agent["vram_mb"] = val / 1024
-                            elif unit == "MB":
-                                current_agent["vram_mb"] = val
-                            elif unit == "GB":
-                                current_agent["vram_mb"] = val * 1024
-                    if current_agent.get("gpu_arch") and current_agent.get("is_gpu"):
-                        gpus_list.append(current_agent)
-                    for g in gpus_list:
-                        gpus.append({
-                            "model": g.get("marketing_name") or "AMD GPU",
-                            "vram_gb": round(g["vram_mb"] / 1024, 2) if g.get("vram_mb") else None,
-                            "compute_capability": g["gpu_arch"],
-                            "gpu_uuid": f"amdgpu-{g['gpu_arch']}",
-                            "pcie_link": None,
-                        })
-            except (subprocess.SubprocessError, subprocess.TimeoutExpired):
-                pass
-
-    return gpus
-
-
-def _run_env(cmd: list[str], env: dict) -> str | None:
-    try:
-        out = subprocess.check_output(
-            cmd, stderr=subprocess.DEVNULL, timeout=SUBPROCESS_TIMEOUT_SEC, env=env
-        )
-        return out.decode("utf-8", errors="replace").strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-
-
 def _hostname() -> str | None:
     try:
         import socket
         return socket.gethostname()
     except Exception:
         return None
+
+
+def _amd_gfx_target(env: dict[str, str] | None = None) -> str | None:
+    rocminfo_path = shutil.which("rocminfo")
+    if not rocminfo_path:
+        for d in sorted(Path("/opt").glob("rocm*/bin"), reverse=True):
+            candidate = d / "rocminfo"
+            if candidate.is_file():
+                rocminfo_path = str(candidate)
+                break
+    if rocminfo_path:
+        try:
+            result = subprocess.run(
+                [rocminfo_path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env or _rocm_miner_env(),
+            )
+            if result.returncode == 0:
+                m = re.search(r"\bgfx\d{3,4}[a-z]?\b", result.stdout)
+                if m:
+                    return m.group(0)
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            pass
+    return None
+
+
+def _amd_pci_bdfs() -> list[str]:
+    """PCI bus IDs for AMD display/3D controllers (vendor 0x1002)."""
+    bdfs: list[str] = []
+    pci_root = "/sys/bus/pci/devices"
+    if not os.path.isdir(pci_root):
+        return bdfs
+    try:
+        for entry in sorted(os.listdir(pci_root)):
+            base = os.path.join(pci_root, entry)
+            try:
+                with open(os.path.join(base, "vendor")) as f:
+                    if f.read().strip() != "0x1002":
+                        continue
+                with open(os.path.join(base, "class")) as f:
+                    cls = f.read().strip()
+                if not (cls.startswith("0x0300") or cls.startswith("0x0302")):
+                    continue
+                bdfs.append(entry)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return bdfs
+
+
+def _make_amd_gpu_uuid(gfx: str | None, ident: str) -> str:
+    slug = re.sub(r"[^a-z0-9]", "", (gfx or "amdgpu").lower()) or "amdgpu"
+    clean = re.sub(r"[^a-z0-9]", "", ident.lower()) or "unknown"
+    return f"amd-{slug}-{clean}"
+
+
+def _rocm_smi_json(args: list[str]) -> dict[str, Any] | None:
+    rocm = _resolve_rocm_smi()
+    if not rocm:
+        return None
+    out = _run_env([rocm, *args, "--json"], _rocm_miner_env())
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def _amd_gpus_from_rocm_smi() -> list[dict[str, Any]]:
+    """Per-GPU AMD info via rocm-smi JSON — matches dexbtx pool handshake shape."""
+    if platform.system() != "Linux":
+        return []
+    j = _rocm_smi_json(["--showproductname", "--showuniqueid", "--showmeminfo", "vram"])
+    if not j:
+        return []
+    gfx = _amd_gfx_target()
+    pci_bdfs = _amd_pci_bdfs()
+    gpus: list[dict[str, Any]] = []
+    card_idx = 0
+    for card, info in j.items():
+        if not str(card).lower().startswith("card"):
+            continue
+        low = {str(k).lower(): v for k, v in info.items()}
+        model = (
+            low.get("card series")
+            or low.get("card model")
+            or low.get("device name")
+            or low.get("gpu id")
+            or "AMD GPU"
+        )
+        model = str(model).strip() or "AMD GPU"
+        if not re.search(r"amd|radeon|instinct", model, re.I):
+            model = f"AMD {model}"
+        uniq = str(low.get("unique id", "")).strip()
+        ident = re.sub(r"[^a-z0-9]", "", uniq.lower()) if uniq else ""
+        if not ident:
+            if card_idx < len(pci_bdfs):
+                ident = re.sub(r"[^a-z0-9]", "", pci_bdfs[card_idx].lower())
+            else:
+                ident = (
+                    re.sub(r"[^a-z0-9]", "", str(card).lower())
+                    + "-"
+                    + re.sub(r"[^a-z0-9]", "", (_hostname() or "unknown").lower())
+                )
+        vram_gb: float | None = None
+        for k, v in low.items():
+            if "vram total memory" in k:
+                try:
+                    vram_gb = round(int(str(v)) / (1024 ** 3), 2)
+                except ValueError:
+                    pass
+        gpus.append({
+            "model": model,
+            "vram_gb": vram_gb if vram_gb is not None else 0,
+            "compute_capability": gfx or "rocm",
+            "gpu_uuid": _make_amd_gpu_uuid(gfx, ident),
+            "pcie_link": pci_bdfs[card_idx] if card_idx < len(pci_bdfs) else None,
+        })
+        card_idx += 1
+    return gpus
+
+
+def _amd_gpus_from_rocminfo() -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
+    env = _rocm_miner_env()
+    rocminfo_path = shutil.which("rocminfo")
+    if not rocminfo_path:
+        for d in sorted(Path("/opt").glob("rocm*/bin"), reverse=True):
+            candidate = d / "rocminfo"
+            if candidate.is_file():
+                rocminfo_path = str(candidate)
+                break
+    if not rocminfo_path:
+        return gpus
+    pci_bdfs = _amd_pci_bdfs()
+    try:
+        result = subprocess.run(
+            [rocminfo_path], capture_output=True, text=True, timeout=10, env=env
+        )
+        if result.returncode != 0:
+            return gpus
+        current_agent: dict[str, Any] = {}
+        gpus_list: list[dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if re.match(r"^Agent\s+\d+", stripped):
+                if current_agent.get("gpu_arch") and current_agent.get("is_gpu"):
+                    gpus_list.append(current_agent)
+                current_agent = {
+                    "gpu_arch": "",
+                    "marketing_name": "",
+                    "is_gpu": False,
+                    "vram_mb": None,
+                    "agent_id": stripped,
+                }
+            m = re.search(r"gfx[0-9a-f]+", stripped)
+            if m and not current_agent.get("gpu_arch"):
+                current_agent["gpu_arch"] = m.group()
+            if "Device Type:" in stripped and "GPU" in stripped:
+                current_agent["is_gpu"] = True
+            if "Marketing Name:" in stripped:
+                name = stripped.split(":", 1)[1].strip()
+                name = re.sub(r"\s*\(TM\)\s*|\s*\(R\)\s*", "", name)
+                if name and name != "None":
+                    current_agent["marketing_name"] = name
+            mem_match = re.match(r"Size:\s*(\d+)\s*(KB|MB|GB)", stripped)
+            if mem_match and not current_agent.get("vram_mb"):
+                val = int(mem_match.group(1))
+                unit = mem_match.group(2)
+                if unit == "KB":
+                    current_agent["vram_mb"] = val / 1024
+                elif unit == "MB":
+                    current_agent["vram_mb"] = val
+                elif unit == "GB":
+                    current_agent["vram_mb"] = val * 1024
+        if current_agent.get("gpu_arch") and current_agent.get("is_gpu"):
+            gpus_list.append(current_agent)
+        for idx, g in enumerate(gpus_list):
+            gfx = g["gpu_arch"]
+            if idx < len(pci_bdfs):
+                ident = pci_bdfs[idx]
+            else:
+                ident = re.sub(r"[^a-z0-9]", "", g.get("agent_id", f"gpu{idx}").lower())
+                ident += "-" + re.sub(r"[^a-z0-9]", "", (_hostname() or "unknown").lower())
+            gpus.append({
+                "model": g.get("marketing_name") or "AMD GPU",
+                "vram_gb": round(g["vram_mb"] / 1024, 2) if g.get("vram_mb") else None,
+                "compute_capability": gfx,
+                "gpu_uuid": _make_amd_gpu_uuid(gfx, ident),
+                "pcie_link": pci_bdfs[idx] if idx < len(pci_bdfs) else None,
+            })
+    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+        pass
+    return gpus
+
+
+def _enumerate_amd_gpus() -> list[dict[str, Any]]:
+    """Enumerate AMD GPUs for the pool hardware handshake."""
+    gpus = _amd_gpus_from_rocm_smi()
+    if gpus:
+        return gpus
+    return _amd_gpus_from_rocminfo()
 
 
 def _detect_environment() -> dict[str, Any]:
@@ -232,7 +370,7 @@ def _probe_active_backend(solver_path: str | None) -> dict[str, Any]:
             if gfx:
                 result["cuda_archs"] = ",".join(gfx)
             if any("hip" in s.lower() or "rocm" in s.lower() for s in out.stdout.split("\n")):
-                result["active"] = "rocm"
+                result["active"] = "hip"
             elif any("cuda" in s.lower() for s in out.stdout.split("\n")):
                 result["active"] = "cuda"
     except Exception:
@@ -243,15 +381,7 @@ def _probe_active_backend(solver_path: str | None) -> dict[str, Any]:
 def _probe_solver_gpu(solver_path: str | None) -> dict[str, Any] | None:
     if not solver_path or not os.path.isfile(solver_path):
         return None
-    env = {**os.environ, "HSA_ENABLE_DXG_DETECTION": "1"}
-    # WSL needs librocdxg from rocm-7.2.3+ before /opt/rocm/lib (often lacks DXG).
-    ld_parts = [str(Path.home() / ".amdbtx-miner" / "runtime"), "/usr/lib/wsl/lib"]
-    ld_parts.extend(str(d) for d in sorted(Path("/opt").glob("rocm-*/lib"), reverse=True))
-    ld_parts.append("/opt/rocm/lib")
-    existing_ld = env.get("LD_LIBRARY_PATH", "")
-    if existing_ld:
-        ld_parts.extend(p for p in existing_ld.split(":") if p)
-    env["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(p for p in ld_parts if os.path.isdir(p)))
+    env = _rocm_miner_env()
     try:
         proc = subprocess.Popen(
             [solver_path, "--daemon", "--backend", "hip", "--batch-size", "1", "--epsilon-bits", "0"],
@@ -276,13 +406,29 @@ def _probe_solver_gpu(solver_path: str | None) -> dict[str, Any] | None:
     m = re.search(r"HIP GPU detected:\s*(.*?)\s+arch=(gfx[0-9a-f]+)\s+memory=(\d+)MB", line)
     if not m:
         return None
+    gfx = m.group(2)
+    pci_bdfs = _amd_pci_bdfs()
+    ident = pci_bdfs[0] if pci_bdfs else (_hostname() or "solver-probe")
     return {
         "model": m.group(1).strip() or "AMD GPU",
         "vram_gb": round(int(m.group(3)) / 1024, 2),
-        "compute_capability": m.group(2),
-        "gpu_uuid": f"amdgpu-{m.group(2)}",
-        "pcie_link": None,
+        "compute_capability": gfx,
+        "gpu_uuid": _make_amd_gpu_uuid(gfx, ident),
+        "pcie_link": pci_bdfs[0] if pci_bdfs else None,
     }
+
+
+def solver_sha256_hex(solver_path: str | None) -> str | None:
+    if not solver_path:
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(solver_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def collect_static_hardware(
@@ -428,4 +574,187 @@ def hardware_summary_string(hw: dict[str, Any]) -> str:
     if gpus:
         models = ", ".join(f"{g.get('model', '?')}" for g in gpus)
         bits.append(f"GPUs=[{models}]")
+    if hw.get("active_backend"):
+        bits.append(f"backend={hw['active_backend']}")
     return " ".join(bits)
+
+
+def _ram_gb_used() -> float | None:
+    try:
+        with open("/proc/meminfo") as f:
+            total_kb = None
+            avail_kb = None
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total_kb = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    avail_kb = int(line.split()[1])
+            if total_kb is not None and avail_kb is not None:
+                return round((total_kb - avail_kb) / (1024 * 1024), 2)
+    except OSError:
+        pass
+    return None
+
+
+def _read_stat() -> tuple[int, ...] | None:
+    try:
+        with open("/proc/stat") as f:
+            line = f.readline()
+        if not line.startswith("cpu "):
+            return None
+        parts = line.split()[1:]
+        return tuple(int(x) for x in parts[:10])
+    except (OSError, ValueError):
+        return None
+
+
+def _cpu_util_pct() -> float | None:
+    try:
+        import time as _time
+        a = _read_stat()
+        if a is None:
+            return None
+        _time.sleep(1.0)
+        b = _read_stat()
+        if b is None:
+            return None
+        idle_delta = b[3] - a[3]
+        total_delta = sum(b) - sum(a)
+        if total_delta <= 0:
+            return None
+        return round(100.0 * (1.0 - idle_delta / total_delta), 1)
+    except Exception:
+        return None
+
+
+def _parse_rocm_metric(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("n/a", "na", "none"):
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def _gpu_runtime() -> list[dict[str, Any]]:
+    """Per-GPU runtime metrics for worker.report_metrics."""
+    static_gpus = _enumerate_amd_gpus()
+    if not static_gpus:
+        probe = _probe_solver_gpu(None)
+        if probe:
+            static_gpus = [probe]
+
+    j = _rocm_smi_json(["--showuse", "--showtemp", "--showpower", "--showuniqueid"])
+    if not j:
+        return [
+            {
+                "gpu_uuid": g.get("gpu_uuid"),
+                "util_pct": None,
+                "power_w": None,
+                "temp_c": None,
+            }
+            for g in static_gpus
+            if g.get("gpu_uuid")
+        ]
+
+    out: list[dict[str, Any]] = []
+    card_idx = 0
+    for card, info in j.items():
+        if not str(card).lower().startswith("card"):
+            continue
+        low = {str(k).lower(): v for k, v in info.items()}
+        uniq = str(low.get("unique id", "")).strip()
+        ident = re.sub(r"[^a-z0-9]", "", uniq.lower()) if uniq else ""
+        gfx = _amd_gfx_target()
+        gpu_uuid = _make_amd_gpu_uuid(gfx, ident) if ident else None
+        if not gpu_uuid and card_idx < len(static_gpus):
+            gpu_uuid = static_gpus[card_idx].get("gpu_uuid")
+        if not gpu_uuid:
+            card_idx += 1
+            continue
+
+        util = None
+        for k, v in low.items():
+            if "gpu use" in k or "gpu activity" in k:
+                parsed = _parse_rocm_metric(v)
+                if parsed is not None:
+                    util = int(parsed)
+                break
+
+        temp = None
+        for k, v in low.items():
+            if "temperature" in k and "edge" in k:
+                parsed = _parse_rocm_metric(v)
+                if parsed is not None:
+                    temp = int(parsed)
+                break
+        if temp is None:
+            for k, v in low.items():
+                if "temperature" in k:
+                    parsed = _parse_rocm_metric(v)
+                    if parsed is not None:
+                        temp = int(parsed)
+                    break
+
+        power = None
+        for k, v in low.items():
+            if "average graphics package power" in k or "current socket power" in k:
+                parsed = _parse_rocm_metric(v)
+                if parsed is not None:
+                    power = round(parsed, 1)
+                break
+
+        out.append({
+            "gpu_uuid": gpu_uuid,
+            "util_pct": util,
+            "power_w": power,
+            "temp_c": temp,
+        })
+        card_idx += 1
+
+    if not out and static_gpus:
+        return [
+            {
+                "gpu_uuid": g.get("gpu_uuid"),
+                "util_pct": None,
+                "power_w": None,
+                "temp_c": None,
+            }
+            for g in static_gpus
+            if g.get("gpu_uuid")
+        ]
+    return out
+
+
+def collect_runtime_metrics(
+    session_id: str,
+    solver_nps: float | None,
+    shares_session_total: int,
+    *,
+    solver_sha256: str | None = None,
+    solver_backend: str | None = None,
+    wrapper_version: str | None = None,
+) -> dict[str, Any]:
+    """Build worker.report_metrics payload (pool uses this for vardiff + dashboard)."""
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "timestamp": int(__import__("time").time()),
+        "cpu_util_pct": _cpu_util_pct(),
+        "ram_gb_used": _ram_gb_used(),
+        "gpus": _gpu_runtime(),
+        "solver_nps": solver_nps,
+        "shares_session_total": shares_session_total,
+    }
+    if wrapper_version:
+        payload["wrapper_version"] = wrapper_version
+    if solver_sha256:
+        payload["solver_sha256"] = solver_sha256
+    if solver_backend:
+        payload["solver_backend"] = solver_backend
+    return payload

@@ -145,6 +145,7 @@ int main(int argc, char* argv[]) {
         uint64_t nonce_start = 0;
         uint64_t max_tries = 2000000;
         double max_seconds = 5.0;
+        uint32_t max_results = 64;
 
         Uint256 share_target;
         std::memset(share_target.data, 0xFF, 32);
@@ -169,6 +170,8 @@ int main(int argc, char* argv[]) {
 
         std::string ms_str = extract_json_number(line, "max_seconds");
         if (!ms_str.empty()) max_seconds = std::stod(ms_str);
+        std::string mr_str = extract_json_number(line, "max_results");
+        if (!mr_str.empty()) max_results = static_cast<uint32_t>(std::stoul(mr_str));
 
         std::string st_str = extract_json_string(line, "share_target");
         if (!st_str.empty()) share_target = HexToUint256(st_str);
@@ -191,13 +194,16 @@ int main(int argc, char* argv[]) {
         bool found;
         bool cpu_fallback = false;
         std::string backend_used = config.backend;
+        std::vector<PowState> solutions;
+        uint64_t scanned_nonce_end = nonce_start;
 
         if (config.backend == "hip") {
             found = SolveGPU(state, job_n, job_b, job_r,
                              block_target, share_target, max_tries, max_seconds,
                              tries_used, elapsed_s,
                              config.batch_size, job_epsilon_bits, &cpu_fallback,
-                             &gate_passes, &words_hits, &cpu_verify_misses);
+                             &gate_passes, &words_hits, &cpu_verify_misses,
+                             &solutions, max_results, &scanned_nonce_end);
             backend_used = cpu_fallback ? "cpu" : "hip";
         } else {
             found = SolveCPU(state, job_n, job_b, job_r,
@@ -208,8 +214,10 @@ int main(int argc, char* argv[]) {
         }
 
         bool is_block = found && Uint256LE(state.digest, block_target);
-        uint64_t nonce64_end = found ? state.nonce
-            : (state.nonce > nonce_start ? state.nonce - 1 : nonce_start);
+        uint64_t nonce64_end = backend_used == "hip"
+            ? scanned_nonce_end
+            : (found ? state.nonce
+                : (state.nonce > nonce_start ? state.nonce - 1 : nonce_start));
 
         std::cout << "{";
         std::cout << "\"found\":" << (found ? "true" : "false") << ",";
@@ -228,6 +236,23 @@ int main(int argc, char* argv[]) {
             std::cout << "\"words_hits\":" << words_hits << ",";
         if (cpu_verify_misses > 0)
             std::cout << "\"cpu_verify_misses\":" << cpu_verify_misses << ",";
+        if (!solutions.empty()) {
+            std::cout << "\"solutions\":[";
+            for (size_t i = 0; i < solutions.size(); ++i) {
+                const PowState& solution = solutions[i];
+                const bool solution_is_block =
+                    Uint256LE(solution.digest, block_target);
+                if (i != 0) std::cout << ",";
+                std::cout << "{";
+                std::cout << "\"nonce64\":" << solution.nonce << ",";
+                std::cout << "\"digest\":\"" << Uint256ToHex(solution.digest) << "\",";
+                std::cout << "\"ntime\":" << solution.time << ",";
+                std::cout << "\"is_block\":"
+                          << (solution_is_block ? "true" : "false");
+                std::cout << "}";
+            }
+            std::cout << "],";
+        }
         std::cout << "\"backend\":\"" << backend_used << "\"";
         std::cout << "}" << std::endl;
     }

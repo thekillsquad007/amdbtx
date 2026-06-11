@@ -19,10 +19,11 @@ set(SOURCES
     src/solve.cpp
     src/solve_gpu.hip
     src/gpu_sha256.hip
+    src/matmul_kernel.hip
 )
 
 set(HIP_ARCHS
-    gfx900;gfx906;gfx1030;gfx1100
+    gfx900;gfx906;gfx1030;gfx1100;gfx1101
     CACHE STRING "Semicolon-separated list of HIP offload architectures"
 )
 

@@ -3,10 +3,21 @@ import json
 import time
 import uuid
 import logging
+import random
+import threading
 from typing import Any
 
 from . import PROTOCOL_CAPABILITIES, USER_AGENT, __version__
-from .hardware import collect_static_hardware, detect_gpu_info, hardware_summary_string
+from .config import fully_qualified_worker
+from .hardware import (
+    collect_runtime_metrics,
+    collect_static_hardware,
+    detect_gpu_info,
+    hardware_summary_string,
+    solver_sha256_hex,
+)
+
+METRICS_REPORT_INTERVAL_SEC = 60.0
 
 log = logging.getLogger(__name__)
 
@@ -105,7 +116,8 @@ class StratumClient:
         self.port = port
         self.payout_address = payout_address
         self.operator_worker_name = worker_name
-        self.worker_name = ""
+        self._submit_worker = fully_qualified_worker(payout_address, worker_name)
+        self.worker_name = self._submit_worker
         self._canonical_worker_name = ""
         self.cfg = cfg or {}
         self.sock: socket.socket | None = None
@@ -118,7 +130,11 @@ class StratumClient:
         self.shares_accepted = 0
         self.shares_rejected = 0
         self.blocks_found = 0
+        self._pending_submits: dict[int, dict[str, Any]] = {}
         self._current_job: Job | None = None
+        self._metrics_stop = threading.Event()
+        self._metrics_thread: threading.Thread | None = None
+        self._solver_ref: Any = None
         self._connect()
 
     def _next_id(self) -> int:
@@ -138,6 +154,22 @@ class StratumClient:
             solver_path=self.cfg.get("gbt_solve_path"),
         )
         log.info("hardware: %s", hardware_summary_string(hw))
+        gpus = hw.get("gpus") or []
+        if not gpus:
+            log.warning(
+                "no GPUs in hardware handshake — pool will assign CPU-* canonical name "
+                "and vardiff may stay at minimum; ensure rocm-smi works with "
+                "HSA_ENABLE_DXG_DETECTION=1 before mining"
+            )
+        else:
+            for i, g in enumerate(gpus):
+                log.info(
+                    "pool gpu[%d]: model=%s uuid=%s arch=%s",
+                    i,
+                    g.get("model", "?"),
+                    g.get("gpu_uuid", "?"),
+                    g.get("compute_capability", "?"),
+                )
 
         extension = {
             "protocol_compliant": list(PROTOCOL_CAPABILITIES),
@@ -154,24 +186,66 @@ class StratumClient:
             raise RuntimeError(f"bad subscribe response: {sub!r}")
         log.info("subscribed; extranonce1=%s en2_size=%d", self._extranonce1[:8], self._extranonce2_size)
 
-        # Authorize once with the payout address. No re-authorize with a
-        # full "address.worker" identity — that can create a separate PPLNS
-        # sub-account on the pool's side.
-        ok = self._call("mining.authorize", [self.payout_address, ""])
+        # dexbtx-miner uses address.worker_name for authorize AND submit; the
+        # pool keys vardiff/report_metrics to that identity. Canonical names are
+        # dashboard labels only (mining.set_canonical_name).
+        ok = self._call("mining.authorize", [self._submit_worker, ""])
         if not ok:
-            raise RuntimeError(f"authorize rejected for address={self.payout_address}")
-        log.info("authorized as %s", self.payout_address)
+            raise RuntimeError(f"authorize rejected for worker={self._submit_worker}")
+        log.info("authorized as %s", self._submit_worker)
 
         # Drain handshake messages (set_canonical_name, set_difficulty, etc.).
-        # The canonical worker name is used as a label for share submissions,
-        # not for re-authorization.
-        self._drain_handshake_messages(2.0)
+        self._drain_handshake_messages(3.0)
 
         if self._canonical_worker_name:
-            self.worker_name = self._canonical_worker_name
-            log.info("canonical worker name: %s", self.worker_name)
+            log.info("canonical worker name: %s", self._canonical_worker_name)
+            if self._canonical_worker_name.upper().startswith("CPU-"):
+                log.warning(
+                    "pool assigned CPU canonical name (%s) — vardiff may not ramp; "
+                    "restart after GPU detection is fixed (see pool gpu[] lines above)",
+                    self._canonical_worker_name,
+                )
+            else:
+                log.info(
+                    "if pool dashboard still lists a stale CPU-* worker with the same "
+                    "shares, stop all other miner instances and wait ~10 min for it to age out"
+                )
         else:
             log.info("no canonical name assigned, using address-only")
+        log.info(
+            "pool vardiff: difficulty=%s (dashboard hashrate scales with this, not nonce_khps)",
+            self._difficulty,
+        )
+
+    def start_metrics_reporter(self, solver: Any) -> None:
+        """Background worker.report_metrics heartbeats (dexbtx-miner parity)."""
+        self._solver_ref = solver
+        self._metrics_stop.clear()
+        if self._metrics_thread is not None and self._metrics_thread.is_alive():
+            return
+        self._metrics_thread = threading.Thread(
+            target=self._metrics_loop, name="pool-metrics", daemon=True,
+        )
+        self._metrics_thread.start()
+
+    def stop_metrics_reporter(self) -> None:
+        self._metrics_stop.set()
+
+    def _metrics_loop(self) -> None:
+        time.sleep(random.uniform(5.0, METRICS_REPORT_INTERVAL_SEC))
+        while not self._metrics_stop.is_set():
+            try:
+                solver = self._solver_ref
+                solver_nps = getattr(solver, "last_observed_nps", None) if solver else None
+                if solver_nps and solver_nps > 0:
+                    self.report_metrics(
+                        float(solver_nps),
+                        self.shares_accepted + self.shares_rejected,
+                    )
+            except Exception as e:
+                log.debug("metrics report failed (non-fatal): %s", e)
+            if self._metrics_stop.wait(METRICS_REPORT_INTERVAL_SEC):
+                break
 
     def _drain_handshake_messages(self, seconds: float):
         if self.sock is None:
@@ -180,18 +254,21 @@ class StratumClient:
         old_timeout = self.sock.gettimeout()
         try:
             self.sock.settimeout(0.2)
-            while time.time() < deadline and not self._canonical_worker_name:
+            while time.time() < deadline:
                 try:
                     msg = self._recv()
                 except socket.timeout:
                     continue
-                self._handle_server_message(msg)
+                self._dispatch_message(msg)
         finally:
             self.sock.settimeout(old_timeout)
 
     def _build_solver_env(self) -> dict[str, Any]:
+        backend = self.cfg.get("solver_backend", "rocm")
+        if backend in ("rocm", "hip"):
+            backend = "hip"
         env: dict[str, Any] = {
-            "BTX_MATMUL_BACKEND": self.cfg.get("solver_backend", "rocm"),
+            "BTX_MATMUL_BACKEND": backend,
             "BTX_MATMUL_GPU_INPUTS": self.cfg.get("gpu_inputs", 0),
             "BTX_MATMUL_SOLVE_BATCH_SIZE": self.cfg.get("solver_batch_size", 1024),
             "BTX_MATMUL_PREPARE_PREFETCH_DEPTH": self.cfg.get("solver_prefetch_depth", 8),
@@ -222,6 +299,60 @@ class StratumClient:
         line, self._buf = self._buf.split(b"\n", 1)
         return json.loads(line.decode())
 
+    def _complete_pending_submit(self, msg_id: int, resp: dict) -> None:
+        meta = self._pending_submits.pop(msg_id, None)
+        if not meta:
+            return
+        job_id = meta["job_id"]
+        nonce_hex = meta["nonce_hex"]
+        if resp.get("error"):
+            self.shares_rejected += 1
+            log.info(
+                "share REJECTED job=%s nonce=%s (a/r=%d/%d) error=%s",
+                job_id, nonce_hex,
+                self.shares_accepted, self.shares_rejected, resp["error"],
+            )
+            return
+        self.shares_accepted += 1
+        is_block = meta.get("is_block", False)
+        if is_block:
+            self.blocks_found += 1
+        log.info(
+            "share OK job=%s nonce=%s is_block=%s (a/r/b=%d/%d/%d)",
+            job_id, nonce_hex, is_block,
+            self.shares_accepted, self.shares_rejected, self.blocks_found,
+        )
+
+    def _dispatch_message(self, msg: dict) -> bool:
+        """Route one pool line. Returns True if it was a pending submit response."""
+        msg_id = msg.get("id")
+        if msg_id is not None and msg_id in self._pending_submits:
+            self._complete_pending_submit(msg_id, msg)
+            return True
+        if msg.get("method"):
+            self._handle_server_message(msg)
+        return False
+
+    def process_available_messages(self) -> int:
+        """Non-blocking drain: apply notify/vardiff and finish async submit responses."""
+        if self.sock is None:
+            return 0
+        count = 0
+        old_timeout = self.sock.gettimeout()
+        try:
+            self.sock.setblocking(False)
+            while True:
+                try:
+                    msg = self._recv()
+                except (BlockingIOError, ConnectionError):
+                    break
+                self._dispatch_message(msg)
+                count += 1
+        finally:
+            self.sock.setblocking(True)
+            self.sock.settimeout(old_timeout)
+        return count
+
     def _handle_server_message(self, msg: dict):
         method = msg.get("method")
         if method == "mining.notify":
@@ -237,8 +368,16 @@ class StratumClient:
             params = msg.get("params", [])
             if params:
                 try:
-                    self._difficulty = float(params[0])
-                    log.info("difficulty set to %s", self._difficulty)
+                    new_diff = float(params[0])
+                    old_diff = self._difficulty
+                    self._difficulty = new_diff
+                    if new_diff != old_diff:
+                        log.info(
+                            "pool vardiff: difficulty %.6g -> %.6g "
+                            "(higher = harder shares = higher dashboard hashrate per share)",
+                            old_diff,
+                            new_diff,
+                        )
                 except (TypeError, ValueError):
                     pass
         elif method == "mining.set_extranonce":
@@ -254,7 +393,6 @@ class StratumClient:
             canonical = self._extract_canonical_name(params)
             if canonical:
                 self._canonical_worker_name = canonical
-                self.worker_name = canonical
             log.info("canonical name: %s", params)
 
     @staticmethod
@@ -277,12 +415,21 @@ class StratumClient:
                 if msg.get("error") is not None:
                     raise RuntimeError(f"pool error: {msg['error']}")
                 return msg.get("result")
-            self._handle_server_message(msg)
+            self._dispatch_message(msg)
         raise RuntimeError(f"{method} timed out")
 
-    def send_authorize(self, address: str):
+    def send_authorize(self, payout_address: str, worker_name: str | None = None):
+        if "." in payout_address and worker_name is None:
+            worker = payout_address
+        else:
+            worker = fully_qualified_worker(
+                payout_address, worker_name or self.operator_worker_name,
+            )
+        self._submit_worker = worker
+        self.worker_name = worker
         msg_id = self._next_id()
-        self._send({"id": msg_id, "method": "mining.authorize", "params": [address, ""]})
+        self._send({"id": msg_id, "method": "mining.authorize", "params": [worker, ""]})
+        log.info("re-authorized as %s", worker)
 
     def get_job(self) -> Job:
         if self._current_job is not None:
@@ -299,19 +446,19 @@ class StratumClient:
                 except (IndexError, KeyError, ValueError) as e:
                     log.warning("malformed notify: %s; params=%r", e, params)
             else:
-                self._handle_server_message(msg)
+                self._dispatch_message(msg)
 
     def wait_for_job(self) -> Job:
         while True:
             msg = self._recv()
-            self._handle_server_message(msg)
+            self._dispatch_message(msg)
             if self._current_job is not None:
                 job = self._current_job
                 self._current_job = None
                 return job
 
-    def submit_share(self, job: Job, result: dict):
-        worker = self.worker_name or self.payout_address
+    def submit_share(self, job: Job, result: dict, *, wait: bool = False):
+        worker = self._submit_worker or self.worker_name or self.payout_address
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime_val = int(result.get("ntime") or job.time)
         ntime = f"{ntime_val:08x}"
@@ -323,38 +470,53 @@ class StratumClient:
             result.get("digest", ""), (job.target or "")[:16],
         )
         msg_id = self._next_id()
+        is_block = bool(result.get("is_block", False))
+        self._pending_submits[msg_id] = {
+            "job_id": job.job_id,
+            "nonce_hex": nonce_hex,
+            "is_block": is_block,
+            "sent_at": time.time(),
+        }
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
+        if not wait:
+            return
         deadline = time.time() + 30.0
         while time.time() < deadline:
+            if msg_id not in self._pending_submits:
+                return
             resp = self._recv()
             if resp.get("id") == msg_id:
-                if resp.get("error"):
-                    self.shares_rejected += 1
-                    log.info("share REJECTED job=%s nonce=%s (a/r=%d/%d) error=%s",
-                             job.job_id, nonce_hex,
-                             self.shares_accepted, self.shares_rejected, resp["error"])
-                else:
-                    self.shares_accepted += 1
-                    is_block = result.get("is_block", False)
-                    if is_block:
-                        self.blocks_found += 1
-                    log.info("share OK job=%s nonce=%s is_block=%s (a/r/b=%d/%d/%d)",
-                             job.job_id, nonce_hex, is_block, self.shares_accepted, self.shares_rejected, self.blocks_found)
+                self._complete_pending_submit(msg_id, resp)
                 return
-            self._handle_server_message(resp)
-        log.warning("submit timed out")
+            self._dispatch_message(resp)
+        self._pending_submits.pop(msg_id, None)
+        log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
 
     def report_metrics(self, solver_nps: float, shares_total: int = 0) -> None:
         if solver_nps <= 0 or self.sock is None:
             return
-        payload = {
-            "session_id": self._session_id,
-            "timestamp": int(time.time()),
-            "solver_nps": solver_nps,
-            "shares_session_total": shares_total,
-        }
+        solver_path = self.cfg.get("gbt_solve_path")
+        backend = self.cfg.get("solver_backend", "rocm")
+        if backend in ("rocm", "hip"):
+            backend = "hip"
+        payload = collect_runtime_metrics(
+            session_id=self._session_id,
+            solver_nps=solver_nps,
+            shares_session_total=shares_total,
+            wrapper_version=__version__,
+            solver_sha256=solver_sha256_hex(solver_path),
+            solver_backend=backend,
+        )
+        # dexbtx-miner sends params[0] as a dict; a JSON string is ignored by
+        # the pool and vardiff stays at minimum (~0.34 nps/share credit).
         self._send({
             "method": "worker.report_metrics",
-            "params": [json.dumps(payload, separators=(",", ":"))],
+            "params": [payload],
         })
-        log.debug("report_metrics solver_nps=%.0f shares=%d", solver_nps, shares_total)
+        log.info(
+            "report_metrics solver_nps=%.0f shares=%d pool_diff=%.6g "
+            "(pool uses this + share rate to adjust vardiff)",
+            solver_nps,
+            shares_total,
+            self._difficulty,
+        )
