@@ -343,3 +343,18 @@ class StratumClient:
                 return
             self._handle_server_message(resp)
         log.warning("submit timed out")
+
+    def report_metrics(self, solver_nps: float, shares_total: int = 0) -> None:
+        if solver_nps <= 0 or self.sock is None:
+            return
+        payload = {
+            "session_id": self._session_id,
+            "timestamp": int(time.time()),
+            "solver_nps": solver_nps,
+            "shares_session_total": shares_total,
+        }
+        self._send({
+            "method": "worker.report_metrics",
+            "params": [json.dumps(payload, separators=(",", ":"))],
+        })
+        log.debug("report_metrics solver_nps=%.0f shares=%d", solver_nps, shares_total)
