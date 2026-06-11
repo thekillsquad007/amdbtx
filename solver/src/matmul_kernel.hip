@@ -1710,6 +1710,45 @@ __global__ void batch_perturb_matrix_kernel(
         static_cast<uint32_t>(d_reduce64(acc)));
 }
 
+__global__ void batch_perturb_matrix_512x8_kernel(
+    const uint32_t* __restrict__ base,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    const size_t gid =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    const size_t batch_index = gid >> 18U;
+    const uint32_t local_index =
+        static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+    const uint32_t row = local_index >> 9U;
+    const uint32_t col = local_index & (kN - 1U);
+    const uint32_t* batch_base = base + batch_index * kMatrixElements;
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+               right[k * kN + col];
+        if ((k & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    output[gid] = d_add(
+        batch_base[local_index],
+        static_cast<uint32_t>(d_reduce64(acc)));
+}
+
 // One workgroup per output word. Threads map to the 16x16 compression
 // coordinates and accumulate all 32 inner blocks for that word.
 __global__ void batch_compressed_words_kernel(
@@ -1780,6 +1819,69 @@ __global__ void batch_compressed_words_kernel(
 
     if (tid == 0) {
         output[static_cast<size_t>(batch_index) * words_per_nonce + word_index] =
+            compressed_sum;
+    }
+}
+
+__global__ void batch_compressed_words_512x16_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ matrix_b,
+    const uint32_t* __restrict__ compress,
+    uint32_t* __restrict__ output)
+{
+    __shared__ uint32_t partials[256];
+
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kWordsPerNonce = 32 * 32;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    const uint32_t global_word = blockIdx.x;
+    const uint32_t batch_index = global_word >> 10U;
+    const uint32_t word_index = global_word & (kWordsPerNonce - 1U);
+    const uint32_t bi = word_index >> 5U;
+    const uint32_t bj = word_index & 31U;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row = (bi << 4U) + (tid >> 4U);
+    const uint32_t col = (bj << 4U) + (tid & 15U);
+
+    const uint32_t* A =
+        matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* B =
+        matrix_b + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t weight =
+        compress[(static_cast<size_t>(batch_index) << 8U) + tid];
+
+    uint32_t compressed_sum = 0;
+    for (uint32_t ell = 0; ell < 32; ++ell) {
+        const uint32_t middle = ell << 4U;
+        uint64_t dot = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 16; ++k) {
+            dot += static_cast<uint64_t>(
+                A[static_cast<size_t>(row) * kN + middle + k]) *
+                B[static_cast<size_t>(middle + k) * kN + col];
+            if ((k & 3U) == 3U) {
+                dot = d_reduce64(dot);
+            }
+        }
+        partials[tid] = d_mul(
+            static_cast<uint32_t>(d_reduce64(dot)), weight);
+        __syncthreads();
+
+        for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
+            if (tid < stride) {
+                partials[tid] = d_add(partials[tid], partials[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            compressed_sum = d_add(compressed_sum, partials[0]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[
+            (static_cast<size_t>(batch_index) << 10U) + word_index] =
             compressed_sum;
     }
 }
@@ -2179,19 +2281,35 @@ bool ProcessPassedNoncesBatched(
     constexpr uint32_t kThreads = 256;
     const uint32_t matrix_blocks = static_cast<uint32_t>(
         (total_matrix_elements + kThreads - 1) / kThreads);
-    batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
-        pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
-        matrix_elements, total_matrix_elements, pool.d_matrix_a);
-    batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
-        pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
-        matrix_elements, total_matrix_elements, pool.d_matrix_b);
+    const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
+    if (use_512x16x8) {
+        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
+            total_matrix_elements, pool.d_matrix_a);
+        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr,
+            total_matrix_elements, pool.d_matrix_b);
+    } else {
+        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
+            matrix_elements, total_matrix_elements, pool.d_matrix_a);
+        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
+            matrix_elements, total_matrix_elements, pool.d_matrix_b);
+    }
 
     const uint32_t total_words =
         static_cast<uint32_t>(batch) * words_per_nonce;
-    batch_compressed_words_kernel<<<total_words, kThreads>>>(
-        pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
-        n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
-        pool.d_words);
+    if (use_512x16x8) {
+        batch_compressed_words_512x16_kernel<<<total_words, kThreads>>>(
+            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+            pool.d_words);
+    } else {
+        batch_compressed_words_kernel<<<total_words, kThreads>>>(
+            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+            n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
+            pool.d_words);
+    }
 
     gpasha::HashTranscriptKernel_launch(
         pool.d_words, pool.d_sigma, words_per_nonce, n, bsz,
