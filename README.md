@@ -25,6 +25,14 @@ Launch:
 amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
+The installer builds the Python wrapper and HIP solver from the same Git
+commit. Verify what was installed with:
+
+```bash
+cat ~/.amdbtx-miner/install-source.txt
+sha256sum ~/.amdbtx-miner/bin/btx-gbt-solve-hip
+```
+
 ### Windows (WSL2 with AMD GPU)
 
 > Requires: Windows 11 with WSL2, AMD GPU (RDNA 2+ recommended), latest AMD Adrenalin driver.

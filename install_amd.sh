@@ -24,10 +24,8 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
 fi
 
 # ─── Configurables ──────────────────────────────────────────────────────────
-PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.0}"
-PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/${PREBUILDS_TAG}}"
-SOLVER_NAME="${SOLVER_NAME:-btx-gbt-solve-hip}"
-SOLVER_URL="${PREBUILDS_BASE}/${SOLVER_NAME}"
+SOURCE_REF="${AMDBTX_SOURCE_REF:-main}"
+SOURCE_REPO="thekillsquad007/amdbtx"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
@@ -397,24 +395,35 @@ log "creating private Python environment..."
 "$PYTHON" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip wheel pyyaml
 
-# ─── Fetch pre-built Python package from releases ────────────────────────
+# ─── Fetch one source snapshot for wrapper and solver ────────────────────
 mkdir -p "${INSTALL_DIR}/bin"
-WHEEL_FILENAME="amdbtx_miner-1.0.0-py3-none-any.whl"
-TMP_WHEEL="$(mktemp -d)/${WHEEL_FILENAME}"
-TMP_BUILD_DIR=""
+TMP_BUILD_DIR="$(mktemp -d)"
+REPO_SRC_DIR="${TMP_BUILD_DIR}/repo"
 cleanup_temp() {
-    rm -rf "$(dirname "$TMP_WHEEL")" 2>/dev/null || true
-    [[ -n "$TMP_BUILD_DIR" ]] && rm -rf "$TMP_BUILD_DIR" 2>/dev/null || true
+    rm -rf "$TMP_BUILD_DIR" 2>/dev/null || true
 }
 trap cleanup_temp EXIT
+
+RESOLVED_SOURCE_REF="$SOURCE_REF"
+SOURCE_API_URL="https://api.github.com/repos/${SOURCE_REPO}/commits/${SOURCE_REF}"
+SOURCE_API_JSON="$(curl -fsSL "$SOURCE_API_URL" 2>/dev/null || true)"
+SOURCE_COMMIT="$(printf '%s' "$SOURCE_API_JSON" | sed -nE 's/^[[:space:]]*"sha":[[:space:]]*"([0-9a-f]{40})",?$/\1/p' | head -1)"
+if [[ -n "$SOURCE_COMMIT" ]]; then
+    RESOLVED_SOURCE_REF="$SOURCE_COMMIT"
+fi
+SOURCE_ARCHIVE_URL="https://github.com/${SOURCE_REPO}/archive/${RESOLVED_SOURCE_REF}.tar.gz"
+log "downloading AMDBTX source (${RESOLVED_SOURCE_REF})..."
+mkdir -p "$REPO_SRC_DIR"
+curl -fsSL "$SOURCE_ARCHIVE_URL" -o "$TMP_BUILD_DIR/repo.tar.gz" 2>/dev/null || \
+    err "failed to download source from ${SOURCE_ARCHIVE_URL}"
+SOURCE_ARCHIVE_SHA256="$(sha256sum "$TMP_BUILD_DIR/repo.tar.gz" | awk '{print $1}')"
+tar xzf "$TMP_BUILD_DIR/repo.tar.gz" -C "$REPO_SRC_DIR" --strip-components=1
 
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
-    log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
-    WHEEL_URL="${PREBUILDS_BASE}/${WHEEL_FILENAME}"
-    curl -fsSL "$WHEEL_URL" -o "$TMP_WHEEL" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
-    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$TMP_WHEEL"
+    log "installing wrapper from the same source snapshot..."
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$REPO_SRC_DIR"
     mkdir -p "$(dirname "$LAUNCHER_PATH")"
     cat > "$LAUNCHER_PATH" <<EOF
 #!/usr/bin/env bash
@@ -435,13 +444,8 @@ if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
     install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
 else
-    TMP_BUILD_DIR="$(mktemp -d)"
     BUILD_DIR="$TMP_BUILD_DIR"
-    log "downloading solver source from GitHub..."
-    curl -fsSL "https://github.com/thekillsquad007/amdbtx/archive/main.tar.gz" -o "$BUILD_DIR/repo.tar.gz" 2>/dev/null || \
-        err "failed to download solver source"
-    tar xzf "$BUILD_DIR/repo.tar.gz" -C "$BUILD_DIR"
-    SOLVER_SRC_DIR="$BUILD_DIR/amdbtx-main/solver"
+    SOLVER_SRC_DIR="$REPO_SRC_DIR/solver"
 
     # Ensure HIP dev packages match the runtime ROCm version.
     # If /opt/rocm is present (host mount), force-install matching dev packages
@@ -475,6 +479,15 @@ else
 fi
 
 log "solver installed → $SOLVER_PATH"
+SOLVER_SHA256="$(sha256sum "$SOLVER_PATH" | awk '{print $1}')"
+cat > "${INSTALL_DIR}/install-source.txt" <<EOF
+source_ref=${SOURCE_REF}
+source_commit=${RESOLVED_SOURCE_REF}
+source_archive_sha256=${SOURCE_ARCHIVE_SHA256}
+solver_sha256=${SOLVER_SHA256}
+EOF
+log "source commit: ${RESOLVED_SOURCE_REF}"
+log "solver sha256: ${SOLVER_SHA256}"
 
 # ─── Build solver runtime (library resolver) ──────────────────────────────
 # The pre-built solver binary links against specific sonames (e.g. libamdhip64.so.6, libhipblas.so.2)
@@ -714,7 +727,7 @@ fi
 # GPU-specific tuning
 GPU_WORKERS=16
 GPU_THREADS=8
-GPU_BATCH=128
+GPU_BATCH=4096
 GPU_PREFETCH=8
 
 # Older GCN cards (gfx803) benefit from lower settings
@@ -727,7 +740,7 @@ fi
 
 # RDNA 2/3/4: larger batches keep the GPU fed
 if [[ "$GPU_ARCH" == gfx103* || "$GPU_ARCH" == gfx110* || "$GPU_ARCH" == gfx115* ]]; then
-    GPU_BATCH=1024
+    GPU_BATCH=65536
 fi
 
 if [[ ! -f "$CONFIG_PATH" || "$ASSUME_YES" -eq 1 ]]; then
@@ -752,11 +765,12 @@ solver_batch_size: ${GPU_BATCH}
 solver_prefetch_depth: ${GPU_PREFETCH}
 solver_prepare_workers: ${GPU_WORKERS}
 solver_pipeline_async: 1
-gpu_inputs: 0
+gpu_inputs: 1
 
 # Slice sizing
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0
+pool_max_shares_per_slice: 0
 
 # Reconnect
 reconnect_initial_s: 1.0
