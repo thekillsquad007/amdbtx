@@ -39,12 +39,14 @@ echo
 # Delete old assets
 echo "Fetching existing assets..."
 ASSETS=$(curl -s -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets")
-for name in "btx-gbt-solve-hip" "amdbtx_miner-1.0.0-py3-none-any.whl"; do
-    asset_id=$(echo "${ASSETS}" | jq -r ".[] | select(.name==\"${name}\") | .id")
-    if [ -n "${asset_id}" ]; then
-        echo "Deleting old ${name} (asset ${asset_id})..."
-        curl -s -X DELETE -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}"
-    fi
+echo "${ASSETS}" | jq -r '
+    .[]
+    | select(.name == "btx-gbt-solve-hip" or (.name | test("^amdbtx_miner-.*\\.whl$")))
+    | "\(.id)\t\(.name)"
+' | while IFS=$'\t' read -r asset_id name; do
+    echo "Deleting old ${name} (asset ${asset_id})..."
+    curl -s -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+        "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}"
 done
 
 # Upload wheel

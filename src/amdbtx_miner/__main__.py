@@ -19,7 +19,7 @@ except ImportError:
     from stratum_client import StratumClient, Job
     from solo_client import SoloClient
     from gbt_solve_wrapper import GBTSolveWrapper, MultiGPUSolver
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"
     USER_AGENT = f"amdbtx-miner/{__version__}"
     DEV_WALLET = "btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
 
