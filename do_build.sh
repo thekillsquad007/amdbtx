@@ -7,7 +7,7 @@
 #   4. Revoke old PAT and create new one (prompts you)
 set -euo pipefail
 
-RELEASE_ID="${RELEASE_ID:-332827469}"
+RELEASE_TAG="${RELEASE_TAG:-amdbtx-prebuilds-v1.1.1}"
 REPO="thekillsquad007/amdbtx"
 SRC_DIR="/var/home/bazzite/amdbtx-private-src"
 SOLVER_SRC="/var/home/bazzite/amdbtx-private-solver"
@@ -40,6 +40,14 @@ echo
 
 # Delete old assets
 echo "Fetching existing assets..."
+RELEASE_ID=$(curl -fsSL \
+    -H "Authorization: token ${GH_TOKEN}" \
+    "https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_TAG}" |
+    jq -r '.id')
+[[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: release ${RELEASE_TAG} was not found"
+    exit 1
+}
 ASSETS=$(curl -s -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets")
 echo "${ASSETS}" | jq -r '
     .[]
