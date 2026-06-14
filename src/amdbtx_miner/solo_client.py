@@ -118,8 +118,7 @@ class SoloClient:
         log.info("solo: payout script resolved for %s...", self.payout_address[:12])
         return self._payout_script
 
-    @staticmethod
-    def _job_from_template(gbt: dict[str, Any], challenge: dict[str, Any]) -> Job:
+    def _job_from_template(self, gbt: dict[str, Any], challenge: dict[str, Any]) -> Job:
         hc = challenge.get("header_context") or {}
         matmul = gbt.get("matmul") or {}
         wp = challenge.get("work_profile") or {}
@@ -132,6 +131,26 @@ class SoloClient:
         height = int(gbt.get("height", hc.get("height", 0)))
         prev_hash = hc.get("previousblockhash") or gbt.get("previousblockhash", "")
         job_id = f"solo-{height}-{prev_hash[:16]}"
+        parent_mtp = next(
+            (
+                value for value in (
+                    hc.get("parent_mtp"),
+                    matmul.get("parent_mtp"),
+                    challenge.get("parent_mtp"),
+                    gbt.get("parent_mtp"),
+                )
+                if value is not None
+            ),
+            None,
+        )
+        if height >= 130500 and parent_mtp is None:
+            parent_header = self.rpc.call("getblockheader", [prev_hash, True], timeout=30.0)
+            parent_mtp = parent_header.get("mediantime")
+            if parent_mtp is None:
+                raise RuntimeError(
+                    "BTX V3 requires parent median-time-past, but getblockheader "
+                    "did not return mediantime"
+                )
 
         return Job(
             job_id=job_id,
@@ -148,6 +167,7 @@ class SoloClient:
             matmul_b=int(matmul.get("b", gbt.get("matmul_b", 16))),
             matmul_r=int(matmul.get("r", gbt.get("matmul_r", 8))),
             epsilon_bits=epsilon,
+            parent_mtp=int(parent_mtp) if parent_mtp is not None else None,
             nonce64_start=0,
             clean_jobs=False,
             received_at=time.time(),

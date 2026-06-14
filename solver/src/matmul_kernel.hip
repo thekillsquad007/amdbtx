@@ -37,6 +37,7 @@ struct HipJobParams {
     uint32_t r;
     uint32_t epsilon_bits;
     uint32_t block_height;
+    int64_t parent_mtp;
     uint8_t prev_hash[32];
     uint8_t merkle_root[32];
     uint8_t seed_a[32];
@@ -620,17 +621,23 @@ __device__ __forceinline__ void d_append_le64(uint8_t* message, uint32_t& offset
     }
 }
 
-__device__ uint32_t d_build_matmul_seed_v2_message(
+__device__ uint32_t d_build_matmul_seed_message(
     const HipJobParams& job,
     uint64_t nonce64,
     uint8_t which,
-    uint8_t message[110])
+    uint8_t message[128])
 {
     uint32_t offset = 0;
-    static const char kTag[] = "BTX_MATMUL_SEED_V2";
+    static const char kTagV2[] = "BTX_MATMUL_SEED_V2";
+    static const char kTagV3[] = "BTX_MATMUL_SEED_V3";
+    const bool use_v3 = job.block_height >= 130500U;
+    const char* tag = use_v3 ? kTagV3 : kTagV2;
     d_append_byte(message, offset, 18U);
-    d_append_bytes(message, offset, reinterpret_cast<const uint8_t*>(kTag), 18U);
+    d_append_bytes(message, offset, reinterpret_cast<const uint8_t*>(tag), 18U);
     d_append_bytes(message, offset, job.prev_hash, 32U);
+    if (use_v3) {
+        d_append_le64(message, offset, static_cast<uint64_t>(job.parent_mtp));
+    }
     d_append_le32(message, offset, job.block_height);
     d_append_le32(message, offset, static_cast<uint32_t>(job.version));
     d_append_bytes(message, offset, job.merkle_root, 32U);
@@ -662,15 +669,15 @@ __device__ uint32_t d_build_matmul_header_message(
     return offset;
 }
 
-__device__ void d_matmul_seed_v2_fast(
+__device__ void d_matmul_seed_fast(
     const uint32_t seed_midstate[8],
     const HipJobParams& job,
     uint64_t nonce64,
     uint8_t which,
     uint8_t out_internal[32])
 {
-    uint8_t message[110];
-    const uint32_t len = d_build_matmul_seed_v2_message(job, nonce64, which, message);
+    uint8_t message[128];
+    const uint32_t len = d_build_matmul_seed_message(job, nonce64, which, message);
     d_sha256_bytes_from_midstate(seed_midstate, message, len, out_internal);
 }
 
@@ -695,7 +702,7 @@ __device__ void d_init_scan_midstates(
     uint32_t header_midstate[8])
 {
     uint8_t prefix[150];
-    d_build_matmul_seed_v2_message(job, 0U, 0U, prefix);
+    d_build_matmul_seed_message(job, 0U, 0U, prefix);
     d_sha256_block0_midstate(prefix, seed_midstate);
     d_build_matmul_header_message(job, 0U, job.prev_hash, job.prev_hash, prefix);
     d_sha256_block0_midstate(prefix, header_midstate);
@@ -1370,8 +1377,8 @@ __device__ bool d_solve_nonce(
                 s_seed_b[i] = reuse_seed_b[i];
             }
         } else if (use_v2) {
-            d_matmul_seed_v2_fast(s_scan_seed_midstate, job, nonce64, 0, s_seed_a);
-            d_matmul_seed_v2_fast(s_scan_seed_midstate, job, nonce64, 1, s_seed_b);
+            d_matmul_seed_fast(s_scan_seed_midstate, job, nonce64, 0, s_seed_a);
+            d_matmul_seed_fast(s_scan_seed_midstate, job, nonce64, 1, s_seed_b);
         } else {
             for (int i = 0; i < 32; ++i) {
                 s_seed_a[i] = job.seed_a[i];
@@ -1583,8 +1590,8 @@ __global__ void matmul_nonce_kernel(
 
     if (use_v2 && threadIdx.x == 0) {
         d_init_scan_midstates(params, s_scan_seed_midstate, s_scan_header_midstate);
-        d_matmul_seed_v2_fast(s_scan_seed_midstate, params, nonces[idx], 0, s_v2_seed_a);
-        d_matmul_seed_v2_fast(s_scan_seed_midstate, params, nonces[idx], 1, s_v2_seed_b);
+        d_matmul_seed_fast(s_scan_seed_midstate, params, nonces[idx], 0, s_v2_seed_a);
+        d_matmul_seed_fast(s_scan_seed_midstate, params, nonces[idx], 1, s_v2_seed_b);
     }
     __syncthreads();
 
@@ -1642,8 +1649,8 @@ __global__ void sigma_gate_kernel(
     const uint64_t nonce = nonce_start + idx;
 
     if (params.block_height >= 125000) {
-        d_matmul_seed_v2_fast(seed_midstate, params, nonce, 0, seed_a);
-        d_matmul_seed_v2_fast(seed_midstate, params, nonce, 1, seed_b);
+        d_matmul_seed_fast(seed_midstate, params, nonce, 0, seed_a);
+        d_matmul_seed_fast(seed_midstate, params, nonce, 1, seed_b);
         d_derive_sigma_fast(
             header_midstate, params, nonce, seed_a, seed_b, sigma);
     } else {
@@ -2198,6 +2205,7 @@ HipJobParams MakeHipJobParams(const FusedMatMulJob& job)
     p.r = job.r;
     p.epsilon_bits = job.epsilon_bits;
     p.block_height = static_cast<uint32_t>(job.state.height);
+    p.parent_mtp = job.state.parent_mtp;
     std::memcpy(p.prev_hash, job.state.previous_block_hash.data, 32);
     std::memcpy(p.merkle_root, job.state.merkle_root.data, 32);
     std::memcpy(p.seed_a, job.state.seed_a.data, 32);

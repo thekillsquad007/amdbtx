@@ -182,6 +182,8 @@ class GBTSolveWrapper:
                 "max_results": 64,
                 "share_target": share_target,
             }
+            if job.parent_mtp is not None:
+                payload["parent_mtp"] = job.parent_mtp
         elif isinstance(job, dict):
             share_target = job.get("target", job.get("share_target", "ff" * 64))
             payload = {
@@ -203,6 +205,8 @@ class GBTSolveWrapper:
                 "max_results": int(job.get("max_results", 64)),
                 "share_target": share_target,
             }
+            if job.get("parent_mtp") is not None:
+                payload["parent_mtp"] = int(job["parent_mtp"])
         else:
             return {"found": False, "error": f"unsupported job type: {type(job)}"}
 

@@ -422,6 +422,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 matmul_b=current_job.matmul_b,
                 matmul_r=current_job.matmul_r,
                 epsilon_bits=current_job.epsilon_bits,
+                parent_mtp=current_job.parent_mtp,
                 nonce64_start=current_job.nonce64_start,
                 clean_jobs=current_job.clean_jobs,
                 received_at=current_job.received_at,

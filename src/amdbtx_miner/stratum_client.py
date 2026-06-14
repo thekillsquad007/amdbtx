@@ -27,16 +27,17 @@ class Job:
         "job_id", "version", "prev_hash", "merkle_root", "time",
         "bits", "target", "seed_a", "seed_b", "block_height",
         "matmul_n", "matmul_b", "matmul_r", "epsilon_bits",
-        "nonce64_start", "clean_jobs", "received_at",
+        "parent_mtp", "nonce64_start", "clean_jobs", "received_at",
     )
 
     def __init__(self, **kwargs):
         for s in self.__slots__:
-            default = 0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start") else (
-                "0" * 64 if s in ("prev_hash", "merkle_root", "seed_a", "seed_b", "target") else (
-                    "1d17c609" if s == "bits" else (
-                        False if s == "clean_jobs" else (
-                            time.time() if s == "received_at" else ""))))
+            default = None if s == "parent_mtp" else (
+                0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start") else (
+                    "0" * 64 if s in ("prev_hash", "merkle_root", "seed_a", "seed_b", "target") else (
+                        "1d17c609" if s == "bits" else (
+                            False if s == "clean_jobs" else (
+                                time.time() if s == "received_at" else "")))))
             setattr(self, s, kwargs.get(s, default))
 
     @classmethod
@@ -59,6 +60,10 @@ class Job:
                 matmul_b=int(matmul.get("matmul_b", 16)),
                 matmul_r=int(matmul.get("matmul_r", 8)),
                 epsilon_bits=int(matmul.get("epsilon_bits", 18)),
+                parent_mtp=(
+                    int(matmul["parent_mtp"])
+                    if matmul.get("parent_mtp") is not None else None
+                ),
                 nonce64_start=int(matmul.get("nonce64_start", 0)),
             )
         if isinstance(params, dict):
@@ -80,6 +85,10 @@ class Job:
                 matmul_b=int(params.get("matmul_b", 16)),
                 matmul_r=int(params.get("matmul_r", 8)),
                 epsilon_bits=int(params.get("epsilon_bits", 18)),
+                parent_mtp=(
+                    int(params["parent_mtp"])
+                    if params.get("parent_mtp") is not None else None
+                ),
                 nonce64_start=int(params.get("nonce64_start", 0)),
             )
         raise ValueError(f"cannot parse notify params: type={type(params)}")
@@ -104,6 +113,7 @@ class Job:
         self.matmul_b = other.matmul_b
         self.matmul_r = other.matmul_r
         self.epsilon_bits = other.epsilon_bits
+        self.parent_mtp = other.parent_mtp
         self.clean_jobs = other.clean_jobs
         self.received_at = other.received_at
         self.nonce64_start = saved_nonce

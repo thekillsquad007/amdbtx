@@ -19,6 +19,8 @@ struct PowState {
     uint64_t nonce;
     uint16_t matmul_dim;
     int32_t height;
+    int64_t parent_mtp;
+    bool has_parent_mtp;
     Uint256 digest;
 };
 
@@ -37,7 +39,18 @@ Uint256 DeterministicMatMulSeedV2(
     uint64_t nonce64, uint16_t matmul_dim,
     uint8_t which);
 
+// BTX v0.32.10 DeterministicMatMulSeedV3 (height >= 130500).
+Uint256 DeterministicMatMulSeedV3(
+    const Uint256& prev_hash, int64_t parent_mtp, int32_t height,
+    int32_t version, const Uint256& merkle_root,
+    uint32_t time, uint32_t bits,
+    uint64_t nonce64, uint16_t matmul_dim,
+    uint8_t which);
+
 bool ComputeDigestForNonce(PowState& state, uint32_t n, uint32_t b, uint32_t r, Uint256& out_digest);
+bool ComputeProductPayloadForNonce(
+    PowState& state, uint32_t n, uint32_t b, uint32_t r,
+    std::vector<field::Element>& out_product);
 
 // Compare GPU-compressed words against CPU reference for one gated nonce.
 uint32_t CountCompressedWordDiffs(

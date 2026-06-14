@@ -75,6 +75,12 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     if (solutions) {
         solutions->clear();
     }
+    if (state.height >= 130500 && !state.has_parent_mtp) {
+        std::fprintf(stderr, "parent_mtp is required at block_height >= 130500\n");
+        tries_used = 0;
+        elapsed_s = 0;
+        return false;
+    }
     if (max_solutions == 0) {
         max_solutions = UINT32_MAX;
     }

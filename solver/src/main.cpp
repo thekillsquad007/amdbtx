@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--batch-size" && i+1 < argc) config.batch_size = std::stoul(argv[++i]);
         else if (arg == "--share-target") { if (i+1 < argc) ++i; }
         else if (arg == "--version") {
-            std::cerr << "btx-gbt-solve-hip 2.0.0" << std::endl;
+            std::cerr << "btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)" << std::endl;
             return 0;
         } else if (arg == "--help") {
             std::cerr << "Usage: " << argv[0] << " --daemon [--matmul-n N] [--matmul-b B] [--matmul-r R] "
@@ -178,11 +178,35 @@ int main(int argc, char* argv[]) {
 
         std::string bh_str = extract_json_number(line, "block_height");
         state.height = bh_str.empty() ? 0 : std::stoi(bh_str);
+        std::string parent_mtp_str = extract_json_number(line, "parent_mtp");
+        state.has_parent_mtp = !parent_mtp_str.empty();
+        if (state.has_parent_mtp) {
+            state.parent_mtp = std::stoll(parent_mtp_str);
+        }
         state.nonce = nonce_start;
 
         std::string eb_str = extract_json_number(line, "epsilon_bits");
         uint32_t job_epsilon_bits = config.epsilon_bits;
         if (!eb_str.empty()) job_epsilon_bits = static_cast<uint32_t>(std::stoul(eb_str));
+        const bool include_product_payload =
+            extract_json_number(line, "include_product_payload") == "1";
+
+        if (state.height >= 130500 && !state.has_parent_mtp) {
+            std::cout
+                << "{\"found\":false,\"error\":\"parent_mtp is required at block_height >= 130500\","
+                << "\"backend\":\"" << config.backend << "\"}" << std::endl;
+            continue;
+        }
+        if (extract_json_number(line, "emit_seeds") == "1") {
+            PrepareNonceSeeds(state);
+            std::cout
+                << "{\"ok\":true,\"block_height\":" << state.height
+                << ",\"nonce64\":" << state.nonce
+                << ",\"seed_a\":\"" << Uint256ToHex(state.seed_a)
+                << "\",\"seed_b\":\"" << Uint256ToHex(state.seed_b)
+                << "\"}" << std::endl;
+            continue;
+        }
 
         Uint256 block_target = DeriveBlockTarget(state.bits);
 
@@ -214,6 +238,11 @@ int main(int argc, char* argv[]) {
         }
 
         bool is_block = found && Uint256LE(state.digest, block_target);
+        std::vector<field::Element> product_payload;
+        if (is_block && include_product_payload) {
+            ComputeProductPayloadForNonce(
+                state, job_n, job_b, job_r, product_payload);
+        }
         uint64_t nonce64_end = backend_used == "hip"
             ? scanned_nonce_end
             : (found ? state.nonce
@@ -227,6 +256,14 @@ int main(int argc, char* argv[]) {
             std::cout << "\"digest\":\"" << Uint256ToHex(state.digest) << "\",";
             std::cout << "\"ntime\":" << state.time << ",";
             std::cout << "\"is_block\":" << (is_block ? "true" : "false") << ",";
+            if (!product_payload.empty()) {
+                std::cout << "\"matrix_c\":[";
+                for (size_t i = 0; i < product_payload.size(); ++i) {
+                    if (i != 0) std::cout << ",";
+                    std::cout << product_payload[i];
+                }
+                std::cout << "],";
+            }
         }
         std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(2) << elapsed_s << ",";
         std::cout << "\"tries_used\":" << tries_used << ",";

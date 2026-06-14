@@ -75,8 +75,49 @@ def derive_v2_seed(
     return hashlib.sha256(buf).digest()
 
 
+def derive_v3_seed(
+    prev_hash: str,
+    parent_mtp: int,
+    height: int,
+    version: int,
+    merkle_root: str,
+    time: int,
+    bits_hex: str,
+    nonce64: int,
+    dim: int,
+    which: int,
+) -> bytes:
+    tag = b"BTX_MATMUL_SEED_V3"
+    buf = bytearray()
+    buf.append(len(tag))
+    buf += tag
+    buf += hex_to_uint256_le(prev_hash)
+    buf += struct.pack("<q", parent_mtp)
+    buf += struct.pack("<I", height)
+    buf += struct.pack("<i", version)
+    buf += hex_to_uint256_le(merkle_root)
+    buf += struct.pack("<I", time)
+    buf += struct.pack("<I", int(bits_hex, 16))
+    buf += struct.pack("<Q", nonce64)
+    buf += struct.pack("<H", dim)
+    buf.append(which)
+    return hashlib.sha256(buf).digest()
+
+
 def resolve_header_seeds(job, nonce64: int) -> tuple[bytes, bytes]:
     dim = job.matmul_n or 512
+    if job.block_height >= 130500:
+        if job.parent_mtp is None:
+            raise ValueError("parent_mtp is required at block height >= 130500")
+        seed_a = derive_v3_seed(
+            job.prev_hash, job.parent_mtp, job.block_height, job.version,
+            job.merkle_root, job.time, job.bits, nonce64, dim, 0,
+        )
+        seed_b = derive_v3_seed(
+            job.prev_hash, job.parent_mtp, job.block_height, job.version,
+            job.merkle_root, job.time, job.bits, nonce64, dim, 1,
+        )
+        return seed_a, seed_b
     if job.block_height >= 125000:
         seed_a = derive_v2_seed(
             job.prev_hash, job.block_height, job.version, job.merkle_root,

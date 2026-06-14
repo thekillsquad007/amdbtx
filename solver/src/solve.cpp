@@ -64,6 +64,41 @@ Uint256 DeterministicMatMulSeedV2(
     return BytesToUint256(digest);
 }
 
+Uint256 DeterministicMatMulSeedV3(
+    const Uint256& prev_hash, int64_t parent_mtp, int32_t height,
+    int32_t version, const Uint256& merkle_root,
+    uint32_t time, uint32_t bits,
+    uint64_t nonce64, uint16_t matmul_dim,
+    uint8_t which)
+{
+    CSHA256 hasher;
+    const std::string tag = "BTX_MATMUL_SEED_V3";
+    WriteCompactSize(hasher, tag.size());
+    hasher.Write(reinterpret_cast<const uint8_t*>(tag.data()), tag.size());
+    hasher.Write(prev_hash.data, 32);
+    uint8_t value_le[8];
+    WriteLE64(value_le, static_cast<uint64_t>(parent_mtp));
+    hasher.Write(value_le, 8);
+    WriteLE32(value_le, static_cast<uint32_t>(height));
+    hasher.Write(value_le, 4);
+    WriteLE32(value_le, static_cast<uint32_t>(version));
+    hasher.Write(value_le, 4);
+    hasher.Write(merkle_root.data, 32);
+    WriteLE32(value_le, time);
+    hasher.Write(value_le, 4);
+    WriteLE32(value_le, bits);
+    hasher.Write(value_le, 4);
+    WriteLE64(value_le, nonce64);
+    hasher.Write(value_le, 8);
+    uint8_t dim_le[2];
+    WriteLE16(dim_le, matmul_dim);
+    hasher.Write(dim_le, 2);
+    hasher.Write(&which, 1);
+    uint8_t digest[32];
+    hasher.Finalize(digest);
+    return BytesToUint256(digest);
+}
+
 void Uint256ToMsbBytes(const Uint256& v, uint8_t out[32]) {
     for (int i = 0; i < 32; ++i)
         out[i] = v.data[31 - i];
@@ -208,7 +243,23 @@ std::string Uint256ToHex(const Uint256& v) {
 }
 
 void PrepareNonceSeeds(PowState& state) {
-    if (state.height >= 125000) {
+    if (state.height >= 130500) {
+        if (!state.has_parent_mtp) {
+            state.seed_a = Uint256{};
+            state.seed_b = Uint256{};
+            return;
+        }
+        state.seed_a = DeterministicMatMulSeedV3(
+            state.previous_block_hash, state.parent_mtp, state.height,
+            state.version, state.merkle_root,
+            state.time, state.bits,
+            state.nonce, state.matmul_dim, 0);
+        state.seed_b = DeterministicMatMulSeedV3(
+            state.previous_block_hash, state.parent_mtp, state.height,
+            state.version, state.merkle_root,
+            state.time, state.bits,
+            state.nonce, state.matmul_dim, 1);
+    } else if (state.height >= 125000) {
         state.seed_a = DeterministicMatMulSeedV2(
             state.previous_block_hash, state.height,
             state.version, state.merkle_root,
@@ -282,6 +333,18 @@ bool ComputeDigestForNonce(PowState& state, uint32_t n, uint32_t b, uint32_t r, 
     return true;
 }
 
+bool ComputeProductPayloadForNonce(
+    PowState& state, uint32_t n, uint32_t b, uint32_t r,
+    std::vector<field::Element>& out_product)
+{
+    Matrix a_prime(n, n), b_prime(n, n);
+    Uint256 sigma;
+    BuildPerturbedMatrices(state, n, b, r, a_prime, b_prime, sigma);
+    const Matrix product = a_prime * b_prime;
+    out_product.assign(product.data(), product.data() + product.size());
+    return true;
+}
+
 bool SolveCPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
                const Uint256& block_target, const Uint256& share_target,
                uint64_t& max_tries, double max_seconds,
@@ -290,8 +353,13 @@ bool SolveCPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
 {
     auto t0 = std::chrono::steady_clock::now();
     tries_used = 0;
-    const bool use_v2 = (state.height >= 125000);
+    const bool use_nonce_seeds = (state.height >= 125000);
     const Uint256 pre_hash_target = DerivePreHashTarget(block_target, epsilon_bits);
+
+    if (state.height >= 130500 && !state.has_parent_mtp) {
+        elapsed_s = 0;
+        return false;
+    }
 
     while (max_tries > 0) {
         auto now = std::chrono::steady_clock::now();
@@ -301,19 +369,10 @@ bool SolveCPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             return false;
         }
 
+        if (use_nonce_seeds) {
+            PrepareNonceSeeds(state);
+        }
         if (epsilon_bits > 0) {
-            if (use_v2) {
-                state.seed_a = DeterministicMatMulSeedV2(
-                    state.previous_block_hash, state.height,
-                    state.version, state.merkle_root,
-                    state.time, state.bits,
-                    state.nonce, state.matmul_dim, 0);
-                state.seed_b = DeterministicMatMulSeedV2(
-                    state.previous_block_hash, state.height,
-                    state.version, state.merkle_root,
-                    state.time, state.bits,
-                    state.nonce, state.matmul_dim, 1);
-            }
             const Uint256 sigma = DeriveSigma(state);
             if (!SigmaLE(sigma, pre_hash_target)) {
                 --max_tries;
