@@ -26,6 +26,12 @@ fi
 # ─── Configurables ──────────────────────────────────────────────────────────
 SOURCE_REF="${AMDBTX_SOURCE_REF:-main}"
 SOURCE_REPO="thekillsquad007/amdbtx"
+PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.0}"
+PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${SOURCE_REPO}/releases/download/${PREBUILDS_TAG}}"
+WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.1-py3-none-any.whl}"
+EXPECTED_MINER_VERSION="1.1.1"
+EXPECTED_WHEEL_SHA256="78fa4dd25291a5216a2879f539fa0d3d13ff2e1008d407f7032a1d4119c7c4b2"
+EXPECTED_SOLVER_VERSION="2.1.0"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
@@ -422,8 +428,24 @@ tar xzf "$TMP_BUILD_DIR/repo.tar.gz" -C "$REPO_SRC_DIR" --strip-components=1
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
-    log "installing wrapper from the same source snapshot..."
-    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$REPO_SRC_DIR"
+    WHEEL_PATH="${TMP_BUILD_DIR}/${WHEEL_FILENAME}"
+    WHEEL_URL="${PREBUILDS_BASE}/${WHEEL_FILENAME}"
+    log "downloading amdbtx-miner ${EXPECTED_MINER_VERSION} wheel..."
+    curl -fsSL "$WHEEL_URL" -o "$WHEEL_PATH" 2>/dev/null || \
+        err "failed to download Python wheel from ${WHEEL_URL}"
+    WHEEL_SHA256="$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"
+    [[ "$WHEEL_SHA256" == "$EXPECTED_WHEEL_SHA256" ]] || \
+        err "wheel checksum mismatch: got ${WHEEL_SHA256}"
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$WHEEL_PATH"
+    INSTALLED_MINER_VERSION="$(
+        "$VENV_DIR/bin/python" -c 'import amdbtx_miner; print(amdbtx_miner.__version__)'
+    )"
+    [[ "$INSTALLED_MINER_VERSION" == "$EXPECTED_MINER_VERSION" ]] || \
+        err "installed miner version ${INSTALLED_MINER_VERSION}, expected ${EXPECTED_MINER_VERSION}"
+    "$VENV_DIR/bin/python" -c '
+import amdbtx_miner
+assert "matmul_parent_mtp_seed_v3" in amdbtx_miner.PROTOCOL_CAPABILITIES
+' || err "installed wheel does not advertise BTX V3 parent-MTP support"
     mkdir -p "$(dirname "$LAUNCHER_PATH")"
     cat > "$LAUNCHER_PATH" <<EOF
 #!/usr/bin/env bash
@@ -479,14 +501,21 @@ else
 fi
 
 log "solver installed → $SOLVER_PATH"
+SOLVER_VERSION_OUTPUT="$("$SOLVER_PATH" --version 2>&1 || true)"
+[[ "$SOLVER_VERSION_OUTPUT" == *"$EXPECTED_SOLVER_VERSION"* ]] || \
+    err "solver is not fork-ready: ${SOLVER_VERSION_OUTPUT:-version unavailable}"
 SOLVER_SHA256="$(sha256sum "$SOLVER_PATH" | awk '{print $1}')"
 cat > "${INSTALL_DIR}/install-source.txt" <<EOF
 source_ref=${SOURCE_REF}
 source_commit=${RESOLVED_SOURCE_REF}
 source_archive_sha256=${SOURCE_ARCHIVE_SHA256}
+wheel_filename=${WHEEL_FILENAME}
+wheel_sha256=${WHEEL_SHA256:-skipped}
 solver_sha256=${SOLVER_SHA256}
+solver_version=${SOLVER_VERSION_OUTPUT}
 EOF
 log "source commit: ${RESOLVED_SOURCE_REF}"
+log "miner version: ${INSTALLED_MINER_VERSION:-skipped}"
 log "solver sha256: ${SOLVER_SHA256}"
 
 # ─── Build solver runtime (library resolver) ──────────────────────────────

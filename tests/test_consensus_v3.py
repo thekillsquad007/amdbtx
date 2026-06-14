@@ -6,6 +6,7 @@ from amdbtx_miner.block_builder import (
     resolve_header_seeds,
     uint256_to_display_hex,
 )
+from amdbtx_miner.gbt_solve_wrapper import GBTSolveWrapper
 from amdbtx_miner.stratum_client import Job
 
 
@@ -116,6 +117,18 @@ class ConsensusV3Tests(unittest.TestCase):
         self.assertEqual(first.parent_mtp, 1_780_000_000)
         first.merge_from(second)
         self.assertIsNone(first.parent_mtp)
+
+    def test_solver_version_gate(self):
+        self.assertFalse(
+            GBTSolveWrapper._supports_parent_mtp_v3(
+                "btx-gbt-solve-hip 2.0.0"
+            )
+        )
+        self.assertTrue(
+            GBTSolveWrapper._supports_parent_mtp_v3(
+                "btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)"
+            )
+        )
 
 
 if __name__ == "__main__":

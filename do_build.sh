@@ -22,7 +22,9 @@ echo "Wheel: ${WHEEL_PATH}"
 
 # ── 2. Solver binary (via distrobox) ───────────────────────────────
 echo "=== Step 2: Build HIP solver in distrobox ==="
-distrobox enter "${DISTROBOX}" -- bash /var/home/bazzite/amdbtx/build_solver.sh
+AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1100 gfx1101}"
+distrobox enter "${DISTROBOX}" -- env AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS}" \
+    bash /var/home/bazzite/amdbtx/build_solver.sh
 SOLVER_BINARY="${SOLVER_SRC}/build/btx-gbt-solve-hip"
 if [ ! -f "${SOLVER_BINARY}" ]; then
     echo "ERROR: solver binary not found at ${SOLVER_BINARY}"

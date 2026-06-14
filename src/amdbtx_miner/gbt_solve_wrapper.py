@@ -1,6 +1,7 @@
 import subprocess
 import json
 import os
+import re
 import time
 import logging
 import threading
@@ -28,9 +29,38 @@ class GBTSolveWrapper:
         self.runtime_ld_path = runtime_ld_path
         self.proc: subprocess.Popen | None = None
         self.last_observed_nps = None
+        self.solver_version = self._probe_solver_version()
+        self.supports_parent_mtp_v3 = self._supports_parent_mtp_v3(
+            self.solver_version
+        )
+        self._compat_error_logged = False
         self._stderr_thread: threading.Thread | None = None
         self._ready_event = threading.Event()
         self._start(allow_cpu_fallback=True)
+
+    def _probe_solver_version(self) -> str:
+        if not self.solver_path.exists():
+            return ""
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = self._build_ld_path()
+        try:
+            result = subprocess.run(
+                [str(self.solver_path), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return (result.stdout or result.stderr).strip()
+
+    @staticmethod
+    def _supports_parent_mtp_v3(version_output: str) -> bool:
+        if "parent-MTP" in version_output:
+            return True
+        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version_output)
+        return bool(match and tuple(map(int, match.groups())) >= (2, 1, 0))
 
     def _build_ld_path(self) -> str:
         parts = []
@@ -154,10 +184,29 @@ class GBTSolveWrapper:
 
     def solve(self, job, nonce_start: int = 0, max_tries: int = 20_000_000,
               max_seconds: float = 5.0) -> dict:
+        from .stratum_client import Job
+
+        block_height = (
+            job.block_height if isinstance(job, Job)
+            else int(job.get("block_height", 0)) if isinstance(job, dict)
+            else 0
+        )
+        if block_height >= 130500 and not self.supports_parent_mtp_v3:
+            error = (
+                "solver is not BTX V3 compatible; install "
+                "btx-gbt-solve-hip 2.1.0 or newer"
+            )
+            if not self._compat_error_logged:
+                log.error(
+                    "%s (reported version: %s)",
+                    error,
+                    self.solver_version or "unknown",
+                )
+                self._compat_error_logged = True
+            return {"found": False, "error": error}
+
         if not self._ensure_running():
             return {"found": False, "error": "solver not running"}
-
-        from .stratum_client import Job
 
         if isinstance(job, Job):
             # Pool must supply params[6]; hard fallback avoids false share hits.
