@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 from amdbtx_miner.block_builder import (
     derive_v2_seed,
@@ -8,6 +9,7 @@ from amdbtx_miner.block_builder import (
 )
 from amdbtx_miner.gbt_solve_wrapper import GBTSolveWrapper
 from amdbtx_miner.stratum_client import Job
+from amdbtx_miner.stratum_client import StratumClient
 
 
 HEADER = {
@@ -129,6 +131,35 @@ class ConsensusV3Tests(unittest.TestCase):
                 "btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)"
             )
         )
+
+    def test_share_dedupe_spans_rotated_job_ids(self):
+        client = StratumClient.__new__(StratumClient)
+        client._submit_worker = "address.worker"
+        client.worker_name = "address.worker"
+        client.payout_address = "address"
+        client._extranonce2_size = 4
+        client._pending_submits = {}
+        client._submitted_share_keys = set()
+        client._submitted_share_order = __import__("collections").deque()
+        client._next_id = Mock(side_effect=[1, 2])
+        client._send = Mock()
+
+        first = Job(
+            job_id="job.b",
+            prev_hash="ab" * 32,
+            time=1_781_441_921,
+        )
+        rotated = Job(
+            job_id="job.c",
+            prev_hash=first.prev_hash,
+            time=first.time,
+        )
+        result = {"nonce64": 1234, "digest": "00" * 32}
+
+        client.submit_share(first, result)
+        client.submit_share(rotated, result)
+
+        self.assertEqual(client._send.call_count, 1)
 
 
 if __name__ == "__main__":

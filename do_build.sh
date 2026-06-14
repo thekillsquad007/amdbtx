@@ -7,7 +7,7 @@
 #   4. Revoke old PAT and create new one (prompts you)
 set -euo pipefail
 
-RELEASE_TAG="${RELEASE_TAG:-amdbtx-prebuilds-v1.1.1}"
+RELEASE_TAG="${RELEASE_TAG:-amdbtx-prebuilds-v1.1.2}"
 REPO="thekillsquad007/amdbtx"
 SRC_DIR="/var/home/bazzite/amdbtx-private-src"
 SOLVER_SRC="/var/home/bazzite/amdbtx-private-solver"

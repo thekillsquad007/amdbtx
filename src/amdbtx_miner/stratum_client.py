@@ -5,6 +5,7 @@ import uuid
 import logging
 import random
 import threading
+from collections import deque
 from typing import Any
 
 from . import PROTOCOL_CAPABILITIES, USER_AGENT, __version__
@@ -141,6 +142,8 @@ class StratumClient:
         self.shares_rejected = 0
         self.blocks_found = 0
         self._pending_submits: dict[int, dict[str, Any]] = {}
+        self._submitted_share_keys: set[tuple[str, int, int]] = set()
+        self._submitted_share_order: deque[tuple[str, int, int]] = deque()
         self._current_job: Job | None = None
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
@@ -469,9 +472,23 @@ class StratumClient:
 
     def submit_share(self, job: Job, result: dict, *, wait: bool = False):
         worker = self._submit_worker or self.worker_name or self.payout_address
-        nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
+        nonce64 = int(result["nonce64"]) if "nonce64" in result else 0
+        nonce_hex = f"{nonce64:016x}" if "nonce64" in result else ""
         ntime_val = int(result.get("ntime") or job.time)
         ntime = f"{ntime_val:08x}"
+        share_key = (job.prev_hash, ntime_val, nonce64)
+        if share_key in self._submitted_share_keys:
+            log.warning(
+                "duplicate share suppressed locally job=%s nonce=%s",
+                job.job_id, nonce_hex,
+            )
+            return
+        self._submitted_share_keys.add(share_key)
+        self._submitted_share_order.append(share_key)
+        while len(self._submitted_share_order) > 65536:
+            expired = self._submitted_share_order.popleft()
+            self._submitted_share_keys.discard(expired)
+
         extranonce2 = "00" * self._extranonce2_size
         params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
         log.info(

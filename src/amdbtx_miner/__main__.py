@@ -19,7 +19,7 @@ except ImportError:
     from stratum_client import StratumClient, Job
     from solo_client import SoloClient
     from gbt_solve_wrapper import GBTSolveWrapper, MultiGPUSolver
-    __version__ = "1.1.1"
+    __version__ = "1.1.2"
     USER_AGENT = f"amdbtx-miner/{__version__}"
     DEV_WALLET = "btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
 
@@ -513,6 +513,11 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 new_job = client._current_job
                 client._current_job = None
                 if current_job.should_replace(new_job):
+                    if current_job.prev_hash == new_job.prev_hash:
+                        new_job.nonce64_start = max(
+                            new_job.nonce64_start,
+                            int(result.get("nonce64_end", solve_job.nonce64_start)) + 1,
+                        )
                     log.info(
                         "job replaced: %s -> %s (clean=%s height=%d)",
                         current_job.job_id, new_job.job_id, new_job.clean_jobs,
@@ -531,6 +536,11 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 new_job = client._current_job
                 client._current_job = None
                 if current_job.should_replace(new_job):
+                    if current_job.prev_hash == new_job.prev_hash:
+                        new_job.nonce64_start = max(
+                            new_job.nonce64_start,
+                            int(result.get("nonce64_end", solve_job.nonce64_start)) + 1,
+                        )
                     log.info(
                         "new job: %s (clean=%s height=%d)",
                         new_job.job_id, new_job.clean_jobs, new_job.block_height,

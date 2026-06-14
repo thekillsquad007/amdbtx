@@ -26,11 +26,11 @@ fi
 # ─── Configurables ──────────────────────────────────────────────────────────
 SOURCE_REF="${AMDBTX_SOURCE_REF:-main}"
 SOURCE_REPO="thekillsquad007/amdbtx"
-PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.1.1}"
+PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.1.2}"
 PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${SOURCE_REPO}/releases/download/${PREBUILDS_TAG}}"
-WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.1-py3-none-any.whl}"
-EXPECTED_MINER_VERSION="1.1.1"
-EXPECTED_WHEEL_SHA256="78fa4dd25291a5216a2879f539fa0d3d13ff2e1008d407f7032a1d4119c7c4b2"
+WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.2-py3-none-any.whl}"
+EXPECTED_MINER_VERSION="1.1.2"
+EXPECTED_WHEEL_SHA256="3523877a6436e38223fac51c6844853fb0d6bb0a11e02fd31ab0de74cdf562e0"
 EXPECTED_SOLVER_VERSION="2.1.0"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
 
