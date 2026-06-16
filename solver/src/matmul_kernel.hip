@@ -8,6 +8,7 @@
 #include "matmul_kernel.h"
 #include "matrix.h"
 #include "field.h"
+#include "gpu_sha256.h"
 #include "uint256.h"
 
 
@@ -36,6 +37,7 @@ struct HipJobParams {
     uint32_t r;
     uint32_t epsilon_bits;
     uint32_t block_height;
+    int64_t parent_mtp;
     uint8_t prev_hash[32];
     uint8_t merkle_root[32];
     uint8_t seed_a[32];
@@ -619,17 +621,23 @@ __device__ __forceinline__ void d_append_le64(uint8_t* message, uint32_t& offset
     }
 }
 
-__device__ uint32_t d_build_matmul_seed_v2_message(
+__device__ uint32_t d_build_matmul_seed_message(
     const HipJobParams& job,
     uint64_t nonce64,
     uint8_t which,
-    uint8_t message[110])
+    uint8_t message[128])
 {
     uint32_t offset = 0;
-    static const char kTag[] = "BTX_MATMUL_SEED_V2";
+    static const char kTagV2[] = "BTX_MATMUL_SEED_V2";
+    static const char kTagV3[] = "BTX_MATMUL_SEED_V3";
+    const bool use_v3 = job.block_height >= 130500U;
+    const char* tag = use_v3 ? kTagV3 : kTagV2;
     d_append_byte(message, offset, 18U);
-    d_append_bytes(message, offset, reinterpret_cast<const uint8_t*>(kTag), 18U);
+    d_append_bytes(message, offset, reinterpret_cast<const uint8_t*>(tag), 18U);
     d_append_bytes(message, offset, job.prev_hash, 32U);
+    if (use_v3) {
+        d_append_le64(message, offset, static_cast<uint64_t>(job.parent_mtp));
+    }
     d_append_le32(message, offset, job.block_height);
     d_append_le32(message, offset, static_cast<uint32_t>(job.version));
     d_append_bytes(message, offset, job.merkle_root, 32U);
@@ -661,15 +669,15 @@ __device__ uint32_t d_build_matmul_header_message(
     return offset;
 }
 
-__device__ void d_matmul_seed_v2_fast(
+__device__ void d_matmul_seed_fast(
     const uint32_t seed_midstate[8],
     const HipJobParams& job,
     uint64_t nonce64,
     uint8_t which,
     uint8_t out_internal[32])
 {
-    uint8_t message[110];
-    const uint32_t len = d_build_matmul_seed_v2_message(job, nonce64, which, message);
+    uint8_t message[128];
+    const uint32_t len = d_build_matmul_seed_message(job, nonce64, which, message);
     d_sha256_bytes_from_midstate(seed_midstate, message, len, out_internal);
 }
 
@@ -694,7 +702,7 @@ __device__ void d_init_scan_midstates(
     uint32_t header_midstate[8])
 {
     uint8_t prefix[150];
-    d_build_matmul_seed_v2_message(job, 0U, 0U, prefix);
+    d_build_matmul_seed_message(job, 0U, 0U, prefix);
     d_sha256_block0_midstate(prefix, seed_midstate);
     d_build_matmul_header_message(job, 0U, job.prev_hash, job.prev_hash, prefix);
     d_sha256_block0_midstate(prefix, header_midstate);
@@ -1369,8 +1377,8 @@ __device__ bool d_solve_nonce(
                 s_seed_b[i] = reuse_seed_b[i];
             }
         } else if (use_v2) {
-            d_matmul_seed_v2_fast(s_scan_seed_midstate, job, nonce64, 0, s_seed_a);
-            d_matmul_seed_v2_fast(s_scan_seed_midstate, job, nonce64, 1, s_seed_b);
+            d_matmul_seed_fast(s_scan_seed_midstate, job, nonce64, 0, s_seed_a);
+            d_matmul_seed_fast(s_scan_seed_midstate, job, nonce64, 1, s_seed_b);
         } else {
             for (int i = 0; i < 32; ++i) {
                 s_seed_a[i] = job.seed_a[i];
@@ -1582,8 +1590,8 @@ __global__ void matmul_nonce_kernel(
 
     if (use_v2 && threadIdx.x == 0) {
         d_init_scan_midstates(params, s_scan_seed_midstate, s_scan_header_midstate);
-        d_matmul_seed_v2_fast(s_scan_seed_midstate, params, nonces[idx], 0, s_v2_seed_a);
-        d_matmul_seed_v2_fast(s_scan_seed_midstate, params, nonces[idx], 1, s_v2_seed_b);
+        d_matmul_seed_fast(s_scan_seed_midstate, params, nonces[idx], 0, s_v2_seed_a);
+        d_matmul_seed_fast(s_scan_seed_midstate, params, nonces[idx], 1, s_v2_seed_b);
     }
     __syncthreads();
 
@@ -1607,6 +1615,284 @@ __global__ void matmul_nonce_kernel(
     }
 }
 
+__global__ void init_scan_midstates_kernel(
+    HipJobParams params,
+    uint32_t* seed_midstate,
+    uint32_t* header_midstate)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        d_init_scan_midstates(params, seed_midstate, header_midstate);
+    }
+}
+
+__global__ void sigma_gate_kernel(
+    HipJobParams params,
+    uint64_t nonce_start,
+    size_t nonce_count,
+    const uint32_t* __restrict__ seed_midstate,
+    const uint32_t* __restrict__ header_midstate,
+    uint32_t* __restrict__ out_count,
+    uint64_t* __restrict__ out_nonces,
+    uint8_t* __restrict__ out_sigma,
+    uint8_t* __restrict__ out_seed_a,
+    uint8_t* __restrict__ out_seed_b)
+{
+    const size_t idx =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= nonce_count) {
+        return;
+    }
+
+    uint8_t seed_a[32];
+    uint8_t seed_b[32];
+    uint8_t sigma[32];
+    const uint64_t nonce = nonce_start + idx;
+
+    if (params.block_height >= 125000) {
+        d_matmul_seed_fast(seed_midstate, params, nonce, 0, seed_a);
+        d_matmul_seed_fast(seed_midstate, params, nonce, 1, seed_b);
+        d_derive_sigma_fast(
+            header_midstate, params, nonce, seed_a, seed_b, sigma);
+    } else {
+        for (uint32_t i = 0; i < 32; ++i) {
+            seed_a[i] = params.seed_a[i];
+            seed_b[i] = params.seed_b[i];
+        }
+        d_derive_sigma(params, nonce, seed_a, seed_b, sigma);
+    }
+
+    if (params.epsilon_bits != 0 &&
+        !d_sigma_below_prehash(sigma, params.pre_hash_target)) {
+        return;
+    }
+
+    const uint32_t compact_index = atomicAdd(out_count, 1u);
+    out_nonces[compact_index] = nonce;
+    for (uint32_t i = 0; i < 32; ++i) {
+        out_sigma[compact_index * 32 + i] = sigma[i];
+        out_seed_a[compact_index * 32 + i] = seed_a[i];
+        out_seed_b[compact_index * 32 + i] = seed_b[i];
+    }
+}
+
+__global__ void batch_perturb_matrix_kernel(
+    const uint32_t* __restrict__ base,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    uint32_t n,
+    uint32_t r,
+    size_t matrix_elements,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    const size_t gid =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid / matrix_elements;
+    const uint32_t local_index = static_cast<uint32_t>(gid % matrix_elements);
+    const uint32_t row = local_index / n;
+    const uint32_t col = local_index % n;
+    const uint32_t* batch_base = base + batch_index * matrix_elements;
+    const uint32_t* left = noise_left + batch_index * n * r;
+    const uint32_t* right = noise_right + batch_index * r * n;
+
+    uint64_t acc = 0;
+    uint32_t pending = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        if (k < r) {
+            acc += static_cast<uint64_t>(left[row * r + k]) *
+                   right[k * n + col];
+            if (++pending == kReduceInterval) {
+                acc = d_reduce64(acc);
+                pending = 0;
+            }
+        }
+    }
+    output[gid] = d_add(
+        batch_base[local_index],
+        static_cast<uint32_t>(d_reduce64(acc)));
+}
+
+__global__ void batch_perturb_matrix_512x8_kernel(
+    const uint32_t* __restrict__ base,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    const size_t gid =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    const size_t batch_index = gid >> 18U;
+    const uint32_t local_index =
+        static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+    const uint32_t row = local_index >> 9U;
+    const uint32_t col = local_index & (kN - 1U);
+    const uint32_t* batch_base = base + batch_index * kMatrixElements;
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+               right[k * kN + col];
+        if ((k & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    output[gid] = d_add(
+        batch_base[local_index],
+        static_cast<uint32_t>(d_reduce64(acc)));
+}
+
+// One workgroup per output word. Threads map to the 16x16 compression
+// coordinates and accumulate all 32 inner blocks for that word.
+__global__ void batch_compressed_words_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ matrix_b,
+    const uint32_t* __restrict__ compress,
+    uint32_t n,
+    uint32_t bsz,
+    uint32_t blocks_per_axis,
+    uint32_t words_per_nonce,
+    size_t matrix_elements,
+    uint32_t* __restrict__ output)
+{
+    __shared__ uint32_t partials[256];
+
+    const uint32_t global_word = blockIdx.x;
+    const uint32_t batch_index = global_word / words_per_nonce;
+    const uint32_t word_index = global_word % words_per_nonce;
+    const uint32_t bi = word_index / blocks_per_axis;
+    const uint32_t bj = word_index % blocks_per_axis;
+    const uint32_t tid = threadIdx.x;
+    const bool active = tid < bsz * bsz;
+    const uint32_t x = active ? tid / bsz : 0;
+    const uint32_t y = active ? tid % bsz : 0;
+
+    const uint32_t* A = matrix_a + static_cast<size_t>(batch_index) * matrix_elements;
+    const uint32_t* B = matrix_b + static_cast<size_t>(batch_index) * matrix_elements;
+    const uint32_t* W = compress + static_cast<size_t>(batch_index) * bsz * bsz;
+
+    uint32_t compressed_sum = 0;
+    for (uint32_t ell = 0; ell < blocks_per_axis; ++ell) {
+        uint64_t dot = 0;
+        uint32_t pending = 0;
+        if (active) {
+            const uint32_t row = bi * bsz + x;
+            const uint32_t col = bj * bsz + y;
+            const uint32_t middle = ell * bsz;
+            #pragma unroll
+            for (uint32_t k = 0; k < 16; ++k) {
+                if (k < bsz) {
+                    dot += static_cast<uint64_t>(
+                        A[static_cast<size_t>(row) * n + middle + k]) *
+                        B[static_cast<size_t>(middle + k) * n + col];
+                    if (++pending == kReduceInterval) {
+                        dot = d_reduce64(dot);
+                        pending = 0;
+                    }
+                }
+            }
+            partials[tid] = d_mul(
+                static_cast<uint32_t>(d_reduce64(dot)), W[tid]);
+        } else {
+            partials[tid] = 0;
+        }
+        __syncthreads();
+
+        for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
+            if (tid < stride) {
+                partials[tid] = d_add(partials[tid], partials[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            compressed_sum = d_add(compressed_sum, partials[0]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[static_cast<size_t>(batch_index) * words_per_nonce + word_index] =
+            compressed_sum;
+    }
+}
+
+__global__ void batch_compressed_words_512x16_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ matrix_b,
+    const uint32_t* __restrict__ compress,
+    uint32_t* __restrict__ output)
+{
+    __shared__ uint32_t partials[256];
+
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kWordsPerNonce = 32 * 32;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    const uint32_t global_word = blockIdx.x;
+    const uint32_t batch_index = global_word >> 10U;
+    const uint32_t word_index = global_word & (kWordsPerNonce - 1U);
+    const uint32_t bi = word_index >> 5U;
+    const uint32_t bj = word_index & 31U;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row = (bi << 4U) + (tid >> 4U);
+    const uint32_t col = (bj << 4U) + (tid & 15U);
+
+    const uint32_t* A =
+        matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* B =
+        matrix_b + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t weight =
+        compress[(static_cast<size_t>(batch_index) << 8U) + tid];
+
+    uint32_t compressed_sum = 0;
+    for (uint32_t ell = 0; ell < 32; ++ell) {
+        const uint32_t middle = ell << 4U;
+        uint64_t dot = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 16; ++k) {
+            dot += static_cast<uint64_t>(
+                A[static_cast<size_t>(row) * kN + middle + k]) *
+                B[static_cast<size_t>(middle + k) * kN + col];
+            if ((k & 3U) == 3U) {
+                dot = d_reduce64(dot);
+            }
+        }
+        partials[tid] = d_mul(
+            static_cast<uint32_t>(d_reduce64(dot)), weight);
+        __syncthreads();
+
+        for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
+            if (tid < stride) {
+                partials[tid] = d_add(partials[tid], partials[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            compressed_sum = d_add(compressed_sum, partials[0]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[
+            (static_cast<size_t>(batch_index) << 10U) + word_index] =
+            compressed_sum;
+    }
+}
+
 struct DeviceMatrixCache {
     int device = -1;
     uint8_t seed_a[32]{};
@@ -1620,10 +1906,16 @@ DeviceMatrixCache g_matrix_cache[16];
 
 struct DeviceLaunchPool {
     int device = -1;
-    uint64_t* d_nonces = nullptr;
     uint32_t* d_workspace = nullptr;
     uint8_t* d_digests = nullptr;
     uint8_t* d_found = nullptr;
+    uint32_t* d_gate_count = nullptr;
+    uint64_t* d_passed_nonces = nullptr;
+    uint8_t* d_passed_sigma = nullptr;
+    uint8_t* d_passed_seed_a = nullptr;
+    uint8_t* d_passed_seed_b = nullptr;
+    uint32_t* d_seed_midstate = nullptr;
+    uint32_t* d_header_midstate = nullptr;
     size_t nonce_cap = 0;
     size_t ws_bytes = 0;
     size_t digest_cap = 0;
@@ -1631,12 +1923,124 @@ struct DeviceLaunchPool {
 
 DeviceLaunchPool g_launch_pool[16];
 
+struct BatchedMatMulPool {
+    int device = -1;
+    uint8_t* d_seed_a = nullptr;
+    uint8_t* d_seed_b = nullptr;
+    uint8_t* d_sigma = nullptr;
+    uint8_t* d_noise_seeds = nullptr;
+    uint8_t* d_compress_seeds = nullptr;
+    uint32_t* d_base_a = nullptr;
+    uint32_t* d_base_b = nullptr;
+    uint32_t* d_matrix_a = nullptr;
+    uint32_t* d_matrix_b = nullptr;
+    uint32_t* d_noise_el = nullptr;
+    uint32_t* d_noise_er = nullptr;
+    uint32_t* d_noise_fl = nullptr;
+    uint32_t* d_noise_fr = nullptr;
+    uint32_t* d_compress = nullptr;
+    uint32_t* d_words = nullptr;
+    uint8_t* d_digests = nullptr;
+    int32_t* d_results = nullptr;
+    uint8_t* d_block_target = nullptr;
+    uint8_t* d_share_target = nullptr;
+    size_t capacity = 0;
+};
+
+BatchedMatMulPool g_batched_pool[16];
+
+void FreeBatchedPool(BatchedMatMulPool& pool)
+{
+    hipFree(pool.d_seed_a);
+    hipFree(pool.d_seed_b);
+    hipFree(pool.d_sigma);
+    hipFree(pool.d_noise_seeds);
+    hipFree(pool.d_compress_seeds);
+    hipFree(pool.d_base_a);
+    hipFree(pool.d_base_b);
+    hipFree(pool.d_matrix_a);
+    hipFree(pool.d_matrix_b);
+    hipFree(pool.d_noise_el);
+    hipFree(pool.d_noise_er);
+    hipFree(pool.d_noise_fl);
+    hipFree(pool.d_noise_fr);
+    hipFree(pool.d_compress);
+    hipFree(pool.d_words);
+    hipFree(pool.d_digests);
+    hipFree(pool.d_results);
+    hipFree(pool.d_block_target);
+    hipFree(pool.d_share_target);
+    pool = {};
+}
+
+template <typename T>
+bool HipAlloc(T*& ptr, size_t count)
+{
+    return hipMalloc(&ptr, count * sizeof(T)) == hipSuccess;
+}
+
+bool EnsureBatchedPool(
+    int device,
+    size_t batch,
+    uint32_t n,
+    uint32_t r,
+    uint32_t bsz)
+{
+    if (device < 0 || device >= 16) {
+        return false;
+    }
+    BatchedMatMulPool& pool = g_batched_pool[device];
+    if (pool.device == device && pool.capacity >= batch) {
+        return true;
+    }
+    FreeBatchedPool(pool);
+    pool.device = device;
+    pool.capacity = batch;
+
+    const size_t matrix = batch * static_cast<size_t>(n) * n;
+    const size_t noise_left = batch * static_cast<size_t>(n) * r;
+    const size_t noise_right = batch * static_cast<size_t>(r) * n;
+    const size_t compress = batch * static_cast<size_t>(bsz) * bsz;
+    const size_t words = batch * static_cast<size_t>(n / bsz) * (n / bsz);
+
+    const bool ok =
+        HipAlloc(pool.d_seed_a, batch * 32) &&
+        HipAlloc(pool.d_seed_b, batch * 32) &&
+        HipAlloc(pool.d_sigma, batch * 32) &&
+        HipAlloc(pool.d_noise_seeds, batch * 4 * 32) &&
+        HipAlloc(pool.d_compress_seeds, batch * 32) &&
+        HipAlloc(pool.d_base_a, matrix) &&
+        HipAlloc(pool.d_base_b, matrix) &&
+        HipAlloc(pool.d_matrix_a, matrix) &&
+        HipAlloc(pool.d_matrix_b, matrix) &&
+        HipAlloc(pool.d_noise_el, noise_left) &&
+        HipAlloc(pool.d_noise_er, noise_right) &&
+        HipAlloc(pool.d_noise_fl, noise_left) &&
+        HipAlloc(pool.d_noise_fr, noise_right) &&
+        HipAlloc(pool.d_compress, compress) &&
+        HipAlloc(pool.d_words, words) &&
+        HipAlloc(pool.d_digests, batch * 32) &&
+        HipAlloc(pool.d_results, batch) &&
+        HipAlloc(pool.d_block_target, 32) &&
+        HipAlloc(pool.d_share_target, 32);
+    if (!ok) {
+        FreeBatchedPool(pool);
+    }
+    return ok;
+}
+
 void FreeLaunchPool(DeviceLaunchPool& pool)
 {
-    if (pool.d_nonces) hipFree(pool.d_nonces);
     if (pool.d_workspace) hipFree(pool.d_workspace);
     if (pool.d_digests) hipFree(pool.d_digests);
     if (pool.d_found) hipFree(pool.d_found);
+    if (pool.d_gate_count) hipFree(pool.d_gate_count);
+    if (pool.d_passed_nonces) hipFree(pool.d_passed_nonces);
+    if (pool.d_passed_sigma) hipFree(pool.d_passed_sigma);
+    if (pool.d_passed_seed_a) hipFree(pool.d_passed_seed_a);
+    if (pool.d_passed_seed_b) hipFree(pool.d_passed_seed_b);
+    if (pool.d_seed_midstate) hipFree(pool.d_seed_midstate);
+    if (pool.d_header_midstate) hipFree(pool.d_header_midstate);
     pool = {};
 }
 
@@ -1650,12 +2054,6 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
     }
 
     if (pool.nonce_cap < batch) {
-        if (pool.d_nonces) hipFree(pool.d_nonces);
-        pool.d_nonces = nullptr;
-        if (hipMalloc(&pool.d_nonces, batch * sizeof(uint64_t)) != hipSuccess) {
-            FreeLaunchPool(pool);
-            return false;
-        }
         pool.nonce_cap = batch;
     }
     if (pool.ws_bytes < ws_bytes) {
@@ -1671,16 +2069,41 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
     if (pool.digest_cap < batch) {
         if (pool.d_digests) hipFree(pool.d_digests);
         if (pool.d_found) hipFree(pool.d_found);
+        if (pool.d_gate_count) hipFree(pool.d_gate_count);
+        if (pool.d_passed_nonces) hipFree(pool.d_passed_nonces);
+        if (pool.d_passed_sigma) hipFree(pool.d_passed_sigma);
+        if (pool.d_passed_seed_a) hipFree(pool.d_passed_seed_a);
+        if (pool.d_passed_seed_b) hipFree(pool.d_passed_seed_b);
+        if (pool.d_seed_midstate) hipFree(pool.d_seed_midstate);
+        if (pool.d_header_midstate) hipFree(pool.d_header_midstate);
         pool.d_digests = nullptr;
         pool.d_found = nullptr;
+        pool.d_gate_count = nullptr;
+        pool.d_passed_nonces = nullptr;
+        pool.d_passed_sigma = nullptr;
+        pool.d_passed_seed_a = nullptr;
+        pool.d_passed_seed_b = nullptr;
+        pool.d_seed_midstate = nullptr;
+        pool.d_header_midstate = nullptr;
         if (hipMalloc(&pool.d_digests, digest_bytes) != hipSuccess ||
-            hipMalloc(&pool.d_found, batch) != hipSuccess) {
+            hipMalloc(&pool.d_found, batch) != hipSuccess ||
+            hipMalloc(&pool.d_gate_count, sizeof(uint32_t)) != hipSuccess ||
+            hipMalloc(&pool.d_passed_nonces, batch * sizeof(uint64_t)) != hipSuccess ||
+            hipMalloc(&pool.d_passed_sigma, batch * 32) != hipSuccess ||
+            hipMalloc(&pool.d_passed_seed_a, batch * 32) != hipSuccess ||
+            hipMalloc(&pool.d_passed_seed_b, batch * 32) != hipSuccess ||
+            hipMalloc(&pool.d_seed_midstate, 8 * sizeof(uint32_t)) != hipSuccess ||
+            hipMalloc(&pool.d_header_midstate, 8 * sizeof(uint32_t)) != hipSuccess) {
             FreeLaunchPool(pool);
             return false;
         }
         pool.digest_cap = batch;
     }
-    return pool.d_nonces && pool.d_workspace && pool.d_digests && pool.d_found;
+    return pool.d_workspace && pool.d_digests && pool.d_found &&
+           pool.d_gate_count && pool.d_passed_nonces &&
+           pool.d_passed_sigma && pool.d_passed_seed_a &&
+           pool.d_passed_seed_b && pool.d_seed_midstate &&
+           pool.d_header_midstate;
 }
 
 void FreeMatrixCache(DeviceMatrixCache& cache)
@@ -1782,6 +2205,7 @@ HipJobParams MakeHipJobParams(const FusedMatMulJob& job)
     p.r = job.r;
     p.epsilon_bits = job.epsilon_bits;
     p.block_height = static_cast<uint32_t>(job.state.height);
+    p.parent_mtp = job.state.parent_mtp;
     std::memcpy(p.prev_hash, job.state.previous_block_hash.data, 32);
     std::memcpy(p.merkle_root, job.state.merkle_root.data, 32);
     std::memcpy(p.seed_a, job.state.seed_a.data, 32);
@@ -1790,6 +2214,149 @@ HipJobParams MakeHipJobParams(const FusedMatMulJob& job)
     const Uint256 pre_hash = DerivePreHashTarget(job.block_target, job.epsilon_bits);
     std::memcpy(p.pre_hash_target, pre_hash.data, 32);
     return p;
+}
+
+bool ProcessPassedNoncesBatched(
+    int device,
+    const FusedMatMulJob& job,
+    size_t batch,
+    const uint8_t* d_seed_a,
+    const uint8_t* d_seed_b,
+    const uint8_t* d_sigma,
+    std::vector<Uint256>& digests,
+    std::vector<uint8_t>& found)
+{
+    if (batch == 0) {
+        return true;
+    }
+    if (!EnsureBatchedPool(device, batch, job.n, job.r, job.b)) {
+        return false;
+    }
+    BatchedMatMulPool& pool = g_batched_pool[device];
+
+    if (hipMemcpy(
+            pool.d_seed_a, d_seed_a, batch * 32,
+            hipMemcpyDeviceToDevice) != hipSuccess ||
+        hipMemcpy(
+            pool.d_seed_b, d_seed_b, batch * 32,
+            hipMemcpyDeviceToDevice) != hipSuccess ||
+        hipMemcpy(
+            pool.d_sigma, d_sigma, batch * 32,
+            hipMemcpyDeviceToDevice) != hipSuccess ||
+        hipMemcpy(
+            pool.d_block_target, job.block_target.data, 32,
+            hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(
+            pool.d_share_target, job.share_target.data, 32,
+            hipMemcpyHostToDevice) != hipSuccess) {
+        return false;
+    }
+
+    const uint32_t n = job.n;
+    const uint32_t r = job.r;
+    const uint32_t bsz = job.b;
+    const uint32_t blocks_per_axis = n / bsz;
+    const uint32_t words_per_nonce = blocks_per_axis * blocks_per_axis;
+    const size_t matrix_elements = static_cast<size_t>(n) * n;
+    const size_t total_matrix_elements = batch * matrix_elements;
+    const uint32_t noise_left_elements = n * r;
+    const uint32_t noise_right_elements = r * n;
+    const uint32_t compress_elements = bsz * bsz;
+
+    gpasha::GenerateMatrixKernel_launch(
+        pool.d_seed_a, static_cast<uint32_t>(batch), n, pool.d_base_a);
+    gpasha::GenerateMatrixKernel_launch(
+        pool.d_seed_b, static_cast<uint32_t>(batch), n, pool.d_base_b);
+    gpasha::DeriveNoiseSeedsKernel_launch(
+        pool.d_sigma, pool.d_noise_seeds, pool.d_compress_seeds,
+        static_cast<uint32_t>(batch));
+    gpasha::GenerateNoiseKernel_launch(
+        pool.d_noise_seeds, static_cast<uint32_t>(batch),
+        noise_left_elements, 0, pool.d_noise_el);
+    gpasha::GenerateNoiseKernel_launch(
+        pool.d_noise_seeds, static_cast<uint32_t>(batch),
+        noise_right_elements, 1, pool.d_noise_er);
+    gpasha::GenerateNoiseKernel_launch(
+        pool.d_noise_seeds, static_cast<uint32_t>(batch),
+        noise_left_elements, 2, pool.d_noise_fl);
+    gpasha::GenerateNoiseKernel_launch(
+        pool.d_noise_seeds, static_cast<uint32_t>(batch),
+        noise_right_elements, 3, pool.d_noise_fr);
+    gpasha::GenerateCompressKernel_launch(
+        pool.d_compress_seeds, static_cast<uint32_t>(batch),
+        compress_elements, pool.d_compress);
+
+    constexpr uint32_t kThreads = 256;
+    const uint32_t matrix_blocks = static_cast<uint32_t>(
+        (total_matrix_elements + kThreads - 1) / kThreads);
+    const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
+    if (use_512x16x8) {
+        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
+            total_matrix_elements, pool.d_matrix_a);
+        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr,
+            total_matrix_elements, pool.d_matrix_b);
+    } else {
+        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
+            matrix_elements, total_matrix_elements, pool.d_matrix_a);
+        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
+            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
+            matrix_elements, total_matrix_elements, pool.d_matrix_b);
+    }
+
+    const uint32_t total_words =
+        static_cast<uint32_t>(batch) * words_per_nonce;
+    if (use_512x16x8) {
+        batch_compressed_words_512x16_kernel<<<total_words, kThreads>>>(
+            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+            pool.d_words);
+    } else {
+        batch_compressed_words_kernel<<<total_words, kThreads>>>(
+            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+            n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
+            pool.d_words);
+    }
+
+    gpasha::HashTranscriptKernel_launch(
+        pool.d_words, pool.d_sigma, words_per_nonce, n, bsz,
+        static_cast<uint32_t>(batch), pool.d_digests);
+    gpasha::CompareDigestsKernel_launch(
+        pool.d_digests, pool.d_block_target, pool.d_share_target,
+        static_cast<uint32_t>(batch), pool.d_results);
+
+    hipError_t err = hipGetLastError();
+    if (err == hipSuccess) {
+        err = hipDeviceSynchronize();
+    }
+    if (err != hipSuccess) {
+        std::fprintf(
+            stderr, "batched HIP transcript failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+
+    std::vector<int32_t> results(batch);
+    std::vector<uint8_t> digest_bytes(batch * 32);
+    if (hipMemcpy(
+            results.data(), pool.d_results, batch * sizeof(int32_t),
+            hipMemcpyDeviceToHost) != hipSuccess ||
+        hipMemcpy(
+            digest_bytes.data(), pool.d_digests, digest_bytes.size(),
+            hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+
+    digests.resize(batch);
+    found.assign(batch, 0);
+    for (size_t i = 0; i < batch; ++i) {
+        if (results[i] != 0) {
+            found[i] = 1;
+            std::memcpy(digests[i].data, digest_bytes.data() + i * 32, 32);
+        }
+    }
+    return true;
 }
 
 size_t WorkspaceUint32Count(uint32_t n, uint32_t r, uint32_t bsz, bool use_v2_seeds)
@@ -1856,7 +2423,8 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     const FusedMatMulJob& job,
     const std::vector<uint64_t>& nonces,
     std::vector<Uint256>& out_digests,
-    std::vector<bool>& out_found)
+    std::vector<bool>& out_found,
+    std::vector<bool>* out_gate_passed)
 {
     if (nonces.empty()) {
         return false;
@@ -1877,28 +2445,42 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     const size_t batch = nonces.size();
     const bool use_v2 = job.state.height >= 125000;
     const size_t ws_uint32_per_nonce = WorkspaceUint32Count(job.n, job.r, job.b, use_v2);
-    const size_t ws_bytes = batch * ws_uint32_per_nonce * sizeof(uint32_t);
-
     out_digests.resize(batch);
     out_found.assign(batch, false);
+    if (out_gate_passed) {
+        out_gate_passed->assign(batch, false);
+    }
 
-    if (!EnsureLaunchPool(device, batch, ws_bytes)) {
+    // The epsilon gate accepts roughly one nonce in 2^epsilon_bits. Allocate
+    // one full workspace initially and grow only when a scan actually finds
+    // more candidates.
+    const size_t per_nonce_ws_bytes =
+        ws_uint32_per_nonce * sizeof(uint32_t);
+    if (!EnsureLaunchPool(device, batch, per_nonce_ws_bytes)) {
         return false;
     }
     DeviceLaunchPool& pool = g_launch_pool[device];
 
-    std::vector<uint8_t> h_found(batch, 0);
-    std::vector<uint8_t> h_digests(batch * 32);
-
-    if (hipMemset(pool.d_found, 0, batch) != hipSuccess) {
+    for (size_t i = 1; i < batch; ++i) {
+        if (nonces[i] != nonces.front() + i) {
+            return false;
+        }
+    }
+    if (hipMemset(pool.d_gate_count, 0, sizeof(uint32_t)) != hipSuccess) {
         return false;
     }
-    if (hipMemcpy(pool.d_nonces, nonces.data(), batch * sizeof(uint64_t), hipMemcpyHostToDevice) != hipSuccess) {
-        return false;
-    }
 
-    matmul_nonce_kernel<<<static_cast<int>(batch), kBlockThreads>>>(
-        h_params, d_A, d_B, pool.d_nonces, pool.d_workspace, pool.d_digests, pool.d_found);
+    init_scan_midstates_kernel<<<1, 1>>>(
+        h_params, pool.d_seed_midstate, pool.d_header_midstate);
+    // RDNA3 (gfx11): 512-wide launches improve sigma-gate occupancy vs 256.
+    constexpr int kGateThreads = 512;
+    const int gate_blocks =
+        static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
+    sigma_gate_kernel<<<gate_blocks, kGateThreads>>>(
+        h_params, nonces.front(), batch,
+        pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
+        pool.d_passed_nonces, pool.d_passed_sigma,
+        pool.d_passed_seed_a, pool.d_passed_seed_b);
 
     if (hipGetLastError() != hipSuccess) {
         return false;
@@ -1906,27 +2488,47 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     if (hipDeviceSynchronize() != hipSuccess) {
         return false;
     }
-    if (hipMemcpy(h_found.data(), pool.d_found, batch, hipMemcpyDeviceToHost) != hipSuccess) {
+    uint32_t passed = 0;
+    if (hipMemcpy(
+            &passed, pool.d_gate_count, sizeof(passed),
+            hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+
+    if (passed == 0) {
+        return true;
+    }
+
+    std::vector<uint64_t> passed_nonces(passed);
+    if (hipMemcpy(
+            passed_nonces.data(), pool.d_passed_nonces,
+            passed * sizeof(uint64_t), hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+
+    std::vector<Uint256> passed_digests;
+    std::vector<uint8_t> passed_found;
+    if (!ProcessPassedNoncesBatched(
+            device, job, passed, pool.d_passed_seed_a,
+            pool.d_passed_seed_b, pool.d_passed_sigma,
+            passed_digests, passed_found)) {
         return false;
     }
 
     bool any_hit = false;
-    for (size_t i = 0; i < batch; ++i) {
-        out_found[i] = h_found[i] != 0;
-        if (out_found[i]) {
-            any_hit = true;
-        }
-    }
-
-    if (any_hit) {
-        if (hipMemcpy(h_digests.data(), pool.d_digests, batch * 32, hipMemcpyDeviceToHost) !=
-            hipSuccess) {
+    for (size_t i = 0; i < passed; ++i) {
+        const size_t original_index =
+            static_cast<size_t>(passed_nonces[i] - nonces.front());
+        if (original_index >= batch) {
             return false;
         }
-        for (size_t i = 0; i < batch; ++i) {
-            if (out_found[i]) {
-                std::memcpy(out_digests[i].data, h_digests.data() + i * 32, 32);
-            }
+        if (out_gate_passed) {
+            (*out_gate_passed)[original_index] = true;
+        }
+        out_found[original_index] = passed_found[i] != 0;
+        if (out_found[original_index]) {
+            out_digests[original_index] = passed_digests[i];
+            any_hit = true;
         }
     }
     return true;

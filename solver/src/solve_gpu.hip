@@ -67,8 +67,23 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
               uint64_t& tries_used, double& elapsed_s,
               uint32_t batch_size, uint32_t epsilon_bits,
               bool* cpu_fallback, uint64_t* gate_passes,
-              uint64_t* words_hits, uint64_t* cpu_verify_misses)
+              uint64_t* words_hits, uint64_t* cpu_verify_misses,
+              std::vector<PowState>* solutions,
+              uint32_t max_solutions,
+              uint64_t* scanned_nonce_end)
 {
+    if (solutions) {
+        solutions->clear();
+    }
+    if (state.height >= 130500 && !state.has_parent_mtp) {
+        std::fprintf(stderr, "parent_mtp is required at block_height >= 130500\n");
+        tries_used = 0;
+        elapsed_s = 0;
+        return false;
+    }
+    if (max_solutions == 0) {
+        max_solutions = UINT32_MAX;
+    }
     if (cpu_fallback) {
         *cpu_fallback = false;
     }
@@ -96,10 +111,12 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     const int device = GpuDeviceId();
     int launch_batch = static_cast<int>(batch_size);
     if (launch_batch <= 0) {
-        launch_batch = AutoBatchSizeForDevice(device, n, r, b, state.height, 2048);
+        launch_batch = AutoBatchSizeForDevice(device, n, r, b, state.height, 8192);
     } else {
-        const int auto_max = AutoBatchSizeForDevice(device, n, r, b, state.height, 4096);
-        launch_batch = std::min(launch_batch, auto_max);
+        // The epsilon gate now compacts candidates before allocating full
+        // MatMul state, so scan batches no longer consume one workspace per
+        // input nonce.
+        launch_batch = std::min(launch_batch, 131072);
     }
     launch_batch = std::max(1, launch_batch);
 
@@ -113,6 +130,8 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     fused_job.block_target = block_target;
 
     uint64_t current_nonce = state.nonce;
+    PowState first_solution{};
+    bool have_solution = false;
     while (max_tries > 0) {
         auto now = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(now - t0).count();
@@ -129,7 +148,9 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
 
         std::vector<Uint256> digests;
         std::vector<bool> found;
-        if (!LaunchMatMulTranscriptBatch(device, fused_job, batch_nonces, digests, found)) {
+        std::vector<bool> gate_passed;
+        if (!LaunchMatMulTranscriptBatch(
+                device, fused_job, batch_nonces, digests, found, &gate_passed)) {
             std::fprintf(stderr, "Fused HIP kernel failed, falling back to CPU\n");
             InvalidateGpu();
             if (cpu_fallback) {
@@ -146,7 +167,8 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         max_tries -= this_batch;
         current_nonce += this_batch;
         if (gate_passes) {
-            *gate_passes += this_batch;
+            *gate_passes += static_cast<uint64_t>(
+                std::count(gate_passed.begin(), gate_passed.end(), true));
         }
 
         uint32_t miss_logs = 0;
@@ -181,16 +203,46 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
                 continue;
             }
 
-            state = verify;
-            state.digest = cpu_digest;
+            verify.digest = cpu_digest;
+            if (!have_solution) {
+                first_solution = verify;
+                have_solution = true;
+            }
+            if (solutions) {
+                solutions->push_back(verify);
+            }
+            if (!solutions) {
+                if (scanned_nonce_end) {
+                    *scanned_nonce_end =
+                        current_nonce > 0 ? current_nonce - 1 : current_nonce;
+                }
+                state = first_solution;
+                auto t1 = std::chrono::steady_clock::now();
+                elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+                return true;
+            }
+        }
+
+        if (solutions && solutions->size() >= max_solutions) {
+            if (scanned_nonce_end) {
+                *scanned_nonce_end =
+                    current_nonce > 0 ? current_nonce - 1 : current_nonce;
+            }
+            state = first_solution;
             auto t1 = std::chrono::steady_clock::now();
             elapsed_s = std::chrono::duration<double>(t1 - t0).count();
             return true;
         }
     }
 
-    state.nonce = current_nonce;
+    if (scanned_nonce_end) {
+        *scanned_nonce_end = current_nonce > 0 ? current_nonce - 1 : current_nonce;
+    }
+    state = have_solution ? first_solution : state;
+    if (!have_solution) {
+        state.nonce = current_nonce;
+    }
     auto t1 = std::chrono::steady_clock::now();
     elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-    return false;
+    return have_solution;
 }

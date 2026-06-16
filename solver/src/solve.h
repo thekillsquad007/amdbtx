@@ -6,6 +6,7 @@
 #include "transcript.h"
 #include "uint256.h"
 #include <cstdint>
+#include <vector>
 
 struct PowState {
     int32_t version;
@@ -18,6 +19,8 @@ struct PowState {
     uint64_t nonce;
     uint16_t matmul_dim;
     int32_t height;
+    int64_t parent_mtp;
+    bool has_parent_mtp;
     Uint256 digest;
 };
 
@@ -36,7 +39,18 @@ Uint256 DeterministicMatMulSeedV2(
     uint64_t nonce64, uint16_t matmul_dim,
     uint8_t which);
 
+// BTX v0.32.10 DeterministicMatMulSeedV3 (height >= 130500).
+Uint256 DeterministicMatMulSeedV3(
+    const Uint256& prev_hash, int64_t parent_mtp, int32_t height,
+    int32_t version, const Uint256& merkle_root,
+    uint32_t time, uint32_t bits,
+    uint64_t nonce64, uint16_t matmul_dim,
+    uint8_t which);
+
 bool ComputeDigestForNonce(PowState& state, uint32_t n, uint32_t b, uint32_t r, Uint256& out_digest);
+bool ComputeProductPayloadForNonce(
+    PowState& state, uint32_t n, uint32_t b, uint32_t r,
+    std::vector<field::Element>& out_product);
 
 // Compare GPU-compressed words against CPU reference for one gated nonce.
 uint32_t CountCompressedWordDiffs(
@@ -57,6 +71,9 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
               uint64_t& tries_used, double& elapsed_s,
               uint32_t batch_size = 128, uint32_t epsilon_bits = 18,
               bool* cpu_fallback = nullptr, uint64_t* gate_passes = nullptr,
-              uint64_t* words_hits = nullptr, uint64_t* cpu_verify_misses = nullptr);
+              uint64_t* words_hits = nullptr, uint64_t* cpu_verify_misses = nullptr,
+              std::vector<PowState>* solutions = nullptr,
+              uint32_t max_solutions = 1,
+              uint64_t* scanned_nonce_end = nullptr);
 
 #endif

@@ -180,6 +180,8 @@ class GBTSolveWrapper:
                 "max_seconds": max_seconds,
                 "share_target": share_target,
             }
+            if job.parent_mtp is not None:
+                payload["parent_mtp"] = int(job.parent_mtp)
         elif isinstance(job, dict):
             share_target = job.get("target", job.get("share_target", "ff" * 64))
             payload = {
@@ -200,6 +202,8 @@ class GBTSolveWrapper:
                 "max_seconds": float(job.get("max_seconds", max_seconds)),
                 "share_target": share_target,
             }
+            if job.get("parent_mtp") is not None:
+                payload["parent_mtp"] = int(job["parent_mtp"])
         else:
             return {"found": False, "error": f"unsupported job type: {type(job)}"}
 
@@ -215,8 +219,10 @@ class GBTSolveWrapper:
                 try:
                     result = json.loads(line.strip())
                     if "found" in result:
-                        elapsed = time.time() - t0
-                        tries = result.get("tries_used", 0)
+                        solver_elapsed = float(result.get("elapsed_s", 0) or 0)
+                        wall_elapsed = time.time() - t0
+                        elapsed = solver_elapsed if solver_elapsed > 0 else wall_elapsed
+                        tries = int(result.get("tries_used", 0) or 0)
                         if elapsed > 0 and tries > 0:
                             self.last_observed_nps = tries / elapsed
                         return result
@@ -252,6 +258,8 @@ class MultiGPUSolver:
         runtime_ld_path: str = "",
     ):
         self.gpu_devices = list(gpu_devices or [0])
+        self.last_observed_nps: float | None = None
+        self._peak_nonce_nps: float = 0.0
         self.solvers: list[GBTSolveWrapper] = []
         for device in self.gpu_devices:
             self.solvers.append(
@@ -281,14 +289,16 @@ class MultiGPUSolver:
     def _merge_results(self, results: list[dict], *, wall_elapsed: float) -> dict:
         total_tries = sum(int(r.get("tries_used", 0) or 0) for r in results)
         total_gate = sum(int(r.get("gate_passes", 0) or 0) for r in results)
-        work = total_gate if total_gate else total_tries
         per_gpu_khps = []
+        per_gpu_matmul_khps = []
         for r in results:
             elapsed = float(r.get("elapsed_s", 0) or 0)
             gate = int(r.get("gate_passes", 0) or 0)
             tries = int(r.get("tries_used", 0) or 0)
-            w = gate if gate else tries
-            per_gpu_khps.append(w / elapsed / 1000 if elapsed > 0 else 0.0)
+            per_gpu_khps.append(tries / elapsed / 1000 if elapsed > 0 else 0.0)
+            per_gpu_matmul_khps.append(
+                gate / elapsed / 1000 if elapsed > 0 and gate else 0.0
+            )
 
         merged = {
             "found": False,
@@ -296,11 +306,15 @@ class MultiGPUSolver:
             "gate_passes": total_gate,
             "elapsed_s": wall_elapsed,
             "per_gpu_khps": per_gpu_khps,
+            "per_gpu_matmul_khps": per_gpu_matmul_khps,
             "gpu_devices": list(self.gpu_devices),
             "num_gpus": self.num_gpus,
         }
-        if wall_elapsed > 0 and work > 0:
-            merged["matmul_khps_total"] = work / wall_elapsed / 1000
+        if wall_elapsed > 0:
+            if total_tries > 0:
+                merged["nonce_khps_total"] = total_tries / wall_elapsed / 1000
+            if total_gate > 0:
+                merged["matmul_khps_total"] = total_gate / wall_elapsed / 1000
 
         errors = [r.get("error") for r in results if r.get("error")]
         if errors and len(errors) == len(results):
@@ -317,10 +331,14 @@ class MultiGPUSolver:
             merged.update(winner)
             merged["found"] = True
             merged["per_gpu_khps"] = per_gpu_khps
+            merged["per_gpu_matmul_khps"] = per_gpu_matmul_khps
             merged["gpu_devices"] = list(self.gpu_devices)
             merged["num_gpus"] = self.num_gpus
-            if wall_elapsed > 0 and work > 0:
-                merged["matmul_khps_total"] = work / wall_elapsed / 1000
+            if wall_elapsed > 0:
+                if total_tries > 0:
+                    merged["nonce_khps_total"] = total_tries / wall_elapsed / 1000
+                if total_gate > 0:
+                    merged["matmul_khps_total"] = total_gate / wall_elapsed / 1000
         return merged
 
     def solve(self, job, nonce_start: int = 0, max_tries: int = 20_000_000,
@@ -358,7 +376,11 @@ class MultiGPUSolver:
                     result["gpu_device"] = self.gpu_devices[idx]
                 results.append(result)
 
-        return self._merge_results(results, wall_elapsed=time.time() - t0)
+        merged = self._merge_results(results, wall_elapsed=time.time() - t0)
+        khps = merged.get("nonce_khps_total")
+        if khps:
+            self.last_observed_nps = float(khps) * 1000.0
+        return merged
 
     def stop(self):
         for solver in self.solvers:

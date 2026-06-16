@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--batch-size" && i+1 < argc) config.batch_size = std::stoul(argv[++i]);
         else if (arg == "--share-target") { if (i+1 < argc) ++i; }
         else if (arg == "--version") {
-            std::cerr << "btx-gbt-solve-hip 2.0.0" << std::endl;
+            std::cerr << "btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)" << std::endl;
             return 0;
         } else if (arg == "--help") {
             std::cerr << "Usage: " << argv[0] << " --daemon [--matmul-n N] [--matmul-b B] [--matmul-r R] "
@@ -145,6 +145,7 @@ int main(int argc, char* argv[]) {
         uint64_t nonce_start = 0;
         uint64_t max_tries = 2000000;
         double max_seconds = 5.0;
+        uint32_t max_results = 64;
 
         Uint256 share_target;
         std::memset(share_target.data, 0xFF, 32);
@@ -169,17 +170,43 @@ int main(int argc, char* argv[]) {
 
         std::string ms_str = extract_json_number(line, "max_seconds");
         if (!ms_str.empty()) max_seconds = std::stod(ms_str);
+        std::string mr_str = extract_json_number(line, "max_results");
+        if (!mr_str.empty()) max_results = static_cast<uint32_t>(std::stoul(mr_str));
 
         std::string st_str = extract_json_string(line, "share_target");
         if (!st_str.empty()) share_target = HexToUint256(st_str);
 
         std::string bh_str = extract_json_number(line, "block_height");
         state.height = bh_str.empty() ? 0 : std::stoi(bh_str);
+        std::string parent_mtp_str = extract_json_number(line, "parent_mtp");
+        state.has_parent_mtp = !parent_mtp_str.empty();
+        if (state.has_parent_mtp) {
+            state.parent_mtp = std::stoll(parent_mtp_str);
+        }
         state.nonce = nonce_start;
 
         std::string eb_str = extract_json_number(line, "epsilon_bits");
         uint32_t job_epsilon_bits = config.epsilon_bits;
         if (!eb_str.empty()) job_epsilon_bits = static_cast<uint32_t>(std::stoul(eb_str));
+        const bool include_product_payload =
+            extract_json_number(line, "include_product_payload") == "1";
+
+        if (state.height >= 130500 && !state.has_parent_mtp) {
+            std::cout
+                << "{\"found\":false,\"error\":\"parent_mtp is required at block_height >= 130500\","
+                << "\"backend\":\"" << config.backend << "\"}" << std::endl;
+            continue;
+        }
+        if (extract_json_number(line, "emit_seeds") == "1") {
+            PrepareNonceSeeds(state);
+            std::cout
+                << "{\"ok\":true,\"block_height\":" << state.height
+                << ",\"nonce64\":" << state.nonce
+                << ",\"seed_a\":\"" << Uint256ToHex(state.seed_a)
+                << "\",\"seed_b\":\"" << Uint256ToHex(state.seed_b)
+                << "\"}" << std::endl;
+            continue;
+        }
 
         Uint256 block_target = DeriveBlockTarget(state.bits);
 
@@ -191,13 +218,16 @@ int main(int argc, char* argv[]) {
         bool found;
         bool cpu_fallback = false;
         std::string backend_used = config.backend;
+        std::vector<PowState> solutions;
+        uint64_t scanned_nonce_end = nonce_start;
 
         if (config.backend == "hip") {
             found = SolveGPU(state, job_n, job_b, job_r,
                              block_target, share_target, max_tries, max_seconds,
                              tries_used, elapsed_s,
                              config.batch_size, job_epsilon_bits, &cpu_fallback,
-                             &gate_passes, &words_hits, &cpu_verify_misses);
+                             &gate_passes, &words_hits, &cpu_verify_misses,
+                             &solutions, max_results, &scanned_nonce_end);
             backend_used = cpu_fallback ? "cpu" : "hip";
         } else {
             found = SolveCPU(state, job_n, job_b, job_r,
@@ -208,8 +238,15 @@ int main(int argc, char* argv[]) {
         }
 
         bool is_block = found && Uint256LE(state.digest, block_target);
-        uint64_t nonce64_end = found ? state.nonce
-            : (state.nonce > nonce_start ? state.nonce - 1 : nonce_start);
+        std::vector<field::Element> product_payload;
+        if (is_block && include_product_payload) {
+            ComputeProductPayloadForNonce(
+                state, job_n, job_b, job_r, product_payload);
+        }
+        uint64_t nonce64_end = backend_used == "hip"
+            ? scanned_nonce_end
+            : (found ? state.nonce
+                : (state.nonce > nonce_start ? state.nonce - 1 : nonce_start));
 
         std::cout << "{";
         std::cout << "\"found\":" << (found ? "true" : "false") << ",";
@@ -219,6 +256,14 @@ int main(int argc, char* argv[]) {
             std::cout << "\"digest\":\"" << Uint256ToHex(state.digest) << "\",";
             std::cout << "\"ntime\":" << state.time << ",";
             std::cout << "\"is_block\":" << (is_block ? "true" : "false") << ",";
+            if (!product_payload.empty()) {
+                std::cout << "\"matrix_c\":[";
+                for (size_t i = 0; i < product_payload.size(); ++i) {
+                    if (i != 0) std::cout << ",";
+                    std::cout << product_payload[i];
+                }
+                std::cout << "],";
+            }
         }
         std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(2) << elapsed_s << ",";
         std::cout << "\"tries_used\":" << tries_used << ",";
@@ -228,6 +273,23 @@ int main(int argc, char* argv[]) {
             std::cout << "\"words_hits\":" << words_hits << ",";
         if (cpu_verify_misses > 0)
             std::cout << "\"cpu_verify_misses\":" << cpu_verify_misses << ",";
+        if (!solutions.empty()) {
+            std::cout << "\"solutions\":[";
+            for (size_t i = 0; i < solutions.size(); ++i) {
+                const PowState& solution = solutions[i];
+                const bool solution_is_block =
+                    Uint256LE(solution.digest, block_target);
+                if (i != 0) std::cout << ",";
+                std::cout << "{";
+                std::cout << "\"nonce64\":" << solution.nonce << ",";
+                std::cout << "\"digest\":\"" << Uint256ToHex(solution.digest) << "\",";
+                std::cout << "\"ntime\":" << solution.time << ",";
+                std::cout << "\"is_block\":"
+                          << (solution_is_block ? "true" : "false");
+                std::cout << "}";
+            }
+            std::cout << "],";
+        }
         std::cout << "\"backend\":\"" << backend_used << "\"";
         std::cout << "}" << std::endl;
     }

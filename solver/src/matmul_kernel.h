@@ -31,7 +31,8 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     const FusedMatMulJob& job,
     const std::vector<uint64_t>& nonces,
     std::vector<Uint256>& out_digests,
-    std::vector<bool>& out_found);
+    std::vector<bool>& out_found,
+    std::vector<bool>* out_gate_passed = nullptr);
 
 extern "C" bool HipVerifyAgainstCpu(
     const FusedMatMulJob& job,
