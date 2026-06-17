@@ -4,6 +4,7 @@ import time
 import argparse
 import logging
 import itertools
+from collections import deque
 from pathlib import Path
 
 try:
@@ -19,7 +20,7 @@ except ImportError:
     from stratum_client import StratumClient, Job
     from solo_client import SoloClient
     from gbt_solve_wrapper import GBTSolveWrapper, MultiGPUSolver
-    __version__ = "1.1.2"
+    __version__ = "1.0.0"
     USER_AGENT = f"amdbtx-miner/{__version__}"
     DEV_WALLET = "btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4"
 
@@ -27,6 +28,9 @@ DEV_FEE_SLICE_S = 120
 USER_SLICE_S = 58 * 60
 
 log = logging.getLogger("amdbtx_miner")
+
+# Pool dedupes (job_id, ntime, nonce); skip local resubmits after rotation/races.
+_submitted_share_keys: set[tuple[str, int, int]] = set()
 
 
 def resolve_solver_path(configured_path: str = "") -> Path:
@@ -45,8 +49,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="AMD BTX Miner")
     p.add_argument("--config", default=str(Path.home() / ".amdbtx-miner" / "config.yaml"))
     p.add_argument("--payout-address", help="BTX payout address")
-    p.add_argument("--worker-name", default=None)
-    p.add_argument("--pool-host", default=None)
+    p.add_argument("--worker-name", default="default")
+    p.add_argument("--pool-host", default=None, help="pool hostname (default: config or stratum.bitminerpool.xyz)")
     p.add_argument("--pool-port", type=int, default=None)
     p.add_argument("--solver-backend", default=None, choices=["rocm", "cpu"])
     p.add_argument("--solver-threads", type=int, default=None)
@@ -77,7 +81,7 @@ def _benchmark_job() -> dict:
         "bits": "1d1ccc7b",
         "seed_a": "43b5b748c3ad0928e56256e7c687c4907745220ba7053bc56905942c9a0fa1b2",
         "seed_b": "1190c8ed806ea11336f3ad6a20adb9da0beb7b05772afab86c38c67c919ae645",
-        "block_height": 125601,
+        "block_height": 130000,
         "matmul_n": 512,
         "matmul_b": 16,
         "matmul_r": 8,
@@ -106,14 +110,18 @@ def run_benchmark(cfg: dict, config_path: str = ""):
           f"slice={bench_tries} nonces / {bench_seconds:.0f}s per test\n")
 
     configs = []
-    for batch in (512, 1024, 2048, 4096, 8192, 16384):
-        configs.append({
-            "solver_prepare_workers": bench_workers,
-            "solver_threads": bench_threads,
-            "solver_batch_size": batch,
-            "solver_prefetch_depth": cfg.get("solver_prefetch_depth", 8),
-            "solver_pipeline_async": cfg.get("solver_pipeline_async", 1),
-        })
+    thread_opts = sorted({bench_threads, 8, 12, 16, 20, 24})
+    worker_opts = sorted({bench_workers, 8, 12, 16, 20, 24})
+    for workers in worker_opts:
+        for threads in thread_opts:
+            for batch in (128, 256, 512, 1024, 2048, 4096):
+                configs.append({
+                    "solver_prepare_workers": workers,
+                    "solver_threads": threads,
+                    "solver_batch_size": batch,
+                    "solver_prefetch_depth": cfg.get("solver_prefetch_depth", 8),
+                    "solver_pipeline_async": cfg.get("solver_pipeline_async", 1),
+                })
 
     results = []
     bench_job = _benchmark_job()
@@ -198,12 +206,22 @@ def _make_solver(cfg: dict, solver_path: Path, gpu_devices: list[int]) -> MultiG
     )
 
 
-def _format_khps_line(result: dict, khps: float) -> str:
+def _format_khps_line(
+    result: dict, nonce_khps: float, matmul_khps: float | None = None,
+) -> str:
+    matmul_part = ""
+    if matmul_khps is not None and matmul_khps > 0:
+        per_gpu_matmul = result.get("per_gpu_matmul_khps")
+        if per_gpu_matmul and len(per_gpu_matmul) > 1:
+            parts_m = "+".join(f"{v:.2f}" for v in per_gpu_matmul)
+            matmul_part = f" matmul_khps={matmul_khps:.2f} total ({parts_m} per GPU)"
+        else:
+            matmul_part = f" matmul_khps={matmul_khps:.2f}"
     per_gpu = result.get("per_gpu_khps")
     if per_gpu and len(per_gpu) > 1:
         parts = "+".join(f"{v:.2f}" for v in per_gpu)
-        return f"nonce_khps={khps:.2f} total ({parts} per GPU)"
-    return f"nonce_khps={khps:.2f}"
+        return f"nonce_khps={nonce_khps:.2f} total ({parts} per GPU){matmul_part}"
+    return f"nonce_khps={nonce_khps:.2f}{matmul_part}"
 
 
 def _drain_pool_messages(client) -> None:
@@ -232,8 +250,23 @@ def _drain_pool_messages(client) -> None:
         pass
 
 
+def _share_submit_key(solve_job: Job, result: dict) -> tuple[str, int, int]:
+    ntime = int(result.get("ntime") or solve_job.time)
+    nonce = int(result["nonce64"])
+    return (solve_job.job_id, ntime, nonce)
+
+
 def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> None:
     _drain_pool_messages(client)
+    if not solo:
+        key = _share_submit_key(solve_job, result)
+        if key in _submitted_share_keys:
+            log.info(
+                "skip resubmit job=%s nonce=%016x (already submitted this session)",
+                solve_job.job_id, key[2],
+            )
+            return
+        _submitted_share_keys.add(key)
     if not solo and client._current_job is not None:
         if client._current_job.job_id != solve_job.job_id:
             log.info(
@@ -262,6 +295,8 @@ def _accumulate_slice_stats(merged: dict, result: dict) -> None:
         merged["backend"] = result["backend"]
     if result.get("per_gpu_khps"):
         merged["per_gpu_khps"] = result["per_gpu_khps"]
+    if result.get("per_gpu_matmul_khps"):
+        merged["per_gpu_matmul_khps"] = result["per_gpu_matmul_khps"]
     if result.get("num_gpus"):
         merged["num_gpus"] = result["num_gpus"]
     if result.get("error") and not merged.get("error"):
@@ -296,8 +331,8 @@ def _solve_slice_continuous(
         "cpu_verify_misses": 0,
     }
 
+    _drain_pool_messages(client)
     while budget > 0 and time.time() < slice_deadline:
-        _drain_pool_messages(client)
         remaining_sec = max(0.05, slice_deadline - time.time())
         result = solver.solve(
             solve_job,
@@ -309,20 +344,12 @@ def _solve_slice_continuous(
 
         if result.get("found"):
             merged["found"] = True
-            solutions = result.get("solutions") or [result]
-            for solution in solutions:
-                shares_in_slice += 1
-                if solo:
-                    if solution.get("is_block"):
-                        _submit_pool_share(
-                            client, solve_job, solution, solo=True,
-                        )
-                else:
-                    _submit_pool_share(
-                        client, solve_job, solution, solo=False,
-                    )
-                if max_shares_per_slice and shares_in_slice >= max_shares_per_slice:
-                    break
+            shares_in_slice += 1
+            if solo:
+                if result.get("is_block"):
+                    _submit_pool_share(client, solve_job, result, solo=True)
+            else:
+                _submit_pool_share(client, solve_job, result, solo=False)
 
             nonce_end = result.get("nonce64_end")
             if nonce_end is not None:
@@ -346,10 +373,14 @@ def _solve_slice_continuous(
     merged["elapsed_s"] = time.time() - slice_t0
     merged["shares_in_slice"] = shares_in_slice
     merged["nonce64_end"] = cursor - 1 if cursor > nonce_start else nonce_start
-    work = merged.get("tries_used") or 0
+    tries_work = merged.get("tries_used") or 0
+    gate_work = merged.get("gate_passes") or 0
     solver_elapsed = merged.get("solver_elapsed_s") or merged["elapsed_s"]
-    if solver_elapsed > 0 and work > 0:
-        merged["nonce_khps_total"] = work / solver_elapsed / 1000
+    if solver_elapsed > 0:
+        if tries_work > 0:
+            merged["nonce_khps_total"] = tries_work / solver_elapsed / 1000
+        if gate_work > 0:
+            merged["matmul_khps_total"] = gate_work / solver_elapsed / 1000
     if shares_in_slice > 1:
         log.info(
             "slice submitted %d shares (continuous-feed; pool credits each at current vardiff)",
@@ -380,7 +411,9 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
 
     nonces_per_slice = cfg.get("nonces_per_slice", 20_000_000)
     max_seconds_per_slice = cfg.get("solver_max_seconds_per_slice", 5.0)
-    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 1) or 0) if not solo else 0
+    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 1)) if not solo else 0
+    if not solo and pool_max_shares < 0:
+        pool_max_shares = 0
     if not solo and pool_max_shares == 1:
         log.info(
             "pool mode: 1 share/slice (dexbtx parity) — multi-share slices report "
@@ -443,12 +476,16 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             tries = result.get("tries_used", 0)
             gate_passes = result.get("gate_passes", 0)
             elapsed = result.get("elapsed_s", 0)
-            # tries_used counts sigma scans; gate_passes is full matmul work (post ε gate).
-            work = tries
+            # tries_used = sigma scans; gate_passes = full matmul work (post ε gate).
             if result.get("nonce_khps_total") is not None:
-                khps = float(result["nonce_khps_total"])
+                nonce_khps = float(result["nonce_khps_total"])
             else:
-                khps = work / elapsed / 1000 if elapsed > 0 else 0
+                nonce_khps = tries / elapsed / 1000 if elapsed > 0 else 0
+            matmul_khps = None
+            if result.get("matmul_khps_total") is not None:
+                matmul_khps = float(result["matmul_khps_total"])
+            elif gate_passes and elapsed > 0:
+                matmul_khps = gate_passes / elapsed / 1000
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
@@ -462,18 +499,18 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                     (current_job.target[:16] if current_job.target else "none"),
                 )
 
-            if work > 0 and elapsed > 0:
+            if tries > 0 and elapsed > 0:
                 solver_elapsed = float(
                     result.get("solver_elapsed_s") or elapsed
                 )
-                slice_nps = work / elapsed
-                gpu_nps = work / solver_elapsed if solver_elapsed > 0 else slice_nps
+                slice_nps = tries / elapsed
+                gpu_nps = tries / solver_elapsed if solver_elapsed > 0 else slice_nps
                 peak = max(
-                    float(getattr(solver, "_peak_gate_nps", 0) or 0),
+                    float(getattr(solver, "_peak_nonce_nps", 0) or 0),
                     slice_nps,
                     gpu_nps,
                 )
-                solver._peak_gate_nps = peak
+                solver._peak_nonce_nps = peak
                 if hasattr(solver, "last_observed_nps"):
                     solver.last_observed_nps = peak
 
@@ -481,7 +518,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 backend = result.get("backend", "?")
                 a = getattr(client, "shares_accepted", 0)
                 r = getattr(client, "shares_rejected", 0)
-                khps_line = _format_khps_line(result, khps)
+                khps_line = _format_khps_line(result, nonce_khps, matmul_khps)
                 gpu_tag = f" gpus={solver.num_gpus}" if solver.num_gpus > 1 else ""
                 pool_note = ""
                 if not solo:
@@ -512,19 +549,21 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if client._current_job is not None:
                 new_job = client._current_job
                 client._current_job = None
-                if current_job.should_replace(new_job):
-                    if current_job.prev_hash == new_job.prev_hash:
-                        new_job.nonce64_start = max(
-                            new_job.nonce64_start,
-                            int(result.get("nonce64_end", solve_job.nonce64_start)) + 1,
-                        )
+                if new_job.block_height != current_job.block_height:
                     log.info(
                         "job replaced: %s -> %s (clean=%s height=%d)",
                         current_job.job_id, new_job.job_id, new_job.clean_jobs,
                         new_job.block_height,
                     )
+                    _submitted_share_keys.clear()
                     current_job = new_job
                     continue
+                if new_job.clean_jobs and new_job.job_id != current_job.job_id:
+                    log.info(
+                        "job updated: %s -> %s (clean=%s height=%d nonce=%d)",
+                        current_job.job_id, new_job.job_id, new_job.clean_jobs,
+                        new_job.block_height, current_job.nonce64_start,
+                    )
                 current_job.merge_from(new_job)
 
             if solo:
@@ -535,22 +574,25 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if client._current_job is not None:
                 new_job = client._current_job
                 client._current_job = None
-                if current_job.should_replace(new_job):
-                    if current_job.prev_hash == new_job.prev_hash:
-                        new_job.nonce64_start = max(
-                            new_job.nonce64_start,
-                            int(result.get("nonce64_end", solve_job.nonce64_start)) + 1,
-                        )
+                if new_job.block_height != current_job.block_height:
                     log.info(
                         "new job: %s (clean=%s height=%d)",
                         new_job.job_id, new_job.clean_jobs, new_job.block_height,
                     )
+                    _submitted_share_keys.clear()
                     current_job = new_job
                     continue
-                log.debug(
-                    "job updated: %s -> %s (nonce=%d)",
-                    current_job.job_id, new_job.job_id, current_job.nonce64_start,
-                )
+                if new_job.clean_jobs and new_job.job_id != current_job.job_id:
+                    log.info(
+                        "job updated: %s -> %s (clean=%s height=%d nonce=%d)",
+                        current_job.job_id, new_job.job_id, new_job.clean_jobs,
+                        new_job.block_height, current_job.nonce64_start,
+                    )
+                else:
+                    log.debug(
+                        "job updated: %s -> %s (nonce=%d)",
+                        current_job.job_id, new_job.job_id, current_job.nonce64_start,
+                    )
                 current_job.merge_from(new_job)
 
             if solver.num_gpus > 1:
@@ -610,9 +652,9 @@ def run_miner():
         cfg["payout_address"] = args.payout_address
     if args.worker_name:
         cfg["worker_name"] = args.worker_name
-    if args.pool_host:
+    if args.pool_host is not None:
         cfg["pool_host"] = args.pool_host
-    if args.pool_port:
+    if args.pool_port is not None:
         cfg["pool_port"] = args.pool_port
     if args.solver_backend is not None:
         cfg["solver_backend"] = args.solver_backend
@@ -642,6 +684,12 @@ def run_miner():
         return
 
     cfg = validate_config(cfg)
+
+    if int(cfg.get("solver_batch_size", 128) or 128) > 65536:
+        log.warning(
+            "solver_batch_size=%s is very large; run --benchmark to confirm VRAM headroom",
+            cfg["solver_batch_size"],
+        )
 
     if not cfg.get("payout_address"):
         log.error("payout_address is required. Use --payout-address or set in config.yaml")

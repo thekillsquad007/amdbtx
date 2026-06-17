@@ -1,9 +1,9 @@
 # AMDBTX — AMD GPU Miner for BTX (Pool + Solo)
 
 A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on the
-[MineBtx pool](https://minebtx.com) **or solo** against your own `btxd` node.
+[BitMinerPool](https://bitminerpool.xyz) **or solo** against your own `btxd` node.
 
-- **Pool**: `stratum+tcp://stratum.minebtx.com:3333`
+- **Pool**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
 - **Solo**: `getblocktemplate` + `getmatmulchallenge` + `submitblock` via JSON-RPC
 - **Algorithm**: MatMul PoW (n=512, b=16, r=8, M31 field, sigma gate)
 - **Dev fee**: 2% transparent — time-sliced in pool mode, coinbase split in solo
@@ -61,7 +61,7 @@ Custom options:
 ```bash
 # With worker name and custom pool
 curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- \
-  --address btx1z... --worker myrig --pool stratum.minebtx.com:3333 --yes
+  --address btx1z... --worker myrig --pool stratum.bitminerpool.xyz:3333 --yes
 ```
 
 ### Windows (WSL2)
@@ -105,7 +105,7 @@ Edit `~/.amdbtx-miner/config.yaml` (generated during install). See
 
 ```yaml
 mining_mode: "pool"
-pool_host: "stratum.minebtx.com"
+pool_host: "stratum.bitminerpool.xyz"
 pool_port: 3333
 payout_address: "btx1z..."
 worker_name: "7800XT-ALPHA-1"
@@ -394,8 +394,8 @@ Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 ## Pool Information
 
-- **Pool Dashboard**: https://pool.minebtx.com
-- **Stratum**: `stratum+tcp://stratum.minebtx.com:3333`
+- **Pool Dashboard**: https://bitminerpool.xyz
+- **Stratum**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
 - **Algorithm**: MatMul PoW (BTX spec, n=512, b=16, r=8, M31 field)
 - **Pool Fee**: 2.5% (PPLNS, weekly payouts)
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
@@ -422,7 +422,7 @@ The pool does **not** create wallets. Visit https://easybtx.com/wallet to create
 
 ## Links
 
-- **Pool**: https://minebtx.com
-- **Dashboard**: https://pool.minebtx.com
+- **Pool**: https://bitminerpool.xyz
+- **Dashboard**: https://bitminerpool.xyz
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
 - **GitHub**: https://github.com/thekillsquad007/amdbtx

@@ -22,7 +22,7 @@ echo
 echo "=== 3. Write config ==="
 mkdir -p "${INSTALL_DIR}"
 cat > "${CONFIG_PATH}" <<CFG
-pool_host: "stratum.minebtx.com"
+pool_host: "stratum.bitminerpool.xyz"
 pool_port: 3333
 pool_tls: false
 payout_address: "${PAYOUT_ADDRESS}"

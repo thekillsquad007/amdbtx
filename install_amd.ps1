@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Address,
     [string]$Worker = "",
-    [string]$Pool = "stratum.minebtx.com:3333",
+    [string]$Pool = "stratum.bitminerpool.xyz:3333",
     [switch]$SkipWslInstall
 )
 
