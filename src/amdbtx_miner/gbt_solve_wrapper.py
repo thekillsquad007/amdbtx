@@ -1,7 +1,6 @@
 import subprocess
 import json
 import os
-import re
 import time
 import logging
 import threading
@@ -13,7 +12,7 @@ log = logging.getLogger(__name__)
 
 class GBTSolveWrapper:
     def __init__(self, solver_path: str, backend: str = "rocm", threads: int = 8,
-                 prepare_workers: int = 16, batch_size: int = 1024,
+                 prepare_workers: int = 16, batch_size: int = 65536,
                  prefetch_depth: int = 8, pipeline_async: int = 1,
                  gpu_inputs: int = 0, gpu_device: int = -1,
                  runtime_ld_path: str = ""):
@@ -29,38 +28,9 @@ class GBTSolveWrapper:
         self.runtime_ld_path = runtime_ld_path
         self.proc: subprocess.Popen | None = None
         self.last_observed_nps = None
-        self.solver_version = self._probe_solver_version()
-        self.supports_parent_mtp_v3 = self._supports_parent_mtp_v3(
-            self.solver_version
-        )
-        self._compat_error_logged = False
         self._stderr_thread: threading.Thread | None = None
         self._ready_event = threading.Event()
         self._start(allow_cpu_fallback=True)
-
-    def _probe_solver_version(self) -> str:
-        if not self.solver_path.exists():
-            return ""
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = self._build_ld_path()
-        try:
-            result = subprocess.run(
-                [str(self.solver_path), "--version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                env=env,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return ""
-        return (result.stdout or result.stderr).strip()
-
-    @staticmethod
-    def _supports_parent_mtp_v3(version_output: str) -> bool:
-        if "parent-MTP" in version_output:
-            return True
-        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version_output)
-        return bool(match and tuple(map(int, match.groups())) >= (2, 1, 0))
 
     def _build_ld_path(self) -> str:
         parts = []
@@ -184,29 +154,10 @@ class GBTSolveWrapper:
 
     def solve(self, job, nonce_start: int = 0, max_tries: int = 20_000_000,
               max_seconds: float = 5.0) -> dict:
-        from .stratum_client import Job
-
-        block_height = (
-            job.block_height if isinstance(job, Job)
-            else int(job.get("block_height", 0)) if isinstance(job, dict)
-            else 0
-        )
-        if block_height >= 130500 and not self.supports_parent_mtp_v3:
-            error = (
-                "solver is not BTX V3 compatible; install "
-                "btx-gbt-solve-hip 2.1.0 or newer"
-            )
-            if not self._compat_error_logged:
-                log.error(
-                    "%s (reported version: %s)",
-                    error,
-                    self.solver_version or "unknown",
-                )
-                self._compat_error_logged = True
-            return {"found": False, "error": error}
-
         if not self._ensure_running():
             return {"found": False, "error": "solver not running"}
+
+        from .stratum_client import Job
 
         if isinstance(job, Job):
             # Pool must supply params[6]; hard fallback avoids false share hits.
@@ -227,12 +178,10 @@ class GBTSolveWrapper:
                 "nonce_start": nonce_start,
                 "max_tries": max_tries,
                 "max_seconds": max_seconds,
-                # Result buffering is separate from daemon input prefetching.
-                "max_results": 64,
                 "share_target": share_target,
             }
             if job.parent_mtp is not None:
-                payload["parent_mtp"] = job.parent_mtp
+                payload["parent_mtp"] = int(job.parent_mtp)
         elif isinstance(job, dict):
             share_target = job.get("target", job.get("share_target", "ff" * 64))
             payload = {
@@ -251,7 +200,6 @@ class GBTSolveWrapper:
                 "nonce_start": int(job.get("nonce_start", nonce_start)),
                 "max_tries": int(job.get("max_tries", max_tries)),
                 "max_seconds": float(job.get("max_seconds", max_seconds)),
-                "max_results": int(job.get("max_results", 64)),
                 "share_target": share_target,
             }
             if job.get("parent_mtp") is not None:
@@ -271,7 +219,9 @@ class GBTSolveWrapper:
                 try:
                     result = json.loads(line.strip())
                     if "found" in result:
-                        elapsed = time.time() - t0
+                        solver_elapsed = float(result.get("elapsed_s", 0) or 0)
+                        wall_elapsed = time.time() - t0
+                        elapsed = solver_elapsed if solver_elapsed > 0 else wall_elapsed
                         tries = int(result.get("tries_used", 0) or 0)
                         if elapsed > 0 and tries > 0:
                             self.last_observed_nps = tries / elapsed
@@ -300,7 +250,7 @@ class MultiGPUSolver:
         backend: str = "rocm",
         threads: int = 8,
         prepare_workers: int = 16,
-        batch_size: int = 1024,
+        batch_size: int = 65536,
         prefetch_depth: int = 8,
         pipeline_async: int = 1,
         gpu_inputs: int = 0,
@@ -309,7 +259,7 @@ class MultiGPUSolver:
     ):
         self.gpu_devices = list(gpu_devices or [0])
         self.last_observed_nps: float | None = None
-        self._peak_gate_nps: float = 0.0
+        self._peak_nonce_nps: float = 0.0
         self.solvers: list[GBTSolveWrapper] = []
         for device in self.gpu_devices:
             self.solvers.append(
@@ -340,11 +290,14 @@ class MultiGPUSolver:
         total_tries = sum(int(r.get("tries_used", 0) or 0) for r in results)
         total_gate = sum(int(r.get("gate_passes", 0) or 0) for r in results)
         per_gpu_khps = []
+        per_gpu_matmul_khps = []
         for r in results:
             elapsed = float(r.get("elapsed_s", 0) or 0)
+            gate = int(r.get("gate_passes", 0) or 0)
             tries = int(r.get("tries_used", 0) or 0)
-            per_gpu_khps.append(
-                tries / elapsed / 1000 if elapsed > 0 else 0.0
+            per_gpu_khps.append(tries / elapsed / 1000 if elapsed > 0 else 0.0)
+            per_gpu_matmul_khps.append(
+                gate / elapsed / 1000 if elapsed > 0 and gate else 0.0
             )
 
         merged = {
@@ -353,11 +306,15 @@ class MultiGPUSolver:
             "gate_passes": total_gate,
             "elapsed_s": wall_elapsed,
             "per_gpu_khps": per_gpu_khps,
+            "per_gpu_matmul_khps": per_gpu_matmul_khps,
             "gpu_devices": list(self.gpu_devices),
             "num_gpus": self.num_gpus,
         }
-        if wall_elapsed > 0 and total_tries > 0:
-            merged["nonce_khps_total"] = total_tries / wall_elapsed / 1000
+        if wall_elapsed > 0:
+            if total_tries > 0:
+                merged["nonce_khps_total"] = total_tries / wall_elapsed / 1000
+            if total_gate > 0:
+                merged["matmul_khps_total"] = total_gate / wall_elapsed / 1000
 
         errors = [r.get("error") for r in results if r.get("error")]
         if errors and len(errors) == len(results):
@@ -371,19 +328,17 @@ class MultiGPUSolver:
         if found:
             blocks = [r for r in found if r.get("is_block")]
             winner = blocks[0] if blocks else found[0]
-            solutions = [
-                solution
-                for result in found
-                for solution in (result.get("solutions") or [result])
-            ]
             merged.update(winner)
             merged["found"] = True
-            merged["solutions"] = solutions
             merged["per_gpu_khps"] = per_gpu_khps
+            merged["per_gpu_matmul_khps"] = per_gpu_matmul_khps
             merged["gpu_devices"] = list(self.gpu_devices)
             merged["num_gpus"] = self.num_gpus
-            if wall_elapsed > 0 and total_tries > 0:
-                merged["nonce_khps_total"] = total_tries / wall_elapsed / 1000
+            if wall_elapsed > 0:
+                if total_tries > 0:
+                    merged["nonce_khps_total"] = total_tries / wall_elapsed / 1000
+                if total_gate > 0:
+                    merged["matmul_khps_total"] = total_gate / wall_elapsed / 1000
         return merged
 
     def solve(self, job, nonce_start: int = 0, max_tries: int = 20_000_000,

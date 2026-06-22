@@ -5,7 +5,6 @@ import uuid
 import logging
 import random
 import threading
-from collections import deque
 from typing import Any
 
 from . import PROTOCOL_CAPABILITIES, USER_AGENT, __version__
@@ -33,18 +32,34 @@ class Job:
 
     def __init__(self, **kwargs):
         for s in self.__slots__:
-            default = None if s == "parent_mtp" else (
-                0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start") else (
-                    "0" * 64 if s in ("prev_hash", "merkle_root", "seed_a", "seed_b", "target") else (
-                        "1d17c609" if s == "bits" else (
-                            False if s == "clean_jobs" else (
-                                time.time() if s == "received_at" else "")))))
+            default = 0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start") else (
+                None if s == "parent_mtp" else (
+                "0" * 64 if s in ("prev_hash", "merkle_root", "seed_a", "seed_b", "target") else (
+                    "1d17c609" if s == "bits" else (
+                        False if s == "clean_jobs" else (
+                            time.time() if s == "received_at" else "")))))
             setattr(self, s, kwargs.get(s, default))
+
+    @classmethod
+    def _validate_matmul(cls, matmul: dict, *, context: str) -> None:
+        missing = [k for k in ("seed_a", "seed_b", "block_height") if k not in matmul]
+        if missing:
+            raise ValueError(
+                f"notify missing required matmul fields: {missing} "
+                f"(got keys: {sorted(matmul.keys())}); {context}"
+            )
+        height = int(matmul.get("block_height", 0) or 0)
+        if height >= 130500 and matmul.get("parent_mtp") is None:
+            raise ValueError(
+                f"notify missing parent_mtp at block_height={height} "
+                f"(matmul_parent_mtp_seed_v3); {context}"
+            )
 
     @classmethod
     def from_notify(cls, params) -> "Job":
         if isinstance(params, list) and len(params) >= 6:
             matmul = params[8] if len(params) > 8 and isinstance(params[8], dict) else {}
+            cls._validate_matmul(matmul, context="refusing placeholder seeds")
             return cls(
                 job_id=params[0],
                 version=int(params[1]),
@@ -61,16 +76,14 @@ class Job:
                 matmul_b=int(matmul.get("matmul_b", 16)),
                 matmul_r=int(matmul.get("matmul_r", 8)),
                 epsilon_bits=int(matmul.get("epsilon_bits", 18)),
-                parent_mtp=(
-                    int(matmul["parent_mtp"])
-                    if matmul.get("parent_mtp") is not None else None
-                ),
+                parent_mtp=int(matmul["parent_mtp"]) if matmul.get("parent_mtp") is not None else None,
                 nonce64_start=int(matmul.get("nonce64_start", 0)),
             )
         if isinstance(params, dict):
             matmul = params.get("matmul", {})
             if isinstance(matmul, dict):
                 params = {**params, **matmul}
+            cls._validate_matmul(params, context="refusing placeholder seeds")
             return cls(
                 job_id=params.get("job_id", ""),
                 version=int(params.get("version", 0)),
@@ -86,16 +99,14 @@ class Job:
                 matmul_b=int(params.get("matmul_b", 16)),
                 matmul_r=int(params.get("matmul_r", 8)),
                 epsilon_bits=int(params.get("epsilon_bits", 18)),
-                parent_mtp=(
-                    int(params["parent_mtp"])
-                    if params.get("parent_mtp") is not None else None
-                ),
+                parent_mtp=int(params["parent_mtp"]) if params.get("parent_mtp") is not None else None,
                 nonce64_start=int(params.get("nonce64_start", 0)),
             )
         raise ValueError(f"cannot parse notify params: type={type(params)}")
 
     def should_replace(self, other: "Job") -> bool:
-        return bool(other.clean_jobs) or other.block_height != self.block_height
+        # Same-height notify rotations (clean=true) update job_id/target only.
+        return other.block_height != self.block_height
 
     def merge_from(self, other: "Job") -> None:
         """Apply same-height pool updates without resetting our nonce counter."""
@@ -142,8 +153,6 @@ class StratumClient:
         self.shares_rejected = 0
         self.blocks_found = 0
         self._pending_submits: dict[int, dict[str, Any]] = {}
-        self._submitted_share_keys: set[tuple[str, int, int]] = set()
-        self._submitted_share_order: deque[tuple[str, int, int]] = deque()
         self._current_job: Job | None = None
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
@@ -226,7 +235,7 @@ class StratumClient:
         else:
             log.info("no canonical name assigned, using address-only")
         log.info(
-            "pool vardiff: difficulty=%s (dashboard hashrate scales with this, not nonce_khps)",
+            "pool vardiff: difficulty=%s (dashboard hashrate scales with this, not matmul_khps)",
             self._difficulty,
         )
 
@@ -371,7 +380,16 @@ class StratumClient:
         if method == "mining.notify":
             params = msg.get("params", [])
             try:
-                self._current_job = Job.from_notify(params)
+                job = Job.from_notify(params)
+                # dexbtx v0.4.2: same-parent rotations must not reset nonce progress,
+                # even when clean=true (pool job_id rotation / vardiff retarget).
+                if (
+                    self._current_job is not None
+                    and self._current_job.prev_hash == job.prev_hash
+                    and self._current_job.block_height == job.block_height
+                ):
+                    job.nonce64_start = self._current_job.nonce64_start
+                self._current_job = job
                 log.info("notify job=%s height=%d clean=%s",
                          self._current_job.job_id, self._current_job.block_height,
                          self._current_job.clean_jobs)
@@ -472,23 +490,9 @@ class StratumClient:
 
     def submit_share(self, job: Job, result: dict, *, wait: bool = False):
         worker = self._submit_worker or self.worker_name or self.payout_address
-        nonce64 = int(result["nonce64"]) if "nonce64" in result else 0
-        nonce_hex = f"{nonce64:016x}" if "nonce64" in result else ""
+        nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime_val = int(result.get("ntime") or job.time)
         ntime = f"{ntime_val:08x}"
-        share_key = (job.prev_hash, ntime_val, nonce64)
-        if share_key in self._submitted_share_keys:
-            log.warning(
-                "duplicate share suppressed locally job=%s nonce=%s",
-                job.job_id, nonce_hex,
-            )
-            return
-        self._submitted_share_keys.add(share_key)
-        self._submitted_share_order.append(share_key)
-        while len(self._submitted_share_order) > 65536:
-            expired = self._submitted_share_order.popleft()
-            self._submitted_share_keys.discard(expired)
-
         extranonce2 = "00" * self._extranonce2_size
         params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
         log.info(

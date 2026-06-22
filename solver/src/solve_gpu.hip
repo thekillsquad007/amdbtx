@@ -116,7 +116,7 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         // The epsilon gate now compacts candidates before allocating full
         // MatMul state, so scan batches no longer consume one workspace per
         // input nonce.
-        launch_batch = std::min(launch_batch, 65536);
+        launch_batch = std::min(launch_batch, 131072);
     }
     launch_batch = std::max(1, launch_batch);
 
