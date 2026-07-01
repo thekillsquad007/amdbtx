@@ -27,6 +27,11 @@ set(HIP_ARCHS
     CACHE STRING "Semicolon-separated list of HIP offload architectures"
 )
 
+set(HIP_ARCH_FLAGS "")
+foreach(ARCH IN LISTS HIP_ARCHS)
+    list(APPEND HIP_ARCH_FLAGS "--offload-arch=${ARCH}")
+endforeach()
+
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/btx-gbt-solve-hip
     COMMAND ${HIPCC}
@@ -36,6 +41,7 @@ add_custom_command(
         -I${CMAKE_CURRENT_SOURCE_DIR}/src
         ${SOURCES}
         -lpthread
+        -Wl,-rpath,/opt/rocm/lib:/opt/rocm-7.2.0/lib
         -o ${CMAKE_CURRENT_BINARY_DIR}/btx-gbt-solve-hip
     DEPENDS ${SOURCES}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

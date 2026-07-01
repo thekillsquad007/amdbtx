@@ -113,7 +113,7 @@ gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve-hip"
 solver_backend: "rocm"     # "rocm" or "cpu"
 solver_threads: 8
 solver_prepare_workers: 16
-solver_batch_size: 4096
+solver_batch_size: 81920
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
 gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU

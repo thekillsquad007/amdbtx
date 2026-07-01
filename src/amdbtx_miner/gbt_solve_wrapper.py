@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 class GBTSolveWrapper:
     def __init__(self, solver_path: str, backend: str = "rocm", threads: int = 8,
-                 prepare_workers: int = 16, batch_size: int = 65536,
+                 prepare_workers: int = 16, batch_size: int = 81920,
                  prefetch_depth: int = 8, pipeline_async: int = 1,
                  gpu_inputs: int = 0, gpu_device: int = -1,
                  runtime_ld_path: str = ""):
@@ -83,6 +83,9 @@ class GBTSolveWrapper:
         env["BTX_MATMUL_PREPARE_PREFETCH_DEPTH"] = str(self.prefetch_depth)
         env["BTX_MATMUL_PIPELINE_ASYNC"] = str(self.pipeline_async)
         env["BTX_MATMUL_GPU_INPUTS"] = str(self.gpu_inputs)
+        # Default trust-GPU to ON; pool re-verifies all shares, so a bad GPU
+        # digest is just rejected.  Users can override via shell env.
+        env.setdefault("BTX_MATMUL_TRUST_GPU_SHARES", "1")
         # Post-125k the matmul seed folds nTime. Upstream btx-gbt-solve auto-refreshes
         # header time every 4096 attempts by default; the wrapper still submits the
         # original job ntime, so the pool recomputes a different digest (code-23).
@@ -250,7 +253,7 @@ class MultiGPUSolver:
         backend: str = "rocm",
         threads: int = 8,
         prepare_workers: int = 16,
-        batch_size: int = 65536,
+        batch_size: int = 81920,
         prefetch_depth: int = 8,
         pipeline_async: int = 1,
         gpu_inputs: int = 0,

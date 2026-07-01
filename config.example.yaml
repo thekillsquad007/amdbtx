@@ -17,7 +17,7 @@ solver_backend: "rocm"
 # Feed the GPU: bump threads first (dexbtx v0.4.4 finding). Start at 16, sweep to min(24, nproc-4).
 solver_threads: 16
 solver_prepare_workers: 16
-solver_batch_size: 4096
+solver_batch_size: 81920
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
 gpu_inputs: 0

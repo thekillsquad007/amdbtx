@@ -1757,6 +1757,57 @@ __global__ void batch_perturb_matrix_512x8_kernel(
         static_cast<uint32_t>(d_reduce64(acc)));
 }
 
+__global__ void batch_generate_perturb_matrix_512x8_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t tile_start =
+        static_cast<size_t>(blockIdx.x) * blockDim.x;
+    const size_t gid = tile_start + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = tile_start >> 18U;
+    const uint32_t local_base =
+        static_cast<uint32_t>(tile_start & (kMatrixElements - 1U));
+    const uint32_t local_index = local_base + threadIdx.x;
+    const uint32_t row = local_index >> 9U;
+    const uint32_t col = local_index & (kN - 1U);
+
+    const uint8_t* seed = seeds + batch_index * 32U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    __syncthreads();
+
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+               right[k * kN + col];
+        if ((k & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    const uint32_t base =
+        d_from_oracle_midstate(s_midstate, seed, local_index);
+    output[gid] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+}
+
 // One workgroup per output word. Threads map to the 16x16 compression
 // coordinates and accumulate all 32 inner blocks for that word.
 __global__ void batch_compressed_words_kernel(
@@ -1970,6 +2021,77 @@ __global__ void batch_build_right_noise_rhs_512x16x8_kernel(
     right_rhs[gid] = static_cast<uint32_t>(d_reduce64(acc));
 }
 
+__global__ void batch_build_right_noise_rhs_grouped_512x16x8_kernel(
+    const uint32_t* __restrict__ noise_fr,
+    const uint32_t* __restrict__ compress,
+    size_t total_pairs,
+    uint32_t* __restrict__ right_rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr uint32_t kPairsPerNonce = 32U * kB;
+    constexpr size_t kNoiseElements = size_t{kR} * kN;
+    constexpr size_t kRightRhsElements = 32U * kB * kR;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_pairs) {
+        return;
+    }
+
+    const size_t batch_index = gid / kPairsPerNonce;
+    const uint32_t local = static_cast<uint32_t>(gid & (kPairsPerNonce - 1U));
+    const uint32_t x = local & (kB - 1U);
+    const uint32_t j = local >> 4U;
+
+    const uint32_t* FR = noise_fr + batch_index * kNoiseElements;
+    const uint32_t* W = compress + (batch_index << 8U) + (x << 4U);
+
+    uint64_t acc0 = 0;
+    uint64_t acc1 = 0;
+    uint64_t acc2 = 0;
+    uint64_t acc3 = 0;
+    uint64_t acc4 = 0;
+    uint64_t acc5 = 0;
+    uint64_t acc6 = 0;
+    uint64_t acc7 = 0;
+
+    #pragma unroll
+    for (uint32_t y = 0; y < kB; ++y) {
+        const uint64_t w = W[y];
+        const uint32_t col = (j << 4U) + y;
+        acc0 += w * FR[col];
+        acc1 += w * FR[kN + col];
+        acc2 += w * FR[2U * kN + col];
+        acc3 += w * FR[3U * kN + col];
+        acc4 += w * FR[4U * kN + col];
+        acc5 += w * FR[5U * kN + col];
+        acc6 += w * FR[6U * kN + col];
+        acc7 += w * FR[7U * kN + col];
+        if ((y & 3U) == 3U) {
+            acc0 = d_reduce64(acc0);
+            acc1 = d_reduce64(acc1);
+            acc2 = d_reduce64(acc2);
+            acc3 = d_reduce64(acc3);
+            acc4 = d_reduce64(acc4);
+            acc5 = d_reduce64(acc5);
+            acc6 = d_reduce64(acc6);
+            acc7 = d_reduce64(acc7);
+        }
+    }
+
+    uint32_t* out = right_rhs + batch_index * kRightRhsElements +
+        ((j << 4U) + x) * kR;
+    out[0] = static_cast<uint32_t>(d_reduce64(acc0));
+    out[1] = static_cast<uint32_t>(d_reduce64(acc1));
+    out[2] = static_cast<uint32_t>(d_reduce64(acc2));
+    out[3] = static_cast<uint32_t>(d_reduce64(acc3));
+    out[4] = static_cast<uint32_t>(d_reduce64(acc4));
+    out[5] = static_cast<uint32_t>(d_reduce64(acc5));
+    out[6] = static_cast<uint32_t>(d_reduce64(acc6));
+    out[7] = static_cast<uint32_t>(d_reduce64(acc7));
+}
+
 __global__ void batch_build_factored_rhs_direct_512x16x8_kernel(
     const uint32_t* __restrict__ base_b,
     const uint32_t* __restrict__ noise_fl,
@@ -2028,6 +2150,7 @@ __global__ void batch_build_factored_rhs_direct_512x16x8_kernel(
 
 __global__ void batch_build_factored_rhs_fused_b_512x16x8_kernel(
     const uint8_t* __restrict__ seed_b,
+    const uint32_t* __restrict__ seed_b_midstates,
     const uint32_t* __restrict__ noise_fl,
     const uint32_t* __restrict__ right_rhs,
     const uint32_t* __restrict__ compress,
@@ -2042,7 +2165,6 @@ __global__ void batch_build_factored_rhs_fused_b_512x16x8_kernel(
     constexpr size_t kRightRhsElements = kBlocksPerAxis * kB * kR;
     constexpr uint32_t kTilesPerNonce = kBlocksPerAxis * kBlocksPerAxis;
 
-    __shared__ uint8_t s_seed[32];
     __shared__ uint32_t s_midstate[16];
     __shared__ uint32_t s_b[kB][kB];
 
@@ -2054,13 +2176,9 @@ __global__ void batch_build_factored_rhs_fused_b_512x16x8_kernel(
     const uint32_t tid = threadIdx.x;
 
     const uint8_t* seed = seed_b + static_cast<size_t>(batch_index) * 32U;
-    if (tid < 32U) {
-        s_seed[tid] = seed[tid];
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        d_compute_seed_midstate(s_seed, s_midstate);
+    if (tid < 16U) {
+        s_midstate[tid] =
+            seed_b_midstates[static_cast<size_t>(batch_index) * 16U + tid];
     }
     __syncthreads();
 
@@ -2068,7 +2186,7 @@ __global__ void batch_build_factored_rhs_fused_b_512x16x8_kernel(
     const uint32_t y = tid & (kB - 1U);
     const uint32_t m_for_b = (m_tile << 4U) + b_local_m;
     const uint32_t b_index = m_for_b * kN + (j << 4U) + y;
-    s_b[b_local_m][y] = d_from_oracle_midstate(s_midstate, s_seed, b_index);
+    s_b[b_local_m][y] = d_from_oracle_midstate(s_midstate, seed, b_index);
     __syncthreads();
 
     const uint32_t x = tid >> 4U;
@@ -2642,6 +2760,75 @@ void GenerateMatrixMidstate512(
         seeds, output);
 }
 
+__global__ void batch_generate_matrix_from_midstate_512_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid >> 18U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    __syncthreads();
+
+    const uint32_t local_index =
+        static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+    output[gid] = d_from_oracle_midstate(
+        s_midstate, seeds + batch_index * 32U, local_index);
+}
+
+void GenerateMatrixFromMidstate512(
+    const uint8_t* seeds,
+    const uint32_t* midstates,
+    size_t batch,
+    uint32_t* output)
+{
+    constexpr uint32_t kThreads = 256;
+    constexpr size_t kMatrixElements = size_t{512} * 512;
+    const size_t total_elements = batch * kMatrixElements;
+    const uint32_t blocks = static_cast<uint32_t>(
+        (total_elements + kThreads - 1) / kThreads);
+    batch_generate_matrix_from_midstate_512_kernel<<<blocks, kThreads>>>(
+        seeds, midstates, total_elements, output);
+}
+
+__global__ void batch_compute_seed_midstates_kernel(
+    const uint8_t* __restrict__ seeds,
+    size_t batch,
+    uint32_t* __restrict__ midstates)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) {
+        return;
+    }
+    d_compute_seed_midstate(
+        seeds + static_cast<size_t>(idx) * 32U,
+        midstates + static_cast<size_t>(idx) * 16U);
+}
+
+void ComputeSeedMidstates(
+    const uint8_t* seeds,
+    size_t batch,
+    uint32_t* midstates)
+{
+    constexpr uint32_t kThreads = 256;
+    const uint32_t blocks = static_cast<uint32_t>(
+        (batch + kThreads - 1) / kThreads);
+    batch_compute_seed_midstates_kernel<<<blocks, kThreads>>>(
+        seeds, batch, midstates);
+}
+
 struct DeviceMatrixCache {
     int device = -1;
     uint8_t seed_a[32]{};
@@ -2676,6 +2863,8 @@ struct BatchedMatMulPool {
     int device = -1;
     uint8_t* d_seed_a = nullptr;
     uint8_t* d_seed_b = nullptr;
+    uint32_t* d_seed_a_midstate = nullptr;
+    uint32_t* d_seed_b_midstate = nullptr;
     uint8_t* d_sigma = nullptr;
     uint8_t* d_noise_seeds = nullptr;
     uint8_t* d_compress_seeds = nullptr;
@@ -2717,12 +2906,17 @@ struct MatmulProfile {
     bool enabled = false;
     size_t scan_batch = 0;
     size_t passed = 0;
+    const char* words_path = "none";
+    char arch[64] = "unknown";
     float sigma_ms = 0.0f;
     float matrix_ms = 0.0f;
     float noise_seed_ms = 0.0f;
     float noise_ms = 0.0f;
     float compress_ms = 0.0f;
     float rhs_ms = 0.0f;
+    float rhs_a_ms = 0.0f;
+    float rhs_right_ms = 0.0f;
+    float rhs_b_ms = 0.0f;
     float words_ms = 0.0f;
     float hash_compare_ms = 0.0f;
 };
@@ -2766,6 +2960,8 @@ void FreeBatchedPool(BatchedMatMulPool& pool)
 {
     hipFree(pool.d_seed_a);
     hipFree(pool.d_seed_b);
+    hipFree(pool.d_seed_a_midstate);
+    hipFree(pool.d_seed_b_midstate);
     hipFree(pool.d_sigma);
     hipFree(pool.d_noise_seeds);
     hipFree(pool.d_compress_seeds);
@@ -2819,6 +3015,8 @@ bool EnsureBatchedPool(
     const bool ok =
         HipAlloc(pool.d_seed_a, batch * 32) &&
         HipAlloc(pool.d_seed_b, batch * 32) &&
+        HipAlloc(pool.d_seed_a_midstate, batch * 16) &&
+        HipAlloc(pool.d_seed_b_midstate, batch * 16) &&
         HipAlloc(pool.d_sigma, batch * 32) &&
         HipAlloc(pool.d_noise_seeds, batch * 4 * 32) &&
         HipAlloc(pool.d_compress_seeds, batch * 32) &&
@@ -3078,10 +3276,24 @@ bool ProcessPassedNoncesBatched(
     const uint32_t compress_elements = bsz * bsz;
     const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
     const bool use_fused_b_rhs = use_512x16x8 && !EnvEnabled("BTX_MATMUL_NO_FUSED_B");
+    const bool use_fused_a_perturb = use_512x16x8 &&
+        !EnvEnabled("BTX_MATMUL_NO_FUSED_A");
+    const bool use_precomputed_midstates = use_512x16x8 &&
+        (use_fused_a_perturb || !EnvEnabled("BTX_MATMUL_NO_PRECOMP_A_MIDSTATE"));
 
     {
         GpuStageTimer timer(profile && profile->enabled);
-        if (n == 512) {
+        if (use_precomputed_midstates) {
+            if (use_fused_a_perturb ||
+                !EnvEnabled("BTX_MATMUL_NO_PRECOMP_A_MIDSTATE")) {
+                ComputeSeedMidstates(pool.d_seed_a, batch, pool.d_seed_a_midstate);
+            }
+            if (use_fused_b_rhs) {
+                ComputeSeedMidstates(pool.d_seed_b, batch, pool.d_seed_b_midstate);
+            } else {
+                GenerateMatrixMidstate512(pool.d_seed_b, batch, pool.d_base_b);
+            }
+        } else if (n == 512) {
             GenerateMatrixMidstate512(pool.d_seed_a, batch, pool.d_base_a);
             if (!use_fused_b_rhs) {
                 GenerateMatrixMidstate512(pool.d_seed_b, batch, pool.d_base_b);
@@ -3139,24 +3351,69 @@ bool ProcessPassedNoncesBatched(
     {
         GpuStageTimer timer(profile && profile->enabled);
         if (use_512x16x8) {
-            batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
-                pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
-                total_matrix_elements, pool.d_matrix_a);
+            {
+                GpuStageTimer sub_timer(profile && profile->enabled);
+                if (use_fused_a_perturb) {
+                    const uint32_t fused_a_threads =
+                        EnvEnabled("BTX_MATMUL_FUSED_A_512T") ? 512U : 256U;
+                    const uint32_t fused_a_blocks = static_cast<uint32_t>(
+                        (total_matrix_elements + fused_a_threads - 1) /
+                        fused_a_threads);
+                    batch_generate_perturb_matrix_512x8_kernel<<<fused_a_blocks, fused_a_threads>>>(
+                        pool.d_seed_a, pool.d_seed_a_midstate,
+                        pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
+                        pool.d_matrix_a);
+                } else {
+                    if (use_precomputed_midstates) {
+                        GenerateMatrixFromMidstate512(
+                            pool.d_seed_a, pool.d_seed_a_midstate, batch,
+                            pool.d_base_a);
+                    }
+                    batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
+                        pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
+                        total_matrix_elements, pool.d_matrix_a);
+                }
+                if (profile && profile->enabled) {
+                    profile->rhs_a_ms += sub_timer.finish();
+                }
+            }
             const size_t right_rhs_elements = batch * 32U * 16U * 8U;
             const uint32_t right_rhs_blocks = static_cast<uint32_t>(
                 (right_rhs_elements + kThreads - 1) / kThreads);
-            batch_build_right_noise_rhs_512x16x8_kernel<<<right_rhs_blocks, kThreads>>>(
-                pool.d_noise_fr, pool.d_compress, right_rhs_elements,
-                pool.d_noise_er);
-            if (use_fused_b_rhs) {
-                const uint32_t fused_b_tiles = static_cast<uint32_t>(batch) * 32U * 32U;
-                batch_build_factored_rhs_fused_b_512x16x8_kernel<<<fused_b_tiles, kThreads>>>(
-                    pool.d_seed_b, pool.d_noise_fl, pool.d_noise_er,
-                    pool.d_compress, pool.d_matrix_b);
-            } else {
-                batch_build_factored_rhs_direct_512x16x8_kernel<<<matrix_blocks, kThreads>>>(
-                    pool.d_base_b, pool.d_noise_fl, pool.d_noise_er,
-                    pool.d_compress, total_matrix_elements, pool.d_matrix_b);
+            {
+                GpuStageTimer sub_timer(profile && profile->enabled);
+                if (EnvEnabled("BTX_MATMUL_OLD_RIGHT_RHS")) {
+                    batch_build_right_noise_rhs_512x16x8_kernel<<<right_rhs_blocks, kThreads>>>(
+                        pool.d_noise_fr, pool.d_compress, right_rhs_elements,
+                        pool.d_noise_er);
+                } else {
+                    const size_t right_rhs_pairs = batch * 32U * 16U;
+                    const uint32_t right_rhs_pair_blocks = static_cast<uint32_t>(
+                        (right_rhs_pairs + kThreads - 1) / kThreads);
+                    batch_build_right_noise_rhs_grouped_512x16x8_kernel<<<right_rhs_pair_blocks, kThreads>>>(
+                        pool.d_noise_fr, pool.d_compress, right_rhs_pairs,
+                        pool.d_noise_er);
+                }
+                if (profile && profile->enabled) {
+                    profile->rhs_right_ms += sub_timer.finish();
+                }
+            }
+            {
+                GpuStageTimer sub_timer(profile && profile->enabled);
+                if (use_fused_b_rhs) {
+                    const uint32_t fused_b_tiles = static_cast<uint32_t>(batch) * 32U * 32U;
+                    batch_build_factored_rhs_fused_b_512x16x8_kernel<<<fused_b_tiles, kThreads>>>(
+                        pool.d_seed_b, pool.d_seed_b_midstate,
+                        pool.d_noise_fl, pool.d_noise_er, pool.d_compress,
+                        pool.d_matrix_b);
+                } else {
+                    batch_build_factored_rhs_direct_512x16x8_kernel<<<matrix_blocks, kThreads>>>(
+                        pool.d_base_b, pool.d_noise_fl, pool.d_noise_er,
+                        pool.d_compress, total_matrix_elements, pool.d_matrix_b);
+                }
+                if (profile && profile->enabled) {
+                    profile->rhs_b_ms += sub_timer.finish();
+                }
             }
         } else {
             batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
@@ -3175,6 +3432,15 @@ bool ProcessPassedNoncesBatched(
         static_cast<uint32_t>(batch) * words_per_nonce;
     const bool use_wmma_words = use_512x16x8 && DeviceIsGfx11(device) &&
         !EnvEnabled("BTX_MATMUL_NO_WMMA");
+    if (profile && profile->enabled) {
+        if (use_wmma_words) {
+            profile->words_path = "wmma";
+        } else if (use_512x16x8) {
+            profile->words_path = "factored";
+        } else {
+            profile->words_path = "generic";
+        }
+    }
     {
         GpuStageTimer timer(profile && profile->enabled);
         if (use_wmma_words) {
@@ -3363,6 +3629,12 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     MatmulProfile profile{};
     profile.enabled = EnvEnabled("BTX_MATMUL_PROFILE");
     profile.scan_batch = batch;
+    if (profile.enabled) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) == hipSuccess) {
+            std::snprintf(profile.arch, sizeof(profile.arch), "%s", prop.gcnArchName);
+        }
+    }
     {
         GpuStageTimer timer(profile.enabled);
         init_scan_midstates_kernel<<<1, 1>>>(
@@ -3398,8 +3670,8 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     if (passed == 0) {
         if (profile.enabled) {
             std::fprintf(stderr,
-                "matmul_profile scan=%zu passed=0 sigma_ms=%.3f\n",
-                profile.scan_batch, profile.sigma_ms);
+                "matmul_profile scan=%zu passed=0 arch=%s words_path=none sigma_ms=%.3f\n",
+                profile.scan_batch, profile.arch, profile.sigma_ms);
         }
         return true;
     }
@@ -3422,12 +3694,16 @@ extern "C" bool LaunchMatMulTranscriptBatch(
 
     if (profile.enabled) {
         std::fprintf(stderr,
-            "matmul_profile scan=%zu passed=%zu sigma_ms=%.3f matrix_ms=%.3f "
+            "matmul_profile scan=%zu passed=%zu arch=%s words_path=%s "
+            "sigma_ms=%.3f matrix_ms=%.3f "
             "noise_seed_ms=%.3f noise_ms=%.3f compress_ms=%.3f rhs_ms=%.3f "
+            "rhs_a_ms=%.3f rhs_right_ms=%.3f rhs_b_ms=%.3f "
             "words_ms=%.3f hash_compare_ms=%.3f\n",
-            profile.scan_batch, profile.passed, profile.sigma_ms,
+            profile.scan_batch, profile.passed, profile.arch, profile.words_path,
+            profile.sigma_ms,
             profile.matrix_ms, profile.noise_seed_ms, profile.noise_ms,
-            profile.compress_ms, profile.rhs_ms, profile.words_ms,
+            profile.compress_ms, profile.rhs_ms, profile.rhs_a_ms,
+            profile.rhs_right_ms, profile.rhs_b_ms, profile.words_ms,
             profile.hash_compare_ms);
     }
 
