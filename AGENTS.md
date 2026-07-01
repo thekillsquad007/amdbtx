@@ -170,9 +170,24 @@ Why this matters:
 - Easy-target smoke with trust enabled returned GPU-found shares directly.
 - The old no-trust easy-target path became heavy enough under live mining contention that it had to be killed, which is consistent with the suspected CPU verify stall.
 
+## Recent Fix: Slice Alignment
+
+Live profiling showed repeated partial tail batches:
+
+- With `solver_batch_size=131072` and `nonces_per_slice=2,000,000`, each slice runs 15 full batches plus one `33920` tail batch.
+- Tail batches have worse per-nonce overhead because launch/sync costs are not fully amortized.
+
+Fix:
+
+- `src/amdbtx_miner/__main__.py` now aligns `nonces_per_slice` down to a multiple of `solver_batch_size` at mining-loop startup.
+- Example: `2,000,000 -> 1,966,080` for batch `131072`.
+- Nonce continuity is preserved because the next cursor advances from `nonce64_end`.
+- The installed venv imports the miner package from `/mnt/e/Business/amdbtx/src`, so this Python change is active after miner restart without rebuilding the wheel.
+
 ## Experiments Tried And Reverted Earlier
 
 - Fused hash+compare: slower due register pressure.
+- Corrected 128-thread fused-B tile variant: no meaningful `rhs_b_ms` gain, slower/noisier overall, and compiler could not fully unroll the loop; reverted.
 - Launch bounds on perturb/fused-B: slower.
 - Cold/noinline oracle fallback: slower.
 - Oracle `!= kFieldModulus` fast check: neutral; reverted.
