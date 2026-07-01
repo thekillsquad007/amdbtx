@@ -68,6 +68,20 @@ static bool EnvEnabled(const char* name)
     return value && value[0] != '\0' && value[0] != '0';
 }
 
+static int EnvPositiveInt(const char* name, int fallback)
+{
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
 bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
               const Uint256& block_target, const Uint256& share_target,
               uint64_t& max_tries, double max_seconds,
@@ -123,7 +137,9 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         // The epsilon gate now compacts candidates before allocating full
         // MatMul state, so scan batches no longer consume one workspace per
         // input nonce.
-        launch_batch = std::min(launch_batch, 131072);
+        launch_batch = std::min(
+            launch_batch,
+            EnvPositiveInt("BTX_MATMUL_MAX_SCAN_BATCH", 131072));
     }
     launch_batch = std::max(1, launch_batch);
 

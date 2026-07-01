@@ -96,7 +96,7 @@ pool_host: 127.0.0.1
 pool_port: 3333
 pool_tls: false
 solver_backend: rocm
-solver_batch_size: 131072
+solver_batch_size: 524288
 solver_prepare_workers: 24
 solver_threads: 8
 solver_prefetch_depth: 8
@@ -105,7 +105,19 @@ gpu_inputs: 0
 worker_name: AMD-RX7800XT
 ```
 
-Repo defaults currently differ in some places and were previously moved toward `81920`. The live miner was using `131072`.
+Repo defaults currently differ in some places and were previously moved toward `81920`.
+The live miner was previously using `131072`; controlled v3 tests found `524288`
+faster on RX 7800 XT.
+
+Latest v3 batch sweep with rebuilt solver and `BTX_MATMUL_WMMA=1`:
+
+- `131072`: `58.01 MN/s` for a 19.9M nonce v3 scan.
+- `262144`: `66.55 MN/s`.
+- `524288`: `72.46 MN/s`.
+- `1048576`: regressed to `31.45 MN/s`.
+
+Keep `524288` as the current RX 7800 XT v3 candidate, but do not assume larger
+is better.
 
 ## Current Source Changes Worth Keeping
 

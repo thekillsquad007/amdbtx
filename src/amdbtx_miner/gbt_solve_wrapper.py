@@ -83,6 +83,8 @@ class GBTSolveWrapper:
         env["BTX_MATMUL_PREPARE_PREFETCH_DEPTH"] = str(self.prefetch_depth)
         env["BTX_MATMUL_PIPELINE_ASYNC"] = str(self.pipeline_async)
         env["BTX_MATMUL_GPU_INPUTS"] = str(self.gpu_inputs)
+        if self.batch_size > 131072:
+            env.setdefault("BTX_MATMUL_MAX_SCAN_BATCH", str(self.batch_size))
         # Default trust-GPU to ON; pool re-verifies all shares, so a bad GPU
         # digest is just rejected.  Users can override via shell env.
         env.setdefault("BTX_MATMUL_TRUST_GPU_SHARES", "1")

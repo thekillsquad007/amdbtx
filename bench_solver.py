@@ -36,7 +36,8 @@ BASE_JOB = {
     "bits": "1d1ccc7b",
     "seed_a": "43b5b748c3ad0928e56256e7c687c4907745220ba7053bc56905942c9a0fa1b2",
     "seed_b": "1190c8ed806ea11336f3ad6a20adb9da0beb7b05772afab86c38c67c919ae645",
-    "block_height": 125874,
+    "block_height": 147000,
+    "parent_mtp": 1782910000,
     "matmul_n": 512, "matmul_b": 16, "matmul_r": 8, "epsilon_bits": 18,
 }
 
@@ -53,6 +54,8 @@ def one_run(solver, tries, share_target, extra_env, batch="131072"):
     env["LD_LIBRARY_PATH"] = LD
     env["HSA_ENABLE_DXG_DETECTION"] = "1"
     env["BTX_MATMUL_PROFILE"] = "1"
+    if int(batch) > 131072:
+        env.setdefault("BTX_MATMUL_MAX_SCAN_BATCH", batch)
     env.update(extra_env)
     p = subprocess.Popen(
         [solver, "--daemon", "--backend", "hip", "--batch-size", batch,
