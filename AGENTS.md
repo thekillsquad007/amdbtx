@@ -184,6 +184,29 @@ Fix:
 - Nonce continuity is preserved because the next cursor advances from `nonce64_end`.
 - The installed venv imports the miner package from `/mnt/e/Business/amdbtx/src`, so this Python change is active after miner restart without rebuilding the wheel.
 
+## Recent Root Cause: Pool Hashrate Was Capped By Dropped Shares
+
+The pool dashboard staying around `~1.20 kN/s` despite high local solver throughput is most likely not a GPU kernel issue.
+
+Important finding:
+
+- The C++ solver can return a `solutions` array with multiple valid shares from one solve call.
+- The Python mining loop previously treated `found=True` as a single share and submitted only the top-level `nonce64`.
+- Extra valid shares in `result["solutions"]` were silently ignored, which directly lowers pool-credit hashrate.
+- `pool_max_shares_per_slice: 0` was documented as unlimited, but `validate_config()` converted `0` back to `1`, preserving a one-share-per-slice cap.
+
+Fix:
+
+- `_solve_slice_continuous()` now iterates over `result["solutions"]` and submits each valid solution.
+- `_submit_pool_share()` now returns `True` only when a share is actually sent, so `shares_in_slice` tracks submitted shares.
+- `pool_max_shares_per_slice=0` now truly means unlimited.
+- Regression tests are in `tests/test_pool_share_submission.py` and must be force-added because `.gitignore` ignores `test_*.py`.
+
+Expected effect:
+
+- This should materially improve pool dashboard hashrate when vardiff is low/moderate and solver calls return multiple solutions.
+- This does not change raw local GPU MN/s; it changes how many valid shares reach the pool.
+
 ## Experiments Tried And Reverted Earlier
 
 - Fused hash+compare: slower due register pressure.

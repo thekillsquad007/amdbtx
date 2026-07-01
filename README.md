@@ -116,6 +116,7 @@ solver_prepare_workers: 16
 solver_batch_size: 81920
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
+pool_max_shares_per_slice: 0  # 0 = submit every valid share returned by solver
 gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU
 # gpu_devices: "all"     # multi-GPU: "all", "0,1", or [0, 1] — hashrate stacks
 nonces_per_slice: 20000000

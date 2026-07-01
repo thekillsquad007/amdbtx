@@ -256,7 +256,7 @@ def _share_submit_key(solve_job: Job, result: dict) -> tuple[str, int, int]:
     return (solve_job.job_id, ntime, nonce)
 
 
-def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> None:
+def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> bool:
     _drain_pool_messages(client)
     if not solo:
         key = _share_submit_key(solve_job, result)
@@ -265,7 +265,7 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> N
                 "skip resubmit job=%s nonce=%016x (already submitted this session)",
                 solve_job.job_id, key[2],
             )
-            return
+            return False
         _submitted_share_keys.add(key)
     if not solo and client._current_job is not None:
         if client._current_job.job_id != solve_job.job_id:
@@ -282,6 +282,7 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> N
         result.get("ntime", solve_job.time),
     )
     client.submit_share(solve_job, result, wait=solo and bool(result.get("is_block")))
+    return True
 
 
 def _accumulate_slice_stats(merged: dict, result: dict) -> None:
@@ -344,12 +345,14 @@ def _solve_slice_continuous(
 
         if result.get("found"):
             merged["found"] = True
-            shares_in_slice += 1
-            if solo:
-                if result.get("is_block"):
-                    _submit_pool_share(client, solve_job, result, solo=True)
-            else:
-                _submit_pool_share(client, solve_job, result, solo=False)
+            share_results = result.get("solutions") or [result]
+            for share_result in share_results:
+                if solo and not share_result.get("is_block"):
+                    continue
+                if max_shares_per_slice and shares_in_slice >= max_shares_per_slice:
+                    break
+                if _submit_pool_share(client, solve_job, share_result, solo=solo):
+                    shares_in_slice += 1
 
             nonce_end = result.get("nonce64_end")
             if nonce_end is not None:
@@ -411,7 +414,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
 
     nonces_per_slice = cfg.get("nonces_per_slice", 20_000_000)
     max_seconds_per_slice = cfg.get("solver_max_seconds_per_slice", 5.0)
-    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 1)) if not solo else 0
+    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 0)) if not solo else 0
     solver_batch_size = int(cfg.get("solver_batch_size", 0) or 0)
     if solver_batch_size > 1 and nonces_per_slice > solver_batch_size:
         aligned_nonces = (int(nonces_per_slice) // solver_batch_size) * solver_batch_size
@@ -426,9 +429,8 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
         pool_max_shares = 0
     if not solo and pool_max_shares == 1:
         log.info(
-            "pool mode: 1 share/slice (dexbtx parity) — multi-share slices report "
-            "low solver_nps and keep vardiff at floor; raise pool_max_shares_per_slice "
-            "only after vardiff has ramped"
+            "pool mode: limiting to 1 submitted share per slice; "
+            "set pool_max_shares_per_slice=0 to submit every valid solver result"
         )
     current_job = None
     log_interval = 30

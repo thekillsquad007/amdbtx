@@ -44,10 +44,9 @@ def validate_config(cfg: dict) -> dict:
         "gpu_inputs": 0,
         "nonces_per_slice": 20_000_000,
         "solver_max_seconds_per_slice": 5.0,
-        # Pool: cap shares per 5s slice (dexbtx submits at most one). Multi-share
-        # slices stop the GPU early and report low solver_nps, so vardiff stays at
-        # floor (~0.5 n/s/share) no matter how many shares you submit.
-        "pool_max_shares_per_slice": 1,
+        # Pool: cap shares per 5s slice. 0 means submit every valid share
+        # returned by the solver.
+        "pool_max_shares_per_slice": 0,
         "reconnect_initial_s": 1.0,
     "reconnect_max_s": 60.0,
     "log_level": "INFO",
@@ -58,8 +57,9 @@ def validate_config(cfg: dict) -> dict:
     for k, v in defaults.items():
         if k not in cfg:
             cfg[k] = v
-    # YAML `0` was treated as unlimited shares/slice, which tanks pool vardiff.
     raw_pool_cap = cfg.get("pool_max_shares_per_slice")
-    if raw_pool_cap is None or int(raw_pool_cap) <= 0:
-        cfg["pool_max_shares_per_slice"] = 1
+    if raw_pool_cap is None:
+        cfg["pool_max_shares_per_slice"] = 0
+    else:
+        cfg["pool_max_shares_per_slice"] = max(0, int(raw_pool_cap))
     return cfg
