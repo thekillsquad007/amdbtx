@@ -499,6 +499,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             elif gate_passes and elapsed > 0:
                 matmul_khps = gate_passes / elapsed / 1000
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
+            gate_ppm = (gate_passes / tries * 1_000_000) if tries else 0.0
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
 
@@ -549,9 +550,10 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 slice_shares = result.get("shares_in_slice", 0)
                 slice_tag = f" slice_shares={slice_shares}" if slice_shares else ""
                 log.info(
-                    "solve: nonce=%d tries=%d gate=%d gate/s=%.0f elapsed=%.2fs "
+                    "solve: nonce=%d tries=%d gate=%d gate/s=%.0f gate_ppm=%.2f elapsed=%.2fs "
                     "%s backend=%s%s found=%s shares=%d/%d target=%s%s%s",
-                    current_job.nonce64_start, tries, gate_passes, gate_per_s, elapsed,
+                    current_job.nonce64_start, tries, gate_passes, gate_per_s,
+                    gate_ppm, elapsed,
                     khps_line, backend, gpu_tag, result.get("found"), a, r,
                     (current_job.target[:12] if current_job.target else "none"),
                     pool_note, slice_tag,
