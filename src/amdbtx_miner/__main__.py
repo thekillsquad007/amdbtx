@@ -547,6 +547,13 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                             " (dashboard n/s = shares × per-share credit;"
                             " nonce_khps does not appear on pool; vardiff must ramp)"
                         )
+                    if hasattr(client, "pool_credit_stats"):
+                        stats = client.pool_credit_stats(60.0)
+                        pool_note += (
+                            f" pool_est_60s=a{int(stats['accepted'])}"
+                            f" diff_avg={stats['avg_diff']:.6g}"
+                            f" credit/min={stats['credit_per_min']:.6g}"
+                        )
                 slice_shares = result.get("shares_in_slice", 0)
                 slice_tag = f" slice_shares={slice_shares}" if slice_shares else ""
                 log.info(

@@ -5,6 +5,7 @@ import uuid
 import logging
 import random
 import threading
+from collections import deque
 from typing import Any
 
 from . import PROTOCOL_CAPABILITIES, USER_AGENT, __version__
@@ -153,6 +154,7 @@ class StratumClient:
         self.shares_rejected = 0
         self.blocks_found = 0
         self._pending_submits: dict[int, dict[str, Any]] = {}
+        self._accepted_share_events: deque[tuple[float, float]] = deque()
         self._current_job: Job | None = None
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
@@ -336,6 +338,9 @@ class StratumClient:
             )
             return
         self.shares_accepted += 1
+        difficulty = float(meta.get("difficulty", self._difficulty) or self._difficulty)
+        self._accepted_share_events.append((time.time(), difficulty))
+        self._prune_accepted_share_events(time.time() - 600.0)
         is_block = meta.get("is_block", False)
         if is_block:
             self.blocks_found += 1
@@ -506,6 +511,7 @@ class StratumClient:
             "job_id": job.job_id,
             "nonce_hex": nonce_hex,
             "is_block": is_block,
+            "difficulty": float(self._difficulty or 0.0),
             "sent_at": time.time(),
         }
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
@@ -522,6 +528,26 @@ class StratumClient:
             self._dispatch_message(resp)
         self._pending_submits.pop(msg_id, None)
         log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
+
+    def _prune_accepted_share_events(self, cutoff: float) -> None:
+        while self._accepted_share_events and self._accepted_share_events[0][0] < cutoff:
+            self._accepted_share_events.popleft()
+
+    def pool_credit_stats(self, window_sec: float = 60.0) -> dict[str, float]:
+        """Rolling accepted-share estimate using submit-time vardiff credit."""
+        now = time.time()
+        cutoff = now - window_sec
+        self._prune_accepted_share_events(now - max(window_sec, 600.0))
+        events = [(ts, diff) for ts, diff in self._accepted_share_events if ts >= cutoff]
+        accepted = len(events)
+        credit = sum(diff for _, diff in events)
+        return {
+            "window_sec": float(window_sec),
+            "accepted": float(accepted),
+            "credit": float(credit),
+            "credit_per_min": credit * 60.0 / window_sec if window_sec > 0 else 0.0,
+            "avg_diff": credit / accepted if accepted else 0.0,
+        }
 
     def report_metrics(self, solver_nps: float, shares_total: int = 0) -> None:
         if solver_nps <= 0 or self.sock is None:

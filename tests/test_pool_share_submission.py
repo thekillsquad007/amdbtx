@@ -1,7 +1,10 @@
+import time
+from collections import deque
+
 from amdbtx_miner.__main__ import _solve_slice_continuous, _submitted_share_keys
 from amdbtx_miner.config import validate_config
 from amdbtx_miner.gbt_solve_wrapper import MultiGPUSolver
-from amdbtx_miner.stratum_client import Job
+from amdbtx_miner.stratum_client import Job, StratumClient
 
 
 class DummySolver:
@@ -143,3 +146,41 @@ def test_single_gpu_solver_derives_observed_nps_when_child_metric_missing():
     solver.solve(_job(), nonce_start=0, max_tries=1000, max_seconds=1.0)
 
     assert solver.last_observed_nps == 500.0
+
+
+def test_share_accept_records_submit_difficulty_for_pool_credit():
+    client = StratumClient.__new__(StratumClient)
+    client._difficulty = 1.0
+    client._pending_submits = {
+        7: {
+            "job_id": "job-1",
+            "nonce_hex": "00",
+            "is_block": False,
+            "difficulty": 0.25,
+        }
+    }
+    client._accepted_share_events = deque()
+    client.shares_accepted = 0
+    client.shares_rejected = 0
+    client.blocks_found = 0
+
+    client._complete_pending_submit(7, {"id": 7, "result": True})
+
+    assert client.shares_accepted == 1
+    assert list(client._accepted_share_events)[0][1] == 0.25
+
+
+def test_pool_credit_stats_reports_recent_credit_per_minute():
+    client = StratumClient.__new__(StratumClient)
+    now = time.time()
+    client._accepted_share_events = deque([
+        (now - 10.0, 0.5),
+        (now - 70.0, 4.0),
+    ])
+
+    stats = client.pool_credit_stats(60.0)
+
+    assert stats["accepted"] == 1.0
+    assert stats["credit"] == 0.5
+    assert stats["avg_diff"] == 0.5
+    assert stats["credit_per_min"] == 0.5
