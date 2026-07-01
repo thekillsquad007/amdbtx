@@ -412,6 +412,16 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
     nonces_per_slice = cfg.get("nonces_per_slice", 20_000_000)
     max_seconds_per_slice = cfg.get("solver_max_seconds_per_slice", 5.0)
     pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 1)) if not solo else 0
+    solver_batch_size = int(cfg.get("solver_batch_size", 0) or 0)
+    if solver_batch_size > 1 and nonces_per_slice > solver_batch_size:
+        aligned_nonces = (int(nonces_per_slice) // solver_batch_size) * solver_batch_size
+        if aligned_nonces != nonces_per_slice:
+            log.info(
+                "aligning nonces_per_slice %d -> %d to avoid partial GPU batch "
+                "(solver_batch_size=%d)",
+                nonces_per_slice, aligned_nonces, solver_batch_size,
+            )
+            nonces_per_slice = aligned_nonces
     if not solo and pool_max_shares < 0:
         pool_max_shares = 0
     if not solo and pool_max_shares == 1:
