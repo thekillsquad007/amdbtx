@@ -207,6 +207,35 @@ Expected effect:
 - This should materially improve pool dashboard hashrate when vardiff is low/moderate and solver calls return multiple solutions.
 - This does not change raw local GPU MN/s; it changes how many valid shares reach the pool.
 
+## Recent Root Cause: Single-GPU Pool Metrics Went Stale
+
+The pool-facing hashrate can still lag even after raw solver speed improves if
+`worker.report_metrics` is stale or absent.
+
+Important finding:
+
+- `StratumClient.start_metrics_reporter()` is given the `MultiGPUSolver` object.
+- The inner `GBTSolveWrapper` updated `last_observed_nps`, but the single-GPU
+  `MultiGPUSolver.solve()` path returned immediately without copying that value.
+- The multi-GPU merge path did update `MultiGPUSolver.last_observed_nps`, so the
+  bug was specific to the common one-GPU setup.
+- Live logs showed `report_metrics solver_nps=66666667` while profile data was
+  closer to `~100 MN/s`, meaning the pool could be making vardiff/dashboard
+  decisions from stale local speed.
+
+Fix:
+
+- Single-GPU `MultiGPUSolver.solve()` now propagates the inner solver's
+  `last_observed_nps` after every solve.
+- If the child metric is missing, the wrapper derives it from `tries_used / elapsed_s`.
+- Regression coverage is in `tests/test_pool_share_submission.py`.
+
+Expected effect:
+
+- Pool vardiff/dashboard should see fresher solver speed after miner restart.
+- This is separate from raw GPU kernel throughput and from the multi-share
+  submission fix; both pool-facing fixes are needed before comparing to other rigs.
+
 ## Experiments Tried And Reverted Earlier
 
 - Fused hash+compare: slower due register pressure.

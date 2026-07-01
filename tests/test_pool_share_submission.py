@@ -1,5 +1,6 @@
 from amdbtx_miner.__main__ import _solve_slice_continuous, _submitted_share_keys
 from amdbtx_miner.config import validate_config
+from amdbtx_miner.gbt_solve_wrapper import MultiGPUSolver
 from amdbtx_miner.stratum_client import Job
 
 
@@ -48,6 +49,18 @@ class DummyClient:
 
     def submit_share(self, job, result, *, wait=False):
         self.submitted.append(result)
+
+
+class DummyInnerSolver:
+    def __init__(self, last_observed_nps):
+        self.last_observed_nps = last_observed_nps
+
+    def solve(self, job, nonce_start=0, max_tries=0, max_seconds=0):
+        return {
+            "found": False,
+            "tries_used": max_tries,
+            "elapsed_s": 2.0,
+        }
 
 
 def _job():
@@ -108,3 +121,25 @@ def test_slice_share_cap_applies_to_submitted_solutions():
 def test_pool_share_cap_zero_remains_unlimited():
     cfg = validate_config({"pool_max_shares_per_slice": 0})
     assert cfg["pool_max_shares_per_slice"] == 0
+
+
+def test_single_gpu_solver_propagates_observed_nps_for_pool_metrics():
+    solver = MultiGPUSolver.__new__(MultiGPUSolver)
+    solver.gpu_devices = [0]
+    solver.solvers = [DummyInnerSolver(123_456_789.0)]
+    solver.last_observed_nps = None
+
+    solver.solve(_job(), nonce_start=0, max_tries=1000, max_seconds=1.0)
+
+    assert solver.last_observed_nps == 123_456_789.0
+
+
+def test_single_gpu_solver_derives_observed_nps_when_child_metric_missing():
+    solver = MultiGPUSolver.__new__(MultiGPUSolver)
+    solver.gpu_devices = [0]
+    solver.solvers = [DummyInnerSolver(None)]
+    solver.last_observed_nps = None
+
+    solver.solve(_job(), nonce_start=0, max_tries=1000, max_seconds=1.0)
+
+    assert solver.last_observed_nps == 500.0

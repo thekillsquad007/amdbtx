@@ -350,9 +350,16 @@ class MultiGPUSolver:
             return {"found": False, "error": "no solvers configured"}
 
         if len(self.solvers) == 1:
-            return self.solvers[0].solve(
+            result = self.solvers[0].solve(
                 job, nonce_start=nonce_start, max_tries=max_tries, max_seconds=max_seconds,
             )
+            observed_nps = self.solvers[0].last_observed_nps
+            if not observed_nps:
+                elapsed = float(result.get("elapsed_s", 0) or 0)
+                tries = int(result.get("tries_used", 0) or 0)
+                observed_nps = tries / elapsed if elapsed > 0 and tries > 0 else None
+            self.last_observed_nps = observed_nps
+            return result
 
         results: list[dict] = []
         t0 = time.time()
