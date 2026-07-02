@@ -95,6 +95,20 @@ log()  { echo -e "\033[1;34m[amdbtx]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[warn]\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31m[error]\033[0m $*" >&2; exit 1; }
 
+# Running `cd ~/.amdbtx-miner && curl ... | bash` deletes the cwd mid-install;
+# pip then crashes in os.getcwd() with FileNotFoundError.
+leave_path_if_inside() {
+    local target="$1"
+    [[ -n "$target" ]] || return 0
+    local cwd
+    cwd="$(pwd -P 2>/dev/null || pwd 2>/dev/null || echo "")"
+    [[ -n "$cwd" ]] || return 0
+    if [[ "$cwd" == "$target" || "$cwd" == "$target"/* ]]; then
+        cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+        log "moved out of ${target} (was shell cwd) → $(pwd)"
+    fi
+}
+
 need() {
     command -v "$1" >/dev/null 2>&1 || err "missing required tool: $1"
 }
@@ -115,7 +129,8 @@ sudo_cmd() {
 
 apt_install() {
     have_apt || return 1
-    sudo_cmd apt-get update -qq
+    repair_rocm_apt_repo_if_present
+    sudo_cmd apt-get update -qq 2>&1 | grep -vE '^(W:|N:).*NO_PUBKEY' || true
     sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
 }
 
@@ -187,6 +202,9 @@ confirm() {
 }
 
 # ─── OS + GPU Detection ────────────────────────────────────────────────────
+leave_path_if_inside "$INSTALL_DIR"
+leave_path_if_inside "$VENV_DIR"
+
 log "AMDBTX miner installer — AMD GPU edition"
 
 # HSA_ENABLE_DXG_DETECTION is required for AMD GPU detection in WSL2.
@@ -633,6 +651,8 @@ if ! "$PYTHON" -m venv --help >/dev/null 2>&1; then
 fi
 
 # ─── Clean previous installation ────────────────────────────────────────────
+leave_path_if_inside "$INSTALL_DIR"
+leave_path_if_inside "$VENV_DIR"
 if [[ -d "$INSTALL_DIR" ]]; then
     log "removing previous installation at ${INSTALL_DIR}..."
     rm -rf "$INSTALL_DIR"
