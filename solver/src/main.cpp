@@ -127,6 +127,8 @@ int main(int argc, char* argv[]) {
     while (std::getline(std::cin, line)) {
         if (line.empty() || line[0] == '#') continue;
 
+        try {
+
         uint32_t job_n = config.matmul_n;
         uint32_t job_b = config.matmul_b;
         uint32_t job_r = config.matmul_r;
@@ -292,6 +294,14 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "\"backend\":\"" << backend_used << "\"";
         std::cout << "}" << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cout
+                << "{\"found\":false,\"error\":\"solver exception: "
+                << e.what()
+                << "\",\"backend\":\"" << config.backend << "\"}"
+                << std::endl;
+        }
     }
 
     return 0;

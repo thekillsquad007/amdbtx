@@ -1,6 +1,8 @@
 # Build artifacts
 build/
+solver/build*/
 dist/
+release/
 release-artifacts/
 *.egg-info/
 *.whl
