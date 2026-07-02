@@ -11,6 +11,18 @@ log = logging.getLogger(__name__)
 
 
 class GBTSolveWrapper:
+    @staticmethod
+    def _supports_parent_mtp_v3(version_output: str) -> bool:
+        text = str(version_output or "").lower()
+        if "parent-mtp" in text or "parent_mtp" in text:
+            return True
+        import re
+        match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+        if not match:
+            return False
+        major, minor, patch = (int(part) for part in match.groups())
+        return (major, minor, patch) >= (2, 1, 0)
+
     def __init__(self, solver_path: str, backend: str = "rocm", threads: int = 8,
                  prepare_workers: int = 16, batch_size: int = 81920,
                  prefetch_depth: int = 8, pipeline_async: int = 1,

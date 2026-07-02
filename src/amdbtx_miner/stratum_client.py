@@ -187,8 +187,7 @@ class Job:
         self.matmul_b = other.matmul_b
         self.matmul_r = other.matmul_r
         self.epsilon_bits = other.epsilon_bits
-        if other.parent_mtp is not None:
-            self.parent_mtp = other.parent_mtp
+        self.parent_mtp = other.parent_mtp
         self.clean_jobs = other.clean_jobs
         self.received_at = other.received_at
         if other.luckypool_nonce_bits > 0:
@@ -707,12 +706,28 @@ class StratumClient:
                 return job
 
     def submit_share(self, job: Job, result: dict, *, wait: bool = False):
-        if self._protocol == "luckypool":
+        if getattr(self, "_protocol", "stratum") == "luckypool":
             return self._submit_luckypool_share(job, result, wait=wait)
         worker = self._submit_worker or self.worker_name or self.payout_address
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime_val = int(result.get("ntime") or job.time)
         ntime = f"{ntime_val:08x}"
+        dedupe_key = (job.prev_hash, ntime_val, int(result["nonce64"]))
+        submitted_keys = getattr(self, "_submitted_share_keys", None)
+        submitted_order = getattr(self, "_submitted_share_order", None)
+        if submitted_keys is not None:
+            if dedupe_key in submitted_keys:
+                log.info(
+                    "skip duplicate submit job=%s nonce=%s ntime=%s",
+                    job.job_id, nonce_hex, ntime,
+                )
+                return
+            submitted_keys.add(dedupe_key)
+            if submitted_order is not None:
+                submitted_order.append(dedupe_key)
+                while len(submitted_order) > 4096:
+                    old_key = submitted_order.popleft()
+                    submitted_keys.discard(old_key)
         extranonce2 = "00" * self._extranonce2_size
         params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
         log.info(
@@ -726,7 +741,7 @@ class StratumClient:
             "job_id": job.job_id,
             "nonce_hex": nonce_hex,
             "is_block": is_block,
-            "difficulty": float(self._difficulty or 0.0),
+            "difficulty": float(getattr(self, "_difficulty", 0.0) or 0.0),
             "sent_at": time.time(),
         }
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
@@ -770,7 +785,7 @@ class StratumClient:
             "job_id": job.job_id,
             "nonce_hex": nonce_text,
             "is_block": is_block,
-            "difficulty": float(self._difficulty or 0.0),
+            "difficulty": float(getattr(self, "_difficulty", 0.0) or 0.0),
             "sent_at": time.time(),
         }
         self._send({

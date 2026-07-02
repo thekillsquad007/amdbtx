@@ -36,7 +36,12 @@ def validate_config(cfg: dict) -> dict:
         "solver_backend": "rocm",
         "solver_threads": 16,
         "solver_prepare_workers": 16,
-        "solver_batch_size": 81920,
+        "solver_batch_size": 4194304,
+        "benchmark_batch_sizes": [
+            131072, 262144, 524288, 1048576,
+            2097152, 4194304, 8388608, 16777216,
+        ],
+        "benchmark_sweep_threads": False,
         "solver_prefetch_depth": 8,
         "solver_pipeline_async": 1,
         "gpu_device": -1,

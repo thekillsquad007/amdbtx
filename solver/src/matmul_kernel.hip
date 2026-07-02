@@ -38,6 +38,7 @@ struct HipJobParams {
     uint32_t r;
     uint32_t epsilon_bits;
     uint32_t block_height;
+    uint32_t fast_v3_scan;
     int64_t parent_mtp;
     uint8_t prev_hash[32];
     uint8_t merkle_root[32];
@@ -246,6 +247,38 @@ __device__ __forceinline__ uint32_t d_bswap32(uint32_t x)
            ((x & 0xff000000U) >> 24U);
 }
 
+__device__ __forceinline__ uint32_t d_sha_word4(
+    uint32_t b0,
+    uint32_t b1,
+    uint32_t b2,
+    uint32_t b3)
+{
+    return ((b0 & 0xffU) << 24U) |
+           ((b1 & 0xffU) << 16U) |
+           ((b2 & 0xffU) << 8U) |
+           (b3 & 0xffU);
+}
+
+__device__ __forceinline__ uint32_t d_digest_byte(
+    const uint32_t words[8],
+    uint32_t byte_index)
+{
+    const uint32_t word = words[byte_index >> 2U];
+    const uint32_t shift = (3U - (byte_index & 3U)) * 8U;
+    return (word >> shift) & 0xffU;
+}
+
+__device__ __forceinline__ uint32_t d_digest_word4(
+    const uint32_t words[8],
+    uint32_t byte_index)
+{
+    return d_sha_word4(
+        d_digest_byte(words, byte_index),
+        d_digest_byte(words, byte_index + 1U),
+        d_digest_byte(words, byte_index + 2U),
+        d_digest_byte(words, byte_index + 3U));
+}
+
 __device__ __forceinline__ void d_sha256_init_words(uint32_t state[8])
 {
     state[0] = 0x6a09e667U;
@@ -398,6 +431,196 @@ __device__ void d_sha256_bytes_from_midstate(
         out[i * 4U + 2U] = static_cast<uint8_t>((state[i] >> 8U) & 0xffU);
         out[i * 4U + 3U] = static_cast<uint8_t>(state[i] & 0xffU);
     }
+}
+
+__device__ __forceinline__ void d_sha256_state_to_bytes(
+    const uint32_t state[8],
+    uint8_t out[32])
+{
+    #pragma unroll
+    for (uint32_t i = 0; i < 8U; ++i) {
+        out[i * 4U] = static_cast<uint8_t>((state[i] >> 24U) & 0xffU);
+        out[i * 4U + 1U] = static_cast<uint8_t>((state[i] >> 16U) & 0xffU);
+        out[i * 4U + 2U] = static_cast<uint8_t>((state[i] >> 8U) & 0xffU);
+        out[i * 4U + 3U] = static_cast<uint8_t>(state[i] & 0xffU);
+    }
+}
+
+__device__ __forceinline__ void d_sha256_once_state_words_to_state(
+    const uint32_t words[8],
+    uint32_t out_state[8])
+{
+    uint32_t w[16];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8U; ++i) {
+        w[i] = words[i];
+    }
+    w[8] = 0x80000000U;
+    #pragma unroll
+    for (uint32_t i = 9U; i < 15U; ++i) {
+        w[i] = 0U;
+    }
+    w[15] = 32U * 8U;
+    d_sha256_init_words(out_state);
+    d_sha256_compress(out_state, w);
+}
+
+__device__ __forceinline__ void d_matmul_seed_v3_midstate_words(
+    const uint32_t seed_midstate[8],
+    const HipJobParams& job,
+    uint64_t nonce64,
+    uint32_t which,
+    uint32_t out_words[8])
+{
+    uint32_t state[8];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8U; ++i) {
+        state[i] = seed_midstate[i];
+    }
+
+    uint32_t w[16];
+    w[0] = d_sha_word4(
+        (static_cast<uint32_t>(job.version) >> 8U) & 0xffU,
+        (static_cast<uint32_t>(job.version) >> 16U) & 0xffU,
+        (static_cast<uint32_t>(job.version) >> 24U) & 0xffU,
+        job.merkle_root[0]);
+    #pragma unroll
+    for (uint32_t i = 1U; i < 8U; ++i) {
+        const uint32_t base = 1U + (i - 1U) * 4U;
+        w[i] = d_sha_word4(
+            job.merkle_root[base],
+            job.merkle_root[base + 1U],
+            job.merkle_root[base + 2U],
+            job.merkle_root[base + 3U]);
+    }
+    w[8] = d_sha_word4(
+        job.merkle_root[29],
+        job.merkle_root[30],
+        job.merkle_root[31],
+        job.time & 0xffU);
+    w[9] = d_sha_word4(
+        (job.time >> 8U) & 0xffU,
+        (job.time >> 16U) & 0xffU,
+        (job.time >> 24U) & 0xffU,
+        job.bits & 0xffU);
+    w[10] = d_sha_word4(
+        (job.bits >> 8U) & 0xffU,
+        (job.bits >> 16U) & 0xffU,
+        (job.bits >> 24U) & 0xffU,
+        nonce64 & 0xffU);
+    w[11] = d_sha_word4(
+        (nonce64 >> 8U) & 0xffU,
+        (nonce64 >> 16U) & 0xffU,
+        (nonce64 >> 24U) & 0xffU,
+        (nonce64 >> 32U) & 0xffU);
+    w[12] = d_sha_word4(
+        (nonce64 >> 40U) & 0xffU,
+        (nonce64 >> 48U) & 0xffU,
+        (nonce64 >> 56U) & 0xffU,
+        job.n & 0xffU);
+    w[13] = d_sha_word4((job.n >> 8U) & 0xffU, which, 0x80U, 0U);
+    w[14] = 0U;
+    w[15] = 118U * 8U;
+    d_sha256_compress(state, w);
+
+    #pragma unroll
+    for (uint32_t i = 0; i < 8U; ++i) {
+        out_words[i] = state[i];
+    }
+}
+
+__device__ __forceinline__ void d_matmul_seed_pair_v3_midstate_words(
+    const uint32_t seed_midstate[8],
+    const HipJobParams& job,
+    uint64_t nonce64,
+    uint32_t seed_a_words[8],
+    uint32_t seed_b_words[8])
+{
+    d_matmul_seed_v3_midstate_words(seed_midstate, job, nonce64, 0U, seed_a_words);
+    d_matmul_seed_v3_midstate_words(seed_midstate, job, nonce64, 1U, seed_b_words);
+}
+
+__device__ __forceinline__ void d_derive_sigma_v3_midstate_words_state(
+    const uint32_t header_midstate[8],
+    const HipJobParams& job,
+    uint64_t nonce64,
+    const uint32_t seed_a_words[8],
+    const uint32_t seed_b_words[8],
+    uint32_t sigma_state[8])
+{
+    uint32_t state[8];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8U; ++i) {
+        state[i] = header_midstate[i];
+    }
+
+    uint32_t w[16];
+    w[0] = d_sha_word4(
+        job.merkle_root[28],
+        job.merkle_root[29],
+        job.merkle_root[30],
+        job.merkle_root[31]);
+    w[1] = d_bswap32(job.time);
+    w[2] = d_bswap32(job.bits);
+    w[3] = d_bswap32(static_cast<uint32_t>(nonce64));
+    w[4] = d_bswap32(static_cast<uint32_t>(nonce64 >> 32U));
+    w[5] = d_sha_word4(
+        job.n & 0xffU,
+        (job.n >> 8U) & 0xffU,
+        d_digest_byte(seed_a_words, 0U),
+        d_digest_byte(seed_a_words, 1U));
+    w[6] = d_digest_word4(seed_a_words, 2U);
+    w[7] = d_digest_word4(seed_a_words, 6U);
+    w[8] = d_digest_word4(seed_a_words, 10U);
+    w[9] = d_digest_word4(seed_a_words, 14U);
+    w[10] = d_digest_word4(seed_a_words, 18U);
+    w[11] = d_digest_word4(seed_a_words, 22U);
+    w[12] = d_digest_word4(seed_a_words, 26U);
+    w[13] = d_sha_word4(
+        d_digest_byte(seed_a_words, 30U),
+        d_digest_byte(seed_a_words, 31U),
+        d_digest_byte(seed_b_words, 0U),
+        d_digest_byte(seed_b_words, 1U));
+    w[14] = d_digest_word4(seed_b_words, 2U);
+    w[15] = d_digest_word4(seed_b_words, 6U);
+    d_sha256_compress(state, w);
+
+    w[0] = d_digest_word4(seed_b_words, 10U);
+    w[1] = d_digest_word4(seed_b_words, 14U);
+    w[2] = d_digest_word4(seed_b_words, 18U);
+    w[3] = d_digest_word4(seed_b_words, 22U);
+    w[4] = d_digest_word4(seed_b_words, 26U);
+    w[5] = d_sha_word4(
+        d_digest_byte(seed_b_words, 30U),
+        d_digest_byte(seed_b_words, 31U),
+        0x80U,
+        0U);
+    #pragma unroll
+    for (uint32_t i = 6U; i < 15U; ++i) {
+        w[i] = 0U;
+    }
+    w[15] = 150U * 8U;
+    d_sha256_compress(state, w);
+    d_sha256_once_state_words_to_state(state, sigma_state);
+}
+
+__device__ __forceinline__ bool d_sigma_state_below_prehash(
+    const uint32_t sigma_state[8],
+    const uint8_t target_arith[32])
+{
+    #pragma unroll
+    for (uint32_t word = 0; word < 8U; ++word) {
+        const uint32_t lhs = sigma_state[word];
+        const uint32_t base = word * 4U;
+        const uint32_t rhs = d_sha_word4(
+            target_arith[31U - base],
+            target_arith[30U - base],
+            target_arith[29U - base],
+            target_arith[28U - base]);
+        if (lhs < rhs) return true;
+        if (lhs > rhs) return false;
+    }
+    return true;
 }
 
 __device__ __forceinline__ void d_pack_seed_words(const uint8_t* seed_internal, uint32_t seed_w[8])
@@ -1649,6 +1872,29 @@ __global__ void sigma_gate_kernel(
     uint8_t sigma[32];
     const uint64_t nonce = nonce_start + idx;
 
+    if (params.block_height >= 130500 && params.fast_v3_scan != 0U) {
+        uint32_t seed_a_words[8];
+        uint32_t seed_b_words[8];
+        uint32_t sigma_state[8];
+        d_matmul_seed_pair_v3_midstate_words(
+            seed_midstate, params, nonce, seed_a_words, seed_b_words);
+        d_derive_sigma_v3_midstate_words_state(
+            header_midstate, params, nonce, seed_a_words, seed_b_words,
+            sigma_state);
+
+        if (params.epsilon_bits != 0 &&
+            !d_sigma_state_below_prehash(sigma_state, params.pre_hash_target)) {
+            return;
+        }
+
+        const uint32_t compact_index = atomicAdd(out_count, 1u);
+        out_nonces[compact_index] = nonce;
+        d_sha256_state_to_bytes(sigma_state, out_sigma + compact_index * 32);
+        d_sha256_state_to_bytes(seed_a_words, out_seed_a + compact_index * 32);
+        d_sha256_state_to_bytes(seed_b_words, out_seed_b + compact_index * 32);
+        return;
+    }
+
     if (params.block_height >= 125000) {
         d_matmul_seed_fast(seed_midstate, params, nonce, 0, seed_a);
         d_matmul_seed_fast(seed_midstate, params, nonce, 1, seed_b);
@@ -2843,8 +3089,6 @@ DeviceMatrixCache g_matrix_cache[16];
 struct DeviceLaunchPool {
     int device = -1;
     uint32_t* d_workspace = nullptr;
-    uint8_t* d_digests = nullptr;
-    uint8_t* d_found = nullptr;
     uint32_t* d_gate_count = nullptr;
     uint64_t* d_passed_nonces = nullptr;
     uint8_t* d_passed_sigma = nullptr;
@@ -3043,8 +3287,6 @@ bool EnsureBatchedPool(
 void FreeLaunchPool(DeviceLaunchPool& pool)
 {
     if (pool.d_workspace) hipFree(pool.d_workspace);
-    if (pool.d_digests) hipFree(pool.d_digests);
-    if (pool.d_found) hipFree(pool.d_found);
     if (pool.d_gate_count) hipFree(pool.d_gate_count);
     if (pool.d_passed_nonces) hipFree(pool.d_passed_nonces);
     if (pool.d_passed_sigma) hipFree(pool.d_passed_sigma);
@@ -3076,10 +3318,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         }
         pool.ws_bytes = ws_bytes;
     }
-    const size_t digest_bytes = batch * 32;
     if (pool.digest_cap < batch) {
-        if (pool.d_digests) hipFree(pool.d_digests);
-        if (pool.d_found) hipFree(pool.d_found);
         if (pool.d_gate_count) hipFree(pool.d_gate_count);
         if (pool.d_passed_nonces) hipFree(pool.d_passed_nonces);
         if (pool.d_passed_sigma) hipFree(pool.d_passed_sigma);
@@ -3087,8 +3326,6 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         if (pool.d_passed_seed_b) hipFree(pool.d_passed_seed_b);
         if (pool.d_seed_midstate) hipFree(pool.d_seed_midstate);
         if (pool.d_header_midstate) hipFree(pool.d_header_midstate);
-        pool.d_digests = nullptr;
-        pool.d_found = nullptr;
         pool.d_gate_count = nullptr;
         pool.d_passed_nonces = nullptr;
         pool.d_passed_sigma = nullptr;
@@ -3096,9 +3333,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         pool.d_passed_seed_b = nullptr;
         pool.d_seed_midstate = nullptr;
         pool.d_header_midstate = nullptr;
-        if (hipMalloc(&pool.d_digests, digest_bytes) != hipSuccess ||
-            hipMalloc(&pool.d_found, batch) != hipSuccess ||
-            hipMalloc(&pool.d_gate_count, sizeof(uint32_t)) != hipSuccess ||
+        if (hipMalloc(&pool.d_gate_count, sizeof(uint32_t)) != hipSuccess ||
             hipMalloc(&pool.d_passed_nonces, batch * sizeof(uint64_t)) != hipSuccess ||
             hipMalloc(&pool.d_passed_sigma, batch * 32) != hipSuccess ||
             hipMalloc(&pool.d_passed_seed_a, batch * 32) != hipSuccess ||
@@ -3110,8 +3345,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         }
         pool.digest_cap = batch;
     }
-    return pool.d_workspace && pool.d_digests && pool.d_found &&
-           pool.d_gate_count && pool.d_passed_nonces &&
+    return pool.d_workspace && pool.d_gate_count && pool.d_passed_nonces &&
            pool.d_passed_sigma && pool.d_passed_seed_a &&
            pool.d_passed_seed_b && pool.d_seed_midstate &&
            pool.d_header_midstate;
@@ -3216,6 +3450,7 @@ HipJobParams MakeHipJobParams(const FusedMatMulJob& job)
     p.r = job.r;
     p.epsilon_bits = job.epsilon_bits;
     p.block_height = static_cast<uint32_t>(job.state.height);
+    p.fast_v3_scan = EnvEnabled("BTX_MATMUL_FAST_V3_SCAN") ? 1U : 0U;
     p.parent_mtp = job.state.parent_mtp;
     std::memcpy(p.prev_hash, job.state.previous_block_hash.data, 32);
     std::memcpy(p.merkle_root, job.state.merkle_root.data, 32);
@@ -3722,6 +3957,143 @@ extern "C" bool LaunchMatMulTranscriptBatch(
             out_digests[original_index] = passed_digests[i];
             any_hit = true;
         }
+    }
+    return true;
+}
+
+extern "C" bool LaunchMatMulTranscriptCompact(
+    int device,
+    const FusedMatMulJob& job,
+    uint64_t nonce_start,
+    size_t nonce_count,
+    std::vector<MatMulBatchHit>& out_hits,
+    uint64_t* out_gate_passes)
+{
+    out_hits.clear();
+    if (nonce_count == 0) {
+        return false;
+    }
+
+    if (hipSetDevice(device) != hipSuccess) {
+        return false;
+    }
+
+    uint32_t* d_A = nullptr;
+    uint32_t* d_B = nullptr;
+    if (!EnsureMatricesOnDevice(device, job, &d_A, &d_B)) {
+        return false;
+    }
+
+    HipJobParams h_params = MakeHipJobParams(job);
+    const bool use_v2 = job.state.height >= 125000;
+    const size_t ws_uint32_per_nonce =
+        WorkspaceUint32Count(job.n, job.r, job.b, use_v2);
+    const size_t per_nonce_ws_bytes =
+        ws_uint32_per_nonce * sizeof(uint32_t);
+    if (!EnsureLaunchPool(device, nonce_count, per_nonce_ws_bytes)) {
+        return false;
+    }
+    DeviceLaunchPool& pool = g_launch_pool[device];
+
+    if (hipMemset(pool.d_gate_count, 0, sizeof(uint32_t)) != hipSuccess) {
+        return false;
+    }
+
+    MatmulProfile profile{};
+    profile.enabled = EnvEnabled("BTX_MATMUL_PROFILE");
+    profile.scan_batch = nonce_count;
+    if (profile.enabled) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) == hipSuccess) {
+            std::snprintf(profile.arch, sizeof(profile.arch), "%s", prop.gcnArchName);
+        }
+    }
+
+    {
+        GpuStageTimer timer(profile.enabled);
+        init_scan_midstates_kernel<<<1, 1>>>(
+            h_params, pool.d_seed_midstate, pool.d_header_midstate);
+        constexpr int kGateThreads = 512;
+        const int gate_blocks =
+            static_cast<int>((nonce_count + kGateThreads - 1) / kGateThreads);
+        sigma_gate_kernel<<<gate_blocks, kGateThreads>>>(
+            h_params, nonce_start, nonce_count,
+            pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
+            pool.d_passed_nonces, pool.d_passed_sigma,
+            pool.d_passed_seed_a, pool.d_passed_seed_b);
+        if (profile.enabled) {
+            profile.sigma_ms = timer.finish();
+        }
+    }
+
+    if (hipGetLastError() != hipSuccess) {
+        return false;
+    }
+    if (hipDeviceSynchronize() != hipSuccess) {
+        return false;
+    }
+
+    uint32_t passed = 0;
+    if (hipMemcpy(
+            &passed, pool.d_gate_count, sizeof(passed),
+            hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+    if (out_gate_passes) {
+        *out_gate_passes = passed;
+    }
+    profile.passed = passed;
+
+    if (passed == 0) {
+        if (profile.enabled) {
+            std::fprintf(stderr,
+                "matmul_profile scan=%zu passed=0 arch=%s words_path=none sigma_ms=%.3f\n",
+                profile.scan_batch, profile.arch, profile.sigma_ms);
+        }
+        return true;
+    }
+
+    std::vector<uint64_t> passed_nonces(passed);
+    if (hipMemcpy(
+            passed_nonces.data(), pool.d_passed_nonces,
+            passed * sizeof(uint64_t), hipMemcpyDeviceToHost) != hipSuccess) {
+        return false;
+    }
+
+    std::vector<Uint256> passed_digests;
+    std::vector<uint8_t> passed_found;
+    if (!ProcessPassedNoncesBatched(
+            device, job, passed, pool.d_passed_seed_a,
+            pool.d_passed_seed_b, pool.d_passed_sigma,
+            passed_digests, passed_found, &profile)) {
+        return false;
+    }
+
+    if (profile.enabled) {
+        std::fprintf(stderr,
+            "matmul_profile scan=%zu passed=%zu arch=%s words_path=%s "
+            "sigma_ms=%.3f matrix_ms=%.3f "
+            "noise_seed_ms=%.3f noise_ms=%.3f compress_ms=%.3f rhs_ms=%.3f "
+            "rhs_a_ms=%.3f rhs_right_ms=%.3f rhs_b_ms=%.3f "
+            "words_ms=%.3f hash_compare_ms=%.3f\n",
+            profile.scan_batch, profile.passed, profile.arch, profile.words_path,
+            profile.sigma_ms,
+            profile.matrix_ms, profile.noise_seed_ms, profile.noise_ms,
+            profile.compress_ms, profile.rhs_ms, profile.rhs_a_ms,
+            profile.rhs_right_ms, profile.rhs_b_ms, profile.words_ms,
+            profile.hash_compare_ms);
+    }
+
+    out_hits.reserve(passed);
+    for (size_t i = 0; i < passed; ++i) {
+        if (passed_found[i] == 0) {
+            continue;
+        }
+        MatMulBatchHit hit{};
+        hit.nonce = passed_nonces[i];
+        hit.digest = passed_digests[i];
+        hit.found = 1;
+        out_hits.push_back(hit);
     }
     return true;
 }

@@ -109,12 +109,21 @@ class ConsensusV3Tests(unittest.TestCase):
         first = Job.from_notify({
             "job_id": "v3",
             "block_height": 130500,
-            "matmul": {"parent_mtp": 1_780_000_000},
+            "matmul": {
+                "seed_a": "aa" * 32,
+                "seed_b": "bb" * 32,
+                "block_height": 130500,
+                "parent_mtp": 1_780_000_000,
+            },
         })
         second = Job.from_notify({
             "job_id": "old",
             "block_height": 130499,
-            "matmul": {},
+            "matmul": {
+                "seed_a": "cc" * 32,
+                "seed_b": "dd" * 32,
+                "block_height": 130499,
+            },
         })
         self.assertEqual(first.parent_mtp, 1_780_000_000)
         first.merge_from(second)
