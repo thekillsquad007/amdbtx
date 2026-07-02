@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 dist/
+release-artifacts/
 *.egg-info/
 *.whl
 solver/src/btx-gbt-solve-hip
