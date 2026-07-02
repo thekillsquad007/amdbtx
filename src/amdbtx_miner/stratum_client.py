@@ -29,11 +29,12 @@ class Job:
         "bits", "target", "seed_a", "seed_b", "block_height",
         "matmul_n", "matmul_b", "matmul_r", "epsilon_bits",
         "parent_mtp", "nonce64_start", "clean_jobs", "received_at",
+        "luckypool_nonce_bits",
     )
 
     def __init__(self, **kwargs):
         for s in self.__slots__:
-            default = 0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start") else (
+            default = 0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start", "luckypool_nonce_bits") else (
                 None if s == "parent_mtp" else (
                 "0" * 64 if s in ("prev_hash", "merkle_root", "seed_a", "seed_b", "target") else (
                     "1d17c609" if s == "bits" else (
@@ -131,6 +132,7 @@ class Job:
             epsilon_bits=int(params.get("epsilonBits", 18)),
             parent_mtp=int(params["parentMtp"]) if params.get("parentMtp") is not None else None,
             nonce64_start=prefix_value << nonce_bits,
+            luckypool_nonce_bits=nonce_bits,
             clean_jobs=bool(params.get("cleanJobs", False)),
         )
 
@@ -158,6 +160,7 @@ class Job:
         self.parent_mtp = other.parent_mtp
         self.clean_jobs = other.clean_jobs
         self.received_at = other.received_at
+        self.luckypool_nonce_bits = other.luckypool_nonce_bits
         self.nonce64_start = saved_nonce
 
 
@@ -615,7 +618,17 @@ class StratumClient:
         log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
 
     def _submit_luckypool_share(self, job: Job, result: dict, *, wait: bool = False):
-        nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
+        if "nonce64" in result:
+            nonce64 = int(result["nonce64"])
+            nonce_bits = int(getattr(job, "luckypool_nonce_bits", 0) or 0)
+            if nonce_bits > 0:
+                nonce_mask = (1 << nonce_bits) - 1
+                nonce_width = (nonce_bits + 3) // 4
+                nonce_hex = f"{nonce64 & nonce_mask:0{nonce_width}x}"
+            else:
+                nonce_hex = f"{nonce64:016x}"
+        else:
+            nonce_hex = ""
         digest_hex = str(result.get("digest", ""))
         log.info(
             "submit luckypool job=%s nonce=%s digest=%s target=%s",

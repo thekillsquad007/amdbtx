@@ -210,10 +210,11 @@ def test_luckypool_job_parser_maps_nonce_prefix_and_v3_fields():
     assert job.block_height == 147654
     assert job.parent_mtp == 1782965509
     assert job.nonce64_start == (9266998 << 40)
+    assert job.luckypool_nonce_bits == 40
     assert job.target == "00" + "ff" * 31
 
 
-def test_luckypool_submit_uses_login_protocol_payload():
+def test_luckypool_submit_uses_login_protocol_payload_with_nonce_suffix():
     sent = []
     client = StratumClient.__new__(StratumClient)
     client._protocol = "luckypool"
@@ -221,18 +222,35 @@ def test_luckypool_submit_uses_login_protocol_payload():
     client._pending_submits = {}
     client._difficulty = 0.0002
     client._send = sent.append
+    job = Job.from_luckypool({
+        "jobId": "504",
+        "height": 147662,
+        "nVersion": 536870912,
+        "prevHash": "11" * 32,
+        "merkleRoot": "22" * 32,
+        "nTime": 1782967143,
+        "nBits": "1c4c2e02",
+        "noncePrefix": "9266998",
+        "nonceBits": 40,
+        "shareTarget": "00001387ec780000",
+        "parentMtp": 1782967000,
+    })
 
     client.submit_share(
-        _job(),
-        {"nonce64": 0x1234, "digest": "ab" * 32, "is_block": False},
+        job,
+        {
+            "nonce64": 0x8d67420074026c11,
+            "digest": "ab" * 32,
+            "is_block": False,
+        },
     )
 
     assert sent == [{
         "id": 1,
         "method": "submit",
         "params": {
-            "jobId": "job-1",
-            "nonce": "0000000000001234",
+            "jobId": "504",
+            "nonce": "0074026c11",
             "result": "ab" * 32,
         },
     }]
