@@ -19,12 +19,18 @@ set(SOURCES
     src/solve.cpp
     src/solve_gpu.hip
     src/gpu_sha256.hip
+    src/matmul_kernel.hip
 )
 
 set(HIP_ARCHS
-    gfx900;gfx906;gfx1030;gfx1100
+    gfx900;gfx906;gfx1030;gfx1100;gfx1101
     CACHE STRING "Semicolon-separated list of HIP offload architectures"
 )
+
+set(HIP_ARCH_FLAGS "")
+foreach(ARCH IN LISTS HIP_ARCHS)
+    list(APPEND HIP_ARCH_FLAGS "--offload-arch=${ARCH}")
+endforeach()
 
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/btx-gbt-solve-hip
@@ -35,6 +41,7 @@ add_custom_command(
         -I${CMAKE_CURRENT_SOURCE_DIR}/src
         ${SOURCES}
         -lpthread
+        -Wl,-rpath,/opt/rocm/lib:/opt/rocm-7.2.0/lib
         -o ${CMAKE_CURRENT_BINARY_DIR}/btx-gbt-solve-hip
     DEPENDS ${SOURCES}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

@@ -7,7 +7,7 @@
 #   4. Revoke old PAT and create new one (prompts you)
 set -euo pipefail
 
-RELEASE_ID="${RELEASE_ID:-332827469}"
+RELEASE_TAG="${RELEASE_TAG:-amdbtx-prebuilds-v1.1.2}"
 REPO="thekillsquad007/amdbtx"
 SRC_DIR="/var/home/bazzite/amdbtx-private-src"
 SOLVER_SRC="/var/home/bazzite/amdbtx-private-solver"
@@ -22,7 +22,9 @@ echo "Wheel: ${WHEEL_PATH}"
 
 # ── 2. Solver binary (via distrobox) ───────────────────────────────
 echo "=== Step 2: Build HIP solver in distrobox ==="
-distrobox enter "${DISTROBOX}" -- bash /var/home/bazzite/amdbtx/build_solver.sh
+AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1100 gfx1101}"
+distrobox enter "${DISTROBOX}" -- env AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS}" \
+    bash /var/home/bazzite/amdbtx/build_solver.sh
 SOLVER_BINARY="${SOLVER_SRC}/build/btx-gbt-solve-hip"
 if [ ! -f "${SOLVER_BINARY}" ]; then
     echo "ERROR: solver binary not found at ${SOLVER_BINARY}"
@@ -38,13 +40,23 @@ echo
 
 # Delete old assets
 echo "Fetching existing assets..."
+RELEASE_ID=$(curl -fsSL \
+    -H "Authorization: token ${GH_TOKEN}" \
+    "https://api.github.com/repos/${REPO}/releases/tags/${RELEASE_TAG}" |
+    jq -r '.id')
+[[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: release ${RELEASE_TAG} was not found"
+    exit 1
+}
 ASSETS=$(curl -s -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets")
-for name in "btx-gbt-solve-hip" "amdbtx_miner-1.0.0-py3-none-any.whl"; do
-    asset_id=$(echo "${ASSETS}" | jq -r ".[] | select(.name==\"${name}\") | .id")
-    if [ -n "${asset_id}" ]; then
-        echo "Deleting old ${name} (asset ${asset_id})..."
-        curl -s -X DELETE -H "Authorization: token ${GH_TOKEN}" "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}"
-    fi
+echo "${ASSETS}" | jq -r '
+    .[]
+    | select(.name == "btx-gbt-solve-hip" or (.name | test("^amdbtx_miner-.*\\.whl$")))
+    | "\(.id)\t\(.name)"
+' | while IFS=$'\t' read -r asset_id name; do
+    echo "Deleting old ${name} (asset ${asset_id})..."
+    curl -s -X DELETE -H "Authorization: token ${GH_TOKEN}" \
+        "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}"
 done
 
 # Upload wheel

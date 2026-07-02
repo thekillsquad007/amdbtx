@@ -265,7 +265,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "],";
             }
         }
-        std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(2) << elapsed_s << ",";
+        std::cout << "\"elapsed_s\":" << std::fixed << std::setprecision(6) << elapsed_s << ",";
         std::cout << "\"tries_used\":" << tries_used << ",";
         if (gate_passes > 0)
             std::cout << "\"gate_passes\":" << gate_passes << ",";

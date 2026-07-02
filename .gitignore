@@ -3,6 +3,7 @@ build/
 dist/
 *.egg-info/
 *.whl
+solver/src/btx-gbt-solve-hip
 
 # Python
 __pycache__/
@@ -23,3 +24,4 @@ solo-config.yaml
 
 # Ad-hoc dev/test scripts (run locally; not shipped in the repo)
 test_*.py
+!tests/test_*.py

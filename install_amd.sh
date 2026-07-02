@@ -8,7 +8,7 @@
 # Installs:
 #   1. ROCm runtime (if not present)
 #   2. amdbtx-miner Python wrapper
-#   3. btx-gbt-solve-hip solver binary (prebuilt or from source)
+#   3. btx-gbt-solve-hip solver binary from public release assets
 #   4. Writes tuned config for detected AMD GPU
 #   5. Runs GPU acceleration smoke test
 #
@@ -24,11 +24,15 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
 fi
 
 # ─── Configurables ──────────────────────────────────────────────────────────
-PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.0}"
-PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/thekillsquad007/amdbtx/releases/download/${PREBUILDS_TAG}}"
-SOLVER_NAME="${SOLVER_NAME:-btx-gbt-solve-hip}"
-SOLVER_URL="${PREBUILDS_BASE}/${SOLVER_NAME}"
-DEFAULT_POOL="${DEXBTX_POOL:-stratum.minebtx.com:3333}"
+RELEASE_REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx-releases}"
+PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.1.8}"
+PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${RELEASE_REPO}/releases/download/${PREBUILDS_TAG}}"
+WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.8-py3-none-any.whl}"
+EXPECTED_MINER_VERSION="1.1.8"
+EXPECTED_WHEEL_SHA256="67bb9b9cfb3cdeb07e604795aa5f52baf57699c8ad285d65d87bbb0aac96aee4"
+EXPECTED_SOLVER_VERSION="2.1.0"
+EXPECTED_SOLVER_SHA256="a9909e1906862d3aef0848cfb126cc5c490ebb3db5c9e962783ec2bea198dcb8"
+DEFAULT_POOL="${DEXBTX_POOL:-stratum.bitminerpool.xyz:3333}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
 SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
@@ -397,24 +401,35 @@ log "creating private Python environment..."
 "$PYTHON" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip wheel pyyaml
 
-# ─── Fetch pre-built Python package from releases ────────────────────────
+# ─── Prepare release downloads ───────────────────────────────────────────
 mkdir -p "${INSTALL_DIR}/bin"
-WHEEL_FILENAME="amdbtx_miner-1.0.0-py3-none-any.whl"
-TMP_WHEEL="$(mktemp -d)/${WHEEL_FILENAME}"
-TMP_BUILD_DIR=""
+TMP_BUILD_DIR="$(mktemp -d)"
 cleanup_temp() {
-    rm -rf "$(dirname "$TMP_WHEEL")" 2>/dev/null || true
-    [[ -n "$TMP_BUILD_DIR" ]] && rm -rf "$TMP_BUILD_DIR" 2>/dev/null || true
+    rm -rf "$TMP_BUILD_DIR" 2>/dev/null || true
 }
 trap cleanup_temp EXIT
 
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
 else
-    log "downloading amdbtx-miner wheel from ${PREBUILDS_BASE}..."
+    WHEEL_PATH="${TMP_BUILD_DIR}/${WHEEL_FILENAME}"
     WHEEL_URL="${PREBUILDS_BASE}/${WHEEL_FILENAME}"
-    curl -fsSL "$WHEEL_URL" -o "$TMP_WHEEL" 2>/dev/null || err "failed to download Python wheel from GitHub releases"
-    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$TMP_WHEEL"
+    log "downloading amdbtx-miner ${EXPECTED_MINER_VERSION} wheel..."
+    curl -fsSL "$WHEEL_URL" -o "$WHEEL_PATH" 2>/dev/null || \
+        err "failed to download Python wheel from ${WHEEL_URL}"
+    WHEEL_SHA256="$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"
+    [[ "$WHEEL_SHA256" == "$EXPECTED_WHEEL_SHA256" ]] || \
+        err "wheel checksum mismatch: got ${WHEEL_SHA256}"
+    "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "$WHEEL_PATH"
+    INSTALLED_MINER_VERSION="$(
+        "$VENV_DIR/bin/python" -c 'import amdbtx_miner; print(amdbtx_miner.__version__)'
+    )"
+    [[ "$INSTALLED_MINER_VERSION" == "$EXPECTED_MINER_VERSION" ]] || \
+        err "installed miner version ${INSTALLED_MINER_VERSION}, expected ${EXPECTED_MINER_VERSION}"
+    "$VENV_DIR/bin/python" -c '
+import amdbtx_miner
+assert "matmul_parent_mtp_seed_v3" in amdbtx_miner.PROTOCOL_CAPABILITIES
+' || err "installed wheel does not advertise BTX V3 parent-MTP support"
     mkdir -p "$(dirname "$LAUNCHER_PATH")"
     cat > "$LAUNCHER_PATH" <<EOF
 #!/usr/bin/env bash
@@ -427,54 +442,42 @@ EOF
     esac
 fi
 
-# ─── Build solver from source ───────────────────────────────────────────
-# The solver source is part of the repository. On the target system, we
-# clone the repo, compile with the locally-installed ROCm, and install.
+# ─── Install solver binary ───────────────────────────────────────────────
+# Public installs use the release binary. --local-solver remains available
+# for private testing of locally-built solver binaries.
 SOLVER_BUILT_FROM_SOURCE=0
 if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
     install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
 else
-    TMP_BUILD_DIR="$(mktemp -d)"
-    BUILD_DIR="$TMP_BUILD_DIR"
-    log "downloading solver source from GitHub..."
-    curl -fsSL "https://github.com/thekillsquad007/amdbtx/archive/main.tar.gz" -o "$BUILD_DIR/repo.tar.gz" 2>/dev/null || \
-        err "failed to download solver source"
-    tar xzf "$BUILD_DIR/repo.tar.gz" -C "$BUILD_DIR"
-    SOLVER_SRC_DIR="$BUILD_DIR/amdbtx-main/solver"
-
-    # Ensure HIP dev packages match the runtime ROCm version.
-    # If /opt/rocm is present (host mount), force-install matching dev packages
-    # from the Radeon repo, even if system ROCm dev packages exist.
-    ROCM_DEV_NEEDED=0
-    set +e
-    ROCM_LIB_VER=$(dpkg -l libamdhip64-dev 2>/dev/null | awk '/libamdhip64-dev/ {print $3}' | head -1)
-    ROCM_VER=$(echo "${ROCM_LIB_VER:-}" | grep -oP '^\d+\.\d+' | head -1) || true
-    HIPCC_VER=$(hipcc --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1) || true
-    set -e
-    HIPCC_VER="${HIPCC_VER:-0}"
-    if [[ -n "$ROCM_VER" && -n "$HIPCC_VER" && "$ROCM_VER" != "$HIPCC_VER" ]]; then
-        ROCM_DEV_NEEDED=1
-    fi
-    if [[ "$ROCM_DEV_NEEDED" -eq 1 ]]; then
-        log "installing matching HIP dev packages from Radeon repo..."
-        sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hip-dev 2>/dev/null || true
-    fi
-
-    log "compiling solver for detected GPU architecture..."
-    BUILD_LOG="$BUILD_DIR/build.log"
-    if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
-        log "solver compilation successful"
-        install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
-        SOLVER_BUILT_FROM_SOURCE=1
-else
-        warn "solver compilation failed (see log below). Try installing rocm-dev or hip-dev."
-        cat "$BUILD_LOG" >&2
-        err "solver compilation failed. GPU mining cannot proceed without a working solver binary."
-    fi
+    SOLVER_ASSET_PATH="${TMP_BUILD_DIR}/btx-gbt-solve-hip"
+    SOLVER_URL="${PREBUILDS_BASE}/btx-gbt-solve-hip"
+    log "downloading btx-gbt-solve-hip ${EXPECTED_SOLVER_VERSION}..."
+    curl -fsSL "$SOLVER_URL" -o "$SOLVER_ASSET_PATH" 2>/dev/null || \
+        err "failed to download solver binary from ${SOLVER_URL}"
+    SOLVER_ASSET_SHA256="$(sha256sum "$SOLVER_ASSET_PATH" | awk '{print $1}')"
+    [[ "$SOLVER_ASSET_SHA256" == "$EXPECTED_SOLVER_SHA256" ]] || \
+        err "solver checksum mismatch: got ${SOLVER_ASSET_SHA256}"
+    install -m 0755 "$SOLVER_ASSET_PATH" "$SOLVER_PATH"
 fi
 
 log "solver installed → $SOLVER_PATH"
+SOLVER_VERSION_OUTPUT="$("$SOLVER_PATH" --version 2>&1 || true)"
+[[ "$SOLVER_VERSION_OUTPUT" == *"$EXPECTED_SOLVER_VERSION"* ]] || \
+    err "solver is not fork-ready: ${SOLVER_VERSION_OUTPUT:-version unavailable}"
+SOLVER_SHA256="$(sha256sum "$SOLVER_PATH" | awk '{print $1}')"
+cat > "${INSTALL_DIR}/install-source.txt" <<EOF
+release_repo=${RELEASE_REPO}
+prebuilds_tag=${PREBUILDS_TAG}
+wheel_filename=${WHEEL_FILENAME}
+wheel_sha256=${WHEEL_SHA256:-skipped}
+solver_sha256=${SOLVER_SHA256}
+solver_version=${SOLVER_VERSION_OUTPUT}
+EOF
+log "release repo: ${RELEASE_REPO}"
+log "release tag: ${PREBUILDS_TAG}"
+log "miner version: ${INSTALLED_MINER_VERSION:-skipped}"
+log "solver sha256: ${SOLVER_SHA256}"
 
 # ─── Build solver runtime (library resolver) ──────────────────────────────
 # The pre-built solver binary links against specific sonames (e.g. libamdhip64.so.6, libhipblas.so.2)
@@ -714,7 +717,7 @@ fi
 # GPU-specific tuning
 GPU_WORKERS=16
 GPU_THREADS=8
-GPU_BATCH=128
+GPU_BATCH=4096
 GPU_PREFETCH=8
 
 # Older GCN cards (gfx803) benefit from lower settings
@@ -727,7 +730,7 @@ fi
 
 # RDNA 2/3/4: larger batches keep the GPU fed
 if [[ "$GPU_ARCH" == gfx103* || "$GPU_ARCH" == gfx110* || "$GPU_ARCH" == gfx115* ]]; then
-    GPU_BATCH=1024
+    GPU_BATCH=65536
 fi
 
 if [[ ! -f "$CONFIG_PATH" || "$ASSUME_YES" -eq 1 ]]; then
@@ -752,11 +755,12 @@ solver_batch_size: ${GPU_BATCH}
 solver_prefetch_depth: ${GPU_PREFETCH}
 solver_prepare_workers: ${GPU_WORKERS}
 solver_pipeline_async: 1
-gpu_inputs: 0
+gpu_inputs: 1
 
 # Slice sizing
 nonces_per_slice: 20000000
 solver_max_seconds_per_slice: 5.0
+pool_max_shares_per_slice: 0
 
 # Reconnect
 reconnect_initial_s: 1.0

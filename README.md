@@ -1,9 +1,9 @@
 # AMDBTX — AMD GPU Miner for BTX (Pool + Solo)
 
 A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on the
-[MineBtx pool](https://minebtx.com) **or solo** against your own `btxd` node.
+[BitMinerPool](https://bitminerpool.xyz) **or solo** against your own `btxd` node.
 
-- **Pool**: `stratum+tcp://stratum.minebtx.com:3333`
+- **Pool**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
 - **Solo**: `getblocktemplate` + `getmatmulchallenge` + `submitblock` via JSON-RPC
 - **Algorithm**: MatMul PoW (n=512, b=16, r=8, M31 field, sigma gate)
 - **Dev fee**: 2% transparent — time-sliced in pool mode, coinbase split in solo
@@ -23,6 +23,14 @@ Launch:
 
 ```bash
 amdbtx-miner --config ~/.amdbtx-miner/config.yaml
+```
+
+The installer builds the Python wrapper and HIP solver from the same Git
+commit. Verify what was installed with:
+
+```bash
+cat ~/.amdbtx-miner/install-source.txt
+sha256sum ~/.amdbtx-miner/bin/btx-gbt-solve-hip
 ```
 
 ### Windows (WSL2 with AMD GPU)
@@ -53,7 +61,7 @@ Custom options:
 ```bash
 # With worker name and custom pool
 curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- \
-  --address btx1z... --worker myrig --pool stratum.minebtx.com:3333 --yes
+  --address btx1z... --worker myrig --pool stratum.bitminerpool.xyz:3333 --yes
 ```
 
 ### Windows (WSL2)
@@ -97,7 +105,7 @@ Edit `~/.amdbtx-miner/config.yaml` (generated during install). See
 
 ```yaml
 mining_mode: "pool"
-pool_host: "stratum.minebtx.com"
+pool_host: "stratum.bitminerpool.xyz"
 pool_port: 3333
 payout_address: "btx1z..."
 worker_name: "7800XT-ALPHA-1"
@@ -105,9 +113,10 @@ gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve-hip"
 solver_backend: "rocm"     # "rocm" or "cpu"
 solver_threads: 8
 solver_prepare_workers: 16
-solver_batch_size: 128
+solver_batch_size: 81920
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
+pool_max_shares_per_slice: 0  # 0 = submit every valid share returned by solver
 gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU
 # gpu_devices: "all"     # multi-GPU: "all", "0,1", or [0, 1] — hashrate stacks
 nonces_per_slice: 20000000
@@ -184,7 +193,7 @@ multi-GPU mining: 2 solvers on devices [0, 1]
 During mining, look for combined hashrate:
 
 ```
-matmul_khps=0.58 total (0.29+0.29 per GPU) backend=hip gpus=2
+nonce_khps=1380 total (690+690 per GPU) backend=hip gpus=2
 ```
 
 **Behaviour**
@@ -204,7 +213,6 @@ Active GPU solver work targets the HIP path in `solver/src/solve_gpu.hip`:
 - Persistent device memory pool (no per-slice `hipFree`/`hipMalloc`)
 - GPU transcript digest filter (`HashTranscriptKernel` + `CompareDigestsKernel`)
 - V2 seeds/sigma re-derived on CPU after sigma gate (required for pool consensus)
-- HIP compute stream with single sync per batch (gate → matmul → digest pipelined)
 - Inner-loop unroll in `ComputeCompressedWordsFusedKernel`
 
 Rebuild after pulling:
@@ -304,9 +312,9 @@ and solo mode correctly skips `submitblock`.
 ### When solo makes sense
 
 Solo competes against **total network hashrate**, not pool hashrate. It can be
-worth trying when network difficulty is low relative to your GPU's `matmul_khps`,
+worth trying when network difficulty is low relative to your GPU's `nonce_khps`,
 or when you want the full block reward without pool fees. At typical single-GPU
-speeds on mainnet, blocks may be rare — check your `matmul_khps` in the solve logs
+speeds on mainnet, blocks may be rare — check your `nonce_khps` in the solve logs
 and compare to network conditions on [BTXplorer](https://explorer.minebtx.com).
 
 ### Solo dev fee
@@ -387,8 +395,8 @@ Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 ## Pool Information
 
-- **Pool Dashboard**: https://pool.minebtx.com
-- **Stratum**: `stratum+tcp://stratum.minebtx.com:3333`
+- **Pool Dashboard**: https://bitminerpool.xyz
+- **Stratum**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
 - **Algorithm**: MatMul PoW (BTX spec, n=512, b=16, r=8, M31 field)
 - **Pool Fee**: 2.5% (PPLNS, weekly payouts)
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
@@ -415,7 +423,7 @@ The pool does **not** create wallets. Visit https://easybtx.com/wallet to create
 
 ## Links
 
-- **Pool**: https://minebtx.com
-- **Dashboard**: https://pool.minebtx.com
+- **Pool**: https://bitminerpool.xyz
+- **Dashboard**: https://bitminerpool.xyz
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
 - **GitHub**: https://github.com/thekillsquad007/amdbtx

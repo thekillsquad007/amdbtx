@@ -5,6 +5,7 @@ import uuid
 import logging
 import random
 import threading
+from collections import deque
 from typing import Any
 
 from . import PROTOCOL_CAPABILITIES, USER_AGENT, __version__
@@ -28,11 +29,12 @@ class Job:
         "bits", "target", "seed_a", "seed_b", "block_height",
         "matmul_n", "matmul_b", "matmul_r", "epsilon_bits",
         "parent_mtp", "nonce64_start", "clean_jobs", "received_at",
+        "luckypool_nonce_bits",
     )
 
     def __init__(self, **kwargs):
         for s in self.__slots__:
-            default = 0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start") else (
+            default = 0 if s in ("version", "time", "block_height", "matmul_n", "matmul_b", "matmul_r", "epsilon_bits", "nonce64_start", "luckypool_nonce_bits") else (
                 None if s == "parent_mtp" else (
                 "0" * 64 if s in ("prev_hash", "merkle_root", "seed_a", "seed_b", "target") else (
                     "1d17c609" if s == "bits" else (
@@ -104,6 +106,66 @@ class Job:
             )
         raise ValueError(f"cannot parse notify params: type={type(params)}")
 
+    @staticmethod
+    def _normalize_target_hex(target: Any) -> str:
+        text = str(target or "").strip().lower()
+        if text.startswith("0x"):
+            text = text[2:]
+        if len(text) > 64:
+            text = text[:64]
+        if len(text) < 64:
+            text = text.ljust(64, "0")
+        return text
+
+    @classmethod
+    def from_luckypool(cls, params: dict) -> "Job":
+        """Parse LuckyPool's login/job JSON-RPC dialect."""
+        nonce_bits = int(params.get("nonceBits", 0) or 0)
+        nonce_prefix = str(params.get("noncePrefix", "") or "0")
+        if nonce_bits <= 0 and nonce_prefix not in ("", "0"):
+            # LuckyPool BTX jobs use a 40-bit suffix even when sparse updates omit nonceBits.
+            nonce_bits = 40
+        try:
+            prefix_value = int(nonce_prefix, 10 if nonce_prefix.isdigit() else 16)
+        except ValueError:
+            prefix_value = int(nonce_prefix, 10)
+        share_target = cls._normalize_target_hex(params.get("shareTarget", ""))
+        return cls(
+            job_id=str(params.get("jobId", "")),
+            version=int(params.get("nVersion", 0)),
+            prev_hash=str(params.get("prevHash", "0" * 64)),
+            merkle_root=str(params.get("merkleRoot", "0" * 64)),
+            time=int(params.get("nTime", 0)),
+            bits=str(params.get("nBits", "1d17c609")),
+            target=share_target,
+            seed_a="0" * 64,
+            seed_b="0" * 64,
+            block_height=int(params.get("height", 0)),
+            matmul_n=int(params.get("matmulDim", 512)),
+            matmul_b=int(params.get("b", 16)),
+            matmul_r=int(params.get("r", 8)),
+            epsilon_bits=int(params.get("epsilonBits", 18)),
+            parent_mtp=int(params["parentMtp"]) if params.get("parentMtp") is not None else None,
+            nonce64_start=prefix_value << nonce_bits,
+            luckypool_nonce_bits=nonce_bits,
+            clean_jobs=bool(params.get("cleanJobs", False)),
+        )
+
+    @staticmethod
+    def infer_luckypool_nonce_bits(nonce64_start: int) -> int:
+        """Infer LuckyPool suffix width from an aligned nonce prefix."""
+        if nonce64_start <= 0:
+            return 0
+        trailing = 0
+        value = int(nonce64_start)
+        while trailing < 64 and (value & 1) == 0:
+            trailing += 1
+            value >>= 1
+        # LuckyPool BTX jobs observed so far use a 40-bit nonce suffix.
+        # Only infer common byte-aligned suffix sizes to avoid masking a full nonce
+        # by accident if a pool ever sends an unaligned start.
+        return trailing if trailing in (32, 40, 48) else 0
+
     def should_replace(self, other: "Job") -> bool:
         # Same-height notify rotations (clean=true) update job_id/target only.
         return other.block_height != self.block_height
@@ -128,7 +190,26 @@ class Job:
         self.parent_mtp = other.parent_mtp
         self.clean_jobs = other.clean_jobs
         self.received_at = other.received_at
+        if other.luckypool_nonce_bits > 0:
+            self.luckypool_nonce_bits = other.luckypool_nonce_bits
         self.nonce64_start = saved_nonce
+
+    def inherit_sparse_luckypool_fields(self, other: "Job") -> None:
+        """Fill omitted same-height job fields from a prior LuckyPool notify."""
+        if other.parent_mtp is not None and self.parent_mtp is None:
+            self.parent_mtp = other.parent_mtp
+        if other.luckypool_nonce_bits > 0 and self.luckypool_nonce_bits <= 0:
+            self.luckypool_nonce_bits = other.luckypool_nonce_bits
+        if not self.target or self.target == "0" * 64:
+            self.target = other.target
+        if self.matmul_n <= 0:
+            self.matmul_n = other.matmul_n
+        if self.matmul_b <= 0:
+            self.matmul_b = other.matmul_b
+        if self.matmul_r <= 0:
+            self.matmul_r = other.matmul_r
+        if self.epsilon_bits <= 0:
+            self.epsilon_bits = other.epsilon_bits
 
 
 class StratumClient:
@@ -141,6 +222,7 @@ class StratumClient:
         self._submit_worker = fully_qualified_worker(payout_address, worker_name)
         self.worker_name = self._submit_worker
         self._canonical_worker_name = ""
+        self._protocol = "stratum"
         self.cfg = cfg or {}
         self.sock: socket.socket | None = None
         self._buf = b""
@@ -153,6 +235,7 @@ class StratumClient:
         self.shares_rejected = 0
         self.blocks_found = 0
         self._pending_submits: dict[int, dict[str, Any]] = {}
+        self._accepted_share_events: deque[tuple[float, float]] = deque()
         self._current_job: Job | None = None
         self._metrics_stop = threading.Event()
         self._metrics_thread: threading.Thread | None = None
@@ -200,7 +283,16 @@ class StratumClient:
             "session_id": self._session_id,
         }
 
-        sub = self._call("mining.subscribe", [USER_AGENT, extension])
+        try:
+            sub = self._call("mining.subscribe", [USER_AGENT, extension])
+        except RuntimeError as e:
+            if "Method not found" in str(e):
+                log.info(
+                    "pool does not support mining.subscribe; trying LuckyPool login protocol"
+                )
+                self._lucky_handshake()
+                return
+            raise
         if isinstance(sub, list) and len(sub) >= 3:
             self._extranonce1 = sub[1]
             self._extranonce2_size = int(sub[2])
@@ -239,8 +331,33 @@ class StratumClient:
             self._difficulty,
         )
 
+    def _lucky_handshake(self) -> None:
+        self._protocol = "luckypool"
+        ok = self._call(
+            "login",
+            {
+                "address": self.payout_address,
+                "worker": self.operator_worker_name,
+                "agent": USER_AGENT,
+            },
+        )
+        if not ok:
+            raise RuntimeError(
+                "luckypool login rejected for "
+                f"address={self.payout_address} worker={self.operator_worker_name}"
+            )
+        # LuckyPool currently advertises BTX vardiff start difficulty 0.0002.
+        self._difficulty = float(self.cfg.get("pool_difficulty", 0.0002) or 0.0002)
+        log.info(
+            "luckypool login OK as address=%s worker=%s; waiting for job messages",
+            self.payout_address, self.operator_worker_name,
+        )
+
     def start_metrics_reporter(self, solver: Any) -> None:
         """Background worker.report_metrics heartbeats (dexbtx-miner parity)."""
+        if self._protocol == "luckypool":
+            log.info("luckypool protocol: worker.report_metrics disabled")
+            return
         self._solver_ref = solver
         self._metrics_stop.clear()
         if self._metrics_thread is not None and self._metrics_thread.is_alive():
@@ -321,38 +438,92 @@ class StratumClient:
         line, self._buf = self._buf.split(b"\n", 1)
         return json.loads(line.decode())
 
+    @staticmethod
+    def _submit_response_accepted(resp: dict) -> tuple[bool, str]:
+        """Return (accepted, detail). LuckyPool often ACKs with result=true before validation."""
+        err = resp.get("error")
+        if err:
+            if isinstance(err, dict):
+                detail = err.get("message") or err
+                code = err.get("code")
+                if code is not None:
+                    detail = f"code={code} {detail}"
+                return False, str(detail)
+            return False, str(err)
+        result = resp.get("result")
+        if result is False or result == "false":
+            return False, "result=false"
+        if isinstance(result, (int, float)) and result == 0:
+            return False, "result=0"
+        if isinstance(result, dict):
+            status = str(result.get("status", "")).lower()
+            if status in ("rejected", "error", "invalid", "false", "stale"):
+                return False, str(result)
+            if result.get("error"):
+                return False, str(result.get("error"))
+        return True, ""
+
+    @staticmethod
+    def _normalize_digest_hex(digest: Any) -> str:
+        text = str(digest or "").strip().lower()
+        if text.startswith("0x"):
+            text = text[2:]
+        if len(text) > 64:
+            text = text[:64]
+        if len(text) < 64:
+            text = text.rjust(64, "0")
+        return text
+
     def _complete_pending_submit(self, msg_id: int, resp: dict) -> None:
         meta = self._pending_submits.pop(msg_id, None)
         if not meta:
             return
         job_id = meta["job_id"]
         nonce_hex = meta["nonce_hex"]
-        if resp.get("error"):
+        accepted, detail = self._submit_response_accepted(resp)
+        if not accepted:
             self.shares_rejected += 1
             log.info(
                 "share REJECTED job=%s nonce=%s (a/r=%d/%d) error=%s",
                 job_id, nonce_hex,
-                self.shares_accepted, self.shares_rejected, resp["error"],
+                self.shares_accepted, self.shares_rejected, detail,
             )
             return
         self.shares_accepted += 1
+        difficulty = float(meta.get("difficulty", self._difficulty) or self._difficulty)
+        self._accepted_share_events.append((time.time(), difficulty))
+        self._prune_accepted_share_events(time.time() - 600.0)
         is_block = meta.get("is_block", False)
         if is_block:
             self.blocks_found += 1
+        extra = ""
+        if getattr(self, "_protocol", "stratum") == "luckypool":
+            extra = (
+                " (luckypool transport-ACK only — dashboard credits after pool validation; "
+                f"worker={self._submit_worker})"
+            )
         log.info(
-            "share OK job=%s nonce=%s is_block=%s (a/r/b=%d/%d/%d)",
+            "share OK job=%s nonce=%s is_block=%s (a/r/b=%d/%d/%d)%s",
             job_id, nonce_hex, is_block,
             self.shares_accepted, self.shares_rejected, self.blocks_found,
+            extra,
         )
 
     def _dispatch_message(self, msg: dict) -> bool:
         """Route one pool line. Returns True if it was a pending submit response."""
         msg_id = msg.get("id")
+        if isinstance(msg_id, str):
+            try:
+                msg_id = int(msg_id, 10)
+            except ValueError:
+                pass
         if msg_id is not None and msg_id in self._pending_submits:
             self._complete_pending_submit(msg_id, msg)
             return True
         if msg.get("method"):
             self._handle_server_message(msg)
+        elif msg_id is not None:
+            log.debug("unmatched pool response id=%r msg=%r", msg.get("id"), msg)
         return False
 
     def process_available_messages(self) -> int:
@@ -366,7 +537,7 @@ class StratumClient:
             while True:
                 try:
                     msg = self._recv()
-                except (BlockingIOError, ConnectionError):
+                except BlockingIOError:
                     break
                 self._dispatch_message(msg)
                 count += 1
@@ -395,6 +566,21 @@ class StratumClient:
                          self._current_job.clean_jobs)
             except (IndexError, KeyError, ValueError) as e:
                 log.warning("malformed notify: %s", e)
+        elif method == "job":
+            params = msg.get("params", {})
+            try:
+                job = Job.from_luckypool(params)
+                if self._current_job is not None:
+                    if self._current_job.block_height == job.block_height:
+                        job.inherit_sparse_luckypool_fields(self._current_job)
+                self._current_job = job
+                log.info(
+                    "luckypool job=%s height=%d clean=%s nonce_start=%d nonce_bits=%d",
+                    job.job_id, job.block_height, job.clean_jobs,
+                    job.nonce64_start, job.luckypool_nonce_bits,
+                )
+            except (TypeError, ValueError) as e:
+                log.warning("malformed luckypool job: %s; params=%r", e, params)
         elif method == "mining.set_difficulty":
             params = msg.get("params", [])
             if params:
@@ -436,13 +622,19 @@ class StratumClient:
             return str(params.get("canonical_name", "") or "")
         return ""
 
-    def _call(self, method: str, params: list) -> Any:
+    def _call(self, method: str, params: Any) -> Any:
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": method, "params": params})
         deadline = time.time() + 30.0
         while time.time() < deadline:
             msg = self._recv()
-            if msg.get("id") == msg_id:
+            resp_id = msg.get("id")
+            if isinstance(resp_id, str):
+                try:
+                    resp_id = int(resp_id, 10)
+                except ValueError:
+                    pass
+            if resp_id == msg_id:
                 if msg.get("error") is not None:
                     raise RuntimeError(f"pool error: {msg['error']}")
                 return msg.get("result")
@@ -458,6 +650,27 @@ class StratumClient:
             )
         self._submit_worker = worker
         self.worker_name = worker
+        if self._protocol == "luckypool":
+            self.payout_address = payout_address
+            self.operator_worker_name = worker_name or self.operator_worker_name
+            ok = self._call(
+                "login",
+                {
+                    "address": self.payout_address,
+                    "worker": self.operator_worker_name,
+                    "agent": USER_AGENT,
+                },
+            )
+            if not ok:
+                raise RuntimeError(
+                    "luckypool re-login rejected for "
+                    f"address={self.payout_address} worker={self.operator_worker_name}"
+                )
+            log.info(
+                "luckypool re-login OK as address=%s worker=%s",
+                self.payout_address, self.operator_worker_name,
+            )
+            return
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": "mining.authorize", "params": [worker, ""]})
         log.info("re-authorized as %s", worker)
@@ -478,6 +691,10 @@ class StratumClient:
                     log.warning("malformed notify: %s; params=%r", e, params)
             else:
                 self._dispatch_message(msg)
+                if self._current_job is not None:
+                    job = self._current_job
+                    self._current_job = None
+                    return job
 
     def wait_for_job(self) -> Job:
         while True:
@@ -489,10 +706,28 @@ class StratumClient:
                 return job
 
     def submit_share(self, job: Job, result: dict, *, wait: bool = False):
+        if getattr(self, "_protocol", "stratum") == "luckypool":
+            return self._submit_luckypool_share(job, result, wait=wait)
         worker = self._submit_worker or self.worker_name or self.payout_address
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime_val = int(result.get("ntime") or job.time)
         ntime = f"{ntime_val:08x}"
+        dedupe_key = (job.prev_hash, ntime_val, int(result["nonce64"]))
+        submitted_keys = getattr(self, "_submitted_share_keys", None)
+        submitted_order = getattr(self, "_submitted_share_order", None)
+        if submitted_keys is not None:
+            if dedupe_key in submitted_keys:
+                log.info(
+                    "skip duplicate submit job=%s nonce=%s ntime=%s",
+                    job.job_id, nonce_hex, ntime,
+                )
+                return
+            submitted_keys.add(dedupe_key)
+            if submitted_order is not None:
+                submitted_order.append(dedupe_key)
+                while len(submitted_order) > 4096:
+                    old_key = submitted_order.popleft()
+                    submitted_keys.discard(old_key)
         extranonce2 = "00" * self._extranonce2_size
         params = [worker, job.job_id, extranonce2, ntime, nonce_hex]
         log.info(
@@ -506,22 +741,104 @@ class StratumClient:
             "job_id": job.job_id,
             "nonce_hex": nonce_hex,
             "is_block": is_block,
+            "difficulty": float(getattr(self, "_difficulty", 0.0) or 0.0),
             "sent_at": time.time(),
         }
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
         if not wait:
             return
         deadline = time.time() + 30.0
-        while time.time() < deadline:
-            if msg_id not in self._pending_submits:
-                return
-            resp = self._recv()
-            if resp.get("id") == msg_id:
-                self._complete_pending_submit(msg_id, resp)
-                return
-            self._dispatch_message(resp)
+        old_timeout = self.sock.gettimeout() if self.sock is not None else None
+        try:
+            if self.sock is not None:
+                self.sock.settimeout(1.0)
+            while time.time() < deadline:
+                if msg_id not in self._pending_submits:
+                    return
+                try:
+                    resp = self._recv()
+                except socket.timeout:
+                    continue
+                if self._dispatch_message(resp):
+                    return
+        finally:
+            if self.sock is not None:
+                self.sock.settimeout(old_timeout)
         self._pending_submits.pop(msg_id, None)
         log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
+
+    def _submit_luckypool_share(self, job: Job, result: dict, *, wait: bool = False):
+        if "nonce64" in result:
+            nonce64 = int(result["nonce64"])
+            nonce_text = str(nonce64)
+        else:
+            nonce64 = 0
+            nonce_text = ""
+        ntime = int(job.time)
+        log.info(
+            "submit luckypool job=%s nTime=%d nonce64=%s target=%s",
+            job.job_id, ntime, nonce_text, (job.target or "")[:16],
+        )
+        msg_id = self._next_id()
+        is_block = bool(result.get("is_block", False))
+        self._pending_submits[msg_id] = {
+            "job_id": job.job_id,
+            "nonce_hex": nonce_text,
+            "is_block": is_block,
+            "difficulty": float(getattr(self, "_difficulty", 0.0) or 0.0),
+            "sent_at": time.time(),
+        }
+        self._send({
+            "id": msg_id,
+            "jsonrpc": "2.0",
+            "method": "submit",
+            "params": {
+                "jobId": job.job_id,
+                "nTime": ntime,
+                "nonce64": nonce_text,
+            },
+        })
+        if not wait:
+            return
+        deadline = time.time() + 30.0
+        old_timeout = self.sock.gettimeout() if self.sock is not None else None
+        try:
+            if self.sock is not None:
+                self.sock.settimeout(1.0)
+            while time.time() < deadline:
+                if msg_id not in self._pending_submits:
+                    return
+                try:
+                    resp = self._recv()
+                except socket.timeout:
+                    continue
+                if self._dispatch_message(resp):
+                    return
+        finally:
+            if self.sock is not None:
+                self.sock.settimeout(old_timeout)
+        self._pending_submits.pop(msg_id, None)
+        log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_text)
+
+    def _prune_accepted_share_events(self, cutoff: float) -> None:
+        while self._accepted_share_events and self._accepted_share_events[0][0] < cutoff:
+            self._accepted_share_events.popleft()
+
+    def pool_credit_stats(self, window_sec: float = 60.0) -> dict[str, float]:
+        """Rolling accepted-share estimate using submit-time vardiff credit."""
+        now = time.time()
+        cutoff = now - window_sec
+        self._prune_accepted_share_events(now - max(window_sec, 600.0))
+        events = [(ts, diff) for ts, diff in self._accepted_share_events if ts >= cutoff]
+        accepted = len(events)
+        credit = sum(diff for _, diff in events)
+        return {
+            "window_sec": float(window_sec),
+            "accepted": float(accepted),
+            "credit": float(credit),
+            "credit_per_min": credit * 60.0 / window_sec if window_sec > 0 else 0.0,
+            "avg_diff": credit / accepted if accepted else 0.0,
+        }
 
     def report_metrics(self, solver_nps: float, shares_total: int = 0) -> None:
         if solver_nps <= 0 or self.sock is None:

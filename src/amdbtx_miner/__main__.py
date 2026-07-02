@@ -33,6 +33,48 @@ log = logging.getLogger("amdbtx_miner")
 _submitted_share_keys: set[tuple[str, int, int]] = set()
 
 
+def _target_probability_from_hex(target_hex: str | None) -> float:
+    """Return final-digest pass probability for a compact/share target hex."""
+    if not target_hex:
+        return 0.0
+    target_str = str(target_hex).strip().lower()
+    if target_str.startswith("0x"):
+        target_str = target_str[2:]
+    target_str = target_str[:64].ljust(64, "0")
+    try:
+        target = int(target_str, 16)
+    except (TypeError, ValueError):
+        return 0.0
+    if target <= 0:
+        return 0.0
+    return min(target / float(1 << 256), 1.0)
+
+
+def _expected_shares_from_gate(gate_passes: int, target_hex: str | None) -> float:
+    """Expected accepted shares after the sigma gate for the current share target."""
+    if gate_passes <= 0:
+        return 0.0
+    return float(gate_passes) * _target_probability_from_hex(target_hex)
+
+
+def _format_share_eta(gate_per_s: float, target_hex: str | None) -> str:
+    """Format expected wall-clock time to the next share at the observed gate rate."""
+    probability = _target_probability_from_hex(target_hex)
+    shares_per_s = max(float(gate_per_s), 0.0) * probability
+    if shares_per_s <= 0:
+        return "unknown"
+    seconds = 1.0 / shares_per_s
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60.0
+    if hours < 48:
+        return f"{hours:.1f}h"
+    return f"{hours / 24.0:.1f}d"
+
+
 def resolve_solver_path(configured_path: str = "") -> Path:
     if configured_path:
         return Path(configured_path).expanduser()
@@ -49,8 +91,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="AMD BTX Miner")
     p.add_argument("--config", default=str(Path.home() / ".amdbtx-miner" / "config.yaml"))
     p.add_argument("--payout-address", help="BTX payout address")
-    p.add_argument("--worker-name", default="default")
-    p.add_argument("--pool-host", default=None, help="pool hostname (default: config or stratum.minebtx.com)")
+    p.add_argument("--worker-name", default=None)
+    p.add_argument("--pool-host", default=None, help="pool hostname (default: config or stratum.bitminerpool.xyz)")
     p.add_argument("--pool-port", type=int, default=None)
     p.add_argument("--solver-backend", default=None, choices=["rocm", "cpu"])
     p.add_argument("--solver-threads", type=int, default=None)
@@ -228,8 +270,10 @@ def _drain_pool_messages(client) -> None:
     if hasattr(client, "process_available_messages"):
         try:
             client.process_available_messages()
-        except Exception:
+        except (BlockingIOError, TimeoutError):
             pass
+        except ConnectionError:
+            raise
         return
     if not getattr(client, "sock", None):
         return
@@ -242,10 +286,12 @@ def _drain_pool_messages(client) -> None:
                     client._dispatch_message(msg)
                 else:
                     client._handle_server_message(msg)
-        except (BlockingIOError, ConnectionError):
+        except BlockingIOError:
             pass
         finally:
             client.sock.setblocking(True)
+    except ConnectionError:
+        raise
     except Exception:
         pass
 
@@ -256,7 +302,7 @@ def _share_submit_key(solve_job: Job, result: dict) -> tuple[str, int, int]:
     return (solve_job.job_id, ntime, nonce)
 
 
-def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> None:
+def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> bool:
     _drain_pool_messages(client)
     if not solo:
         key = _share_submit_key(solve_job, result)
@@ -265,10 +311,47 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> N
                 "skip resubmit job=%s nonce=%016x (already submitted this session)",
                 solve_job.job_id, key[2],
             )
-            return
-        _submitted_share_keys.add(key)
+            return False
+    share_ntime = int(result.get("ntime") or solve_job.time)
+    if (
+        not solo
+        and getattr(client, "_protocol", "stratum") == "luckypool"
+        and share_ntime != int(solve_job.time)
+    ):
+        log.warning(
+            "luckypool: skip submit — share ntime=%d differs from job ntime=%d; "
+            "pool recomputes digest from the job header",
+            share_ntime, solve_job.time,
+        )
+        return False
+    if not solo and getattr(client, "_protocol", "stratum") == "luckypool":
+        nonce_bits = int(getattr(solve_job, "luckypool_nonce_bits", 0) or 0)
+        if nonce_bits > 0:
+            nonce = int(result["nonce64"])
+            lane_mask = ~((1 << nonce_bits) - 1) & ((1 << 64) - 1)
+            if (nonce & lane_mask) != (int(solve_job.nonce64_start) & lane_mask):
+                log.warning(
+                    "luckypool: skip submit — nonce64=%d outside assigned lane start=%d bits=%d",
+                    nonce, solve_job.nonce64_start, nonce_bits,
+                )
+                return False
+    if not solo:
+        _submitted_share_keys.add(_share_submit_key(solve_job, result))
     if not solo and client._current_job is not None:
         if client._current_job.job_id != solve_job.job_id:
+            if (
+                getattr(client, "_protocol", "stratum") == "luckypool"
+                and (
+                    client._current_job.block_height != solve_job.block_height
+                    or client._current_job.prev_hash != solve_job.prev_hash
+                )
+            ):
+                log.info(
+                    "luckypool: drop stale share job=%s current=%s height=%d/%d",
+                    solve_job.job_id, client._current_job.job_id,
+                    solve_job.block_height, client._current_job.block_height,
+                )
+                return False
             log.info(
                 "submitting found share for rotated job_id %s (current=%s); "
                 "pool JobCache handles same-parent staleness",
@@ -281,7 +364,11 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> N
         result.get("is_block"), solve_job.job_id,
         result.get("ntime", solve_job.time),
     )
-    client.submit_share(solve_job, result, wait=solo and bool(result.get("is_block")))
+    wait_submit = bool(result.get("is_block")) if solo else (
+        getattr(client, "_protocol", "stratum") == "luckypool"
+    )
+    client.submit_share(solve_job, result, wait=wait_submit)
+    return True
 
 
 def _accumulate_slice_stats(merged: dict, result: dict) -> None:
@@ -344,12 +431,14 @@ def _solve_slice_continuous(
 
         if result.get("found"):
             merged["found"] = True
-            shares_in_slice += 1
-            if solo:
-                if result.get("is_block"):
-                    _submit_pool_share(client, solve_job, result, solo=True)
-            else:
-                _submit_pool_share(client, solve_job, result, solo=False)
+            share_results = result.get("solutions") or [result]
+            for share_result in share_results:
+                if solo and not share_result.get("is_block"):
+                    continue
+                if max_shares_per_slice and shares_in_slice >= max_shares_per_slice:
+                    break
+                if _submit_pool_share(client, solve_job, share_result, solo=solo):
+                    shares_in_slice += 1
 
             nonce_end = result.get("nonce64_end")
             if nonce_end is not None:
@@ -411,14 +500,23 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
 
     nonces_per_slice = cfg.get("nonces_per_slice", 20_000_000)
     max_seconds_per_slice = cfg.get("solver_max_seconds_per_slice", 5.0)
-    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 1)) if not solo else 0
+    pool_max_shares = int(cfg.get("pool_max_shares_per_slice", 0)) if not solo else 0
+    solver_batch_size = int(cfg.get("solver_batch_size", 0) or 0)
+    if solver_batch_size > 1 and nonces_per_slice > solver_batch_size:
+        aligned_nonces = (int(nonces_per_slice) // solver_batch_size) * solver_batch_size
+        if aligned_nonces != nonces_per_slice:
+            log.info(
+                "aligning nonces_per_slice %d -> %d to avoid partial GPU batch "
+                "(solver_batch_size=%d)",
+                nonces_per_slice, aligned_nonces, solver_batch_size,
+            )
+            nonces_per_slice = aligned_nonces
     if not solo and pool_max_shares < 0:
         pool_max_shares = 0
     if not solo and pool_max_shares == 1:
         log.info(
-            "pool mode: 1 share/slice (dexbtx parity) — multi-share slices report "
-            "low solver_nps and keep vardiff at floor; raise pool_max_shares_per_slice "
-            "only after vardiff has ramped"
+            "pool mode: limiting to 1 submitted share per slice; "
+            "set pool_max_shares_per_slice=0 to submit every valid solver result"
         )
     current_job = None
     log_interval = 30
@@ -459,6 +557,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 nonce64_start=current_job.nonce64_start,
                 clean_jobs=current_job.clean_jobs,
                 received_at=current_job.received_at,
+                luckypool_nonce_bits=current_job.luckypool_nonce_bits,
             )
 
             result = _solve_slice_continuous(
@@ -487,6 +586,9 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             elif gate_passes and elapsed > 0:
                 matmul_khps = gate_passes / elapsed / 1000
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
+            gate_ppm = (gate_passes / tries * 1_000_000) if tries else 0.0
+            expected_shares = _expected_shares_from_gate(gate_passes, current_job.target)
+            share_eta = _format_share_eta(gate_per_s, current_job.target)
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
 
@@ -505,6 +607,10 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 )
                 slice_nps = tries / elapsed
                 gpu_nps = tries / solver_elapsed if solver_elapsed > 0 else slice_nps
+                observed_nps = gpu_nps if gpu_nps > 0 else slice_nps
+                ema_prev = float(getattr(solver, "_ema_nonce_nps", 0) or 0)
+                ema = observed_nps if ema_prev <= 0 else (ema_prev * 0.7 + observed_nps * 0.3)
+                solver._ema_nonce_nps = ema
                 peak = max(
                     float(getattr(solver, "_peak_nonce_nps", 0) or 0),
                     slice_nps,
@@ -512,7 +618,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 )
                 solver._peak_nonce_nps = peak
                 if hasattr(solver, "last_observed_nps"):
-                    solver.last_observed_nps = peak
+                    solver.last_observed_nps = ema
 
             if now - last_log >= log_interval or result.get("found") or result.get("error"):
                 backend = result.get("backend", "?")
@@ -534,12 +640,24 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                             " (dashboard n/s = shares × per-share credit;"
                             " nonce_khps does not appear on pool; vardiff must ramp)"
                         )
+                    if hasattr(client, "pool_credit_stats"):
+                        stats = client.pool_credit_stats(60.0)
+                        pool_note += (
+                            f" pool_est_60s=a{int(stats['accepted'])}"
+                            f" diff_avg={stats['avg_diff']:.6g}"
+                            f" credit/min={stats['credit_per_min']:.6g}"
+                        )
                 slice_shares = result.get("shares_in_slice", 0)
                 slice_tag = f" slice_shares={slice_shares}" if slice_shares else ""
+                nonce_end = result.get("nonce64_end")
+                if nonce_end is None:
+                    nonce_end = current_job.nonce64_start + max(tries - 1, 0)
                 log.info(
-                    "solve: nonce=%d tries=%d gate=%d gate/s=%.0f elapsed=%.2fs "
+                    "solve: nonce=%d nonce_end=%d tries=%d gate=%d gate/s=%.0f "
+                    "gate_ppm=%.2f exp_shares=%.6f share_eta=%s elapsed=%.2fs "
                     "%s backend=%s%s found=%s shares=%d/%d target=%s%s%s",
-                    current_job.nonce64_start, tries, gate_passes, gate_per_s, elapsed,
+                    current_job.nonce64_start, nonce_end, tries, gate_passes, gate_per_s,
+                    gate_ppm, expected_shares, share_eta, elapsed,
                     khps_line, backend, gpu_tag, result.get("found"), a, r,
                     (current_job.target[:12] if current_job.target else "none"),
                     pool_note, slice_tag,
@@ -549,6 +667,16 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if client._current_job is not None:
                 new_job = client._current_job
                 client._current_job = None
+                if getattr(client, "_protocol", "stratum") == "luckypool":
+                    if new_job.job_id != current_job.job_id:
+                        log.info(
+                            "luckypool job replaced: %s -> %s (clean=%s height=%d)",
+                            current_job.job_id, new_job.job_id,
+                            new_job.clean_jobs, new_job.block_height,
+                        )
+                    _submitted_share_keys.clear()
+                    current_job = new_job
+                    continue
                 if new_job.block_height != current_job.block_height:
                     log.info(
                         "job replaced: %s -> %s (clean=%s height=%d)",
@@ -574,6 +702,16 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if client._current_job is not None:
                 new_job = client._current_job
                 client._current_job = None
+                if getattr(client, "_protocol", "stratum") == "luckypool":
+                    if new_job.job_id != current_job.job_id:
+                        log.info(
+                            "luckypool job updated: %s -> %s (clean=%s height=%d)",
+                            current_job.job_id, new_job.job_id,
+                            new_job.clean_jobs, new_job.block_height,
+                        )
+                    _submitted_share_keys.clear()
+                    current_job = new_job
+                    continue
                 if new_job.block_height != current_job.block_height:
                     log.info(
                         "new job: %s (clean=%s height=%d)",
@@ -626,6 +764,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                     )
                     if hasattr(client, "start_metrics_reporter"):
                         client.start_metrics_reporter(solver)
+                _submitted_share_keys.clear()
                 current_job = None
             except Exception as e2:
                 log.error("Reconnect failed: %s", e2)

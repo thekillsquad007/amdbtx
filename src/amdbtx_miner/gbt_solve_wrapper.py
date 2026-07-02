@@ -11,8 +11,20 @@ log = logging.getLogger(__name__)
 
 
 class GBTSolveWrapper:
+    @staticmethod
+    def _supports_parent_mtp_v3(version_output: str) -> bool:
+        text = str(version_output or "").lower()
+        if "parent-mtp" in text or "parent_mtp" in text:
+            return True
+        import re
+        match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+        if not match:
+            return False
+        major, minor, patch = (int(part) for part in match.groups())
+        return (major, minor, patch) >= (2, 1, 0)
+
     def __init__(self, solver_path: str, backend: str = "rocm", threads: int = 8,
-                 prepare_workers: int = 16, batch_size: int = 1024,
+                 prepare_workers: int = 16, batch_size: int = 81920,
                  prefetch_depth: int = 8, pipeline_async: int = 1,
                  gpu_inputs: int = 0, gpu_device: int = -1,
                  runtime_ld_path: str = ""):
@@ -83,6 +95,11 @@ class GBTSolveWrapper:
         env["BTX_MATMUL_PREPARE_PREFETCH_DEPTH"] = str(self.prefetch_depth)
         env["BTX_MATMUL_PIPELINE_ASYNC"] = str(self.pipeline_async)
         env["BTX_MATMUL_GPU_INPUTS"] = str(self.gpu_inputs)
+        if self.batch_size > 131072:
+            env.setdefault("BTX_MATMUL_MAX_SCAN_BATCH", str(self.batch_size))
+        # Default trust-GPU to ON; pool re-verifies all shares, so a bad GPU
+        # digest is just rejected.  Users can override via shell env.
+        env.setdefault("BTX_MATMUL_TRUST_GPU_SHARES", "1")
         # Post-125k the matmul seed folds nTime. Upstream btx-gbt-solve auto-refreshes
         # header time every 4096 attempts by default; the wrapper still submits the
         # original job ntime, so the pool recomputes a different digest (code-23).
@@ -225,6 +242,24 @@ class GBTSolveWrapper:
                         tries = int(result.get("tries_used", 0) or 0)
                         if elapsed > 0 and tries > 0:
                             self.last_observed_nps = tries / elapsed
+                        solutions = result.get("solutions")
+                        if isinstance(solutions, list) and solutions:
+                            normalized = []
+                            for item in solutions:
+                                if not isinstance(item, dict):
+                                    continue
+                                entry = dict(item)
+                                if entry.get("nonce64") is None and entry.get("nonce") is not None:
+                                    nonce_val = entry["nonce"]
+                                    entry["nonce64"] = (
+                                        int(nonce_val, 16)
+                                        if isinstance(nonce_val, str)
+                                        and not nonce_val.lstrip("-").isdigit()
+                                        else int(nonce_val)
+                                    )
+                                normalized.append(entry)
+                            if normalized:
+                                result["solutions"] = normalized
                         return result
                 except json.JSONDecodeError:
                     continue
@@ -250,7 +285,7 @@ class MultiGPUSolver:
         backend: str = "rocm",
         threads: int = 8,
         prepare_workers: int = 16,
-        batch_size: int = 1024,
+        batch_size: int = 81920,
         prefetch_depth: int = 8,
         pipeline_async: int = 1,
         gpu_inputs: int = 0,
@@ -347,9 +382,16 @@ class MultiGPUSolver:
             return {"found": False, "error": "no solvers configured"}
 
         if len(self.solvers) == 1:
-            return self.solvers[0].solve(
+            result = self.solvers[0].solve(
                 job, nonce_start=nonce_start, max_tries=max_tries, max_seconds=max_seconds,
             )
+            observed_nps = self.solvers[0].last_observed_nps
+            if not observed_nps:
+                elapsed = float(result.get("elapsed_s", 0) or 0)
+                tries = int(result.get("tries_used", 0) or 0)
+                observed_nps = tries / elapsed if elapsed > 0 and tries > 0 else None
+            self.last_observed_nps = observed_nps
+            return result
 
         results: list[dict] = []
         t0 = time.time()

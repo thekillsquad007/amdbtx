@@ -74,8 +74,10 @@ echo "ROCm include: $ROCM_INCLUDE"
 echo "ROCm lib: $ROCM_LIB"
 
 # --- Determine GPU architecture ---
-ARCHS=""
-if command -v rocminfo >/dev/null 2>&1; then
+ARCHS="${AMDBTX_HIP_ARCHS:-}"
+if [[ -n "$ARCHS" ]]; then
+    echo "Using requested GPU architectures: $ARCHS"
+elif command -v rocminfo >/dev/null 2>&1; then
     ARCHS=$(rocminfo 2>/dev/null | awk 'match($0,/gfx[0-9a-f]{3,}/){arch=substr($0,RSTART,RLENGTH); if(arch!="") gpus[arch]=1} END{for(a in gpus) print a}' | sort -u || true)
 fi
 if [[ -z "$ARCHS" ]] && command -v rocm-smi >/dev/null 2>&1; then
