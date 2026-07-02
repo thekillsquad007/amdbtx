@@ -684,12 +684,7 @@ class StratumClient:
 
     def _call(self, method: str, params: Any) -> Any:
         msg_id = self._next_id()
-        self._send({
-            "id": msg_id,
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        })
+        self._send({"id": msg_id, "method": method, "params": params})
         deadline = time.time() + 30.0
         while time.time() < deadline:
             msg = self._recv()
@@ -808,12 +803,7 @@ class StratumClient:
             "difficulty": float(getattr(self, "_difficulty", 0.0) or 0.0),
             "sent_at": time.time(),
         }
-        self._send({
-            "id": msg_id,
-            "jsonrpc": "2.0",
-            "method": "mining.submit",
-            "params": params,
-        })
+        self._send({"id": msg_id, "method": "mining.submit", "params": params})
         if not wait:
             return
         deadline = time.time() + 30.0
@@ -859,7 +849,6 @@ class StratumClient:
         }
         self._send({
             "id": msg_id,
-            "jsonrpc": "2.0",
             "method": "submit",
             "params": {
                 "jobId": job.job_id,
