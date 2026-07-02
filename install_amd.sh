@@ -8,7 +8,7 @@
 # Installs:
 #   1. ROCm runtime (if not present)
 #   2. amdbtx-miner Python wrapper
-#   3. btx-gbt-solve-hip solver binary (prebuilt or from source)
+#   3. btx-gbt-solve-hip solver binary from public release assets
 #   4. Writes tuned config for detected AMD GPU
 #   5. Runs GPU acceleration smoke test
 #
@@ -24,14 +24,14 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
 fi
 
 # ─── Configurables ──────────────────────────────────────────────────────────
-SOURCE_REF="${AMDBTX_SOURCE_REF:-main}"
-SOURCE_REPO="thekillsquad007/amdbtx"
+RELEASE_REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx-releases}"
 PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.1.7}"
-PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${SOURCE_REPO}/releases/download/${PREBUILDS_TAG}}"
+PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${RELEASE_REPO}/releases/download/${PREBUILDS_TAG}}"
 WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.7-py3-none-any.whl}"
 EXPECTED_MINER_VERSION="1.1.7"
 EXPECTED_WHEEL_SHA256="41d01a5a18d13dfa9d80ec23367e2571de5d42e1db87a7c9ae4089498b42bdc6"
 EXPECTED_SOLVER_VERSION="2.1.0"
+EXPECTED_SOLVER_SHA256="a9909e1906862d3aef0848cfb126cc5c490ebb3db5c9e962783ec2bea198dcb8"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.bitminerpool.xyz:3333}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
@@ -401,29 +401,13 @@ log "creating private Python environment..."
 "$PYTHON" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip wheel pyyaml
 
-# ─── Fetch one source snapshot for wrapper and solver ────────────────────
+# ─── Prepare release downloads ───────────────────────────────────────────
 mkdir -p "${INSTALL_DIR}/bin"
 TMP_BUILD_DIR="$(mktemp -d)"
-REPO_SRC_DIR="${TMP_BUILD_DIR}/repo"
 cleanup_temp() {
     rm -rf "$TMP_BUILD_DIR" 2>/dev/null || true
 }
 trap cleanup_temp EXIT
-
-RESOLVED_SOURCE_REF="$SOURCE_REF"
-SOURCE_API_URL="https://api.github.com/repos/${SOURCE_REPO}/commits/${SOURCE_REF}"
-SOURCE_API_JSON="$(curl -fsSL "$SOURCE_API_URL" 2>/dev/null || true)"
-SOURCE_COMMIT="$(printf '%s' "$SOURCE_API_JSON" | sed -nE 's/^[[:space:]]*"sha":[[:space:]]*"([0-9a-f]{40})",?$/\1/p' | head -1)"
-if [[ -n "$SOURCE_COMMIT" ]]; then
-    RESOLVED_SOURCE_REF="$SOURCE_COMMIT"
-fi
-SOURCE_ARCHIVE_URL="https://github.com/${SOURCE_REPO}/archive/${RESOLVED_SOURCE_REF}.tar.gz"
-log "downloading AMDBTX source (${RESOLVED_SOURCE_REF})..."
-mkdir -p "$REPO_SRC_DIR"
-curl -fsSL "$SOURCE_ARCHIVE_URL" -o "$TMP_BUILD_DIR/repo.tar.gz" 2>/dev/null || \
-    err "failed to download source from ${SOURCE_ARCHIVE_URL}"
-SOURCE_ARCHIVE_SHA256="$(sha256sum "$TMP_BUILD_DIR/repo.tar.gz" | awk '{print $1}')"
-tar xzf "$TMP_BUILD_DIR/repo.tar.gz" -C "$REPO_SRC_DIR" --strip-components=1
 
 if [[ "$SKIP_PIP" -eq 1 ]]; then
     log "skipping amdbtx-miner pip install (--skip-pip)"
@@ -458,46 +442,23 @@ EOF
     esac
 fi
 
-# ─── Build solver from source ───────────────────────────────────────────
-# The solver source is part of the repository. On the target system, we
-# clone the repo, compile with the locally-installed ROCm, and install.
+# ─── Install solver binary ───────────────────────────────────────────────
+# Public installs use the release binary. --local-solver remains available
+# for private testing of locally-built solver binaries.
 SOLVER_BUILT_FROM_SOURCE=0
 if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
     install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
 else
-    BUILD_DIR="$TMP_BUILD_DIR"
-    SOLVER_SRC_DIR="$REPO_SRC_DIR/solver"
-
-    # Ensure HIP dev packages match the runtime ROCm version.
-    # If /opt/rocm is present (host mount), force-install matching dev packages
-    # from the Radeon repo, even if system ROCm dev packages exist.
-    ROCM_DEV_NEEDED=0
-    set +e
-    ROCM_LIB_VER=$(dpkg -l libamdhip64-dev 2>/dev/null | awk '/libamdhip64-dev/ {print $3}' | head -1)
-    ROCM_VER=$(echo "${ROCM_LIB_VER:-}" | grep -oP '^\d+\.\d+' | head -1) || true
-    HIPCC_VER=$(hipcc --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1) || true
-    set -e
-    HIPCC_VER="${HIPCC_VER:-0}"
-    if [[ -n "$ROCM_VER" && -n "$HIPCC_VER" && "$ROCM_VER" != "$HIPCC_VER" ]]; then
-        ROCM_DEV_NEEDED=1
-    fi
-    if [[ "$ROCM_DEV_NEEDED" -eq 1 ]]; then
-        log "installing matching HIP dev packages from Radeon repo..."
-        sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hip-dev 2>/dev/null || true
-    fi
-
-    log "compiling solver for detected GPU architecture..."
-    BUILD_LOG="$BUILD_DIR/build.log"
-    if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
-        log "solver compilation successful"
-        install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
-        SOLVER_BUILT_FROM_SOURCE=1
-else
-        warn "solver compilation failed (see log below). Try installing rocm-dev or hip-dev."
-        cat "$BUILD_LOG" >&2
-        err "solver compilation failed. GPU mining cannot proceed without a working solver binary."
-    fi
+    SOLVER_ASSET_PATH="${TMP_BUILD_DIR}/btx-gbt-solve-hip"
+    SOLVER_URL="${PREBUILDS_BASE}/btx-gbt-solve-hip"
+    log "downloading btx-gbt-solve-hip ${EXPECTED_SOLVER_VERSION}..."
+    curl -fsSL "$SOLVER_URL" -o "$SOLVER_ASSET_PATH" 2>/dev/null || \
+        err "failed to download solver binary from ${SOLVER_URL}"
+    SOLVER_ASSET_SHA256="$(sha256sum "$SOLVER_ASSET_PATH" | awk '{print $1}')"
+    [[ "$SOLVER_ASSET_SHA256" == "$EXPECTED_SOLVER_SHA256" ]] || \
+        err "solver checksum mismatch: got ${SOLVER_ASSET_SHA256}"
+    install -m 0755 "$SOLVER_ASSET_PATH" "$SOLVER_PATH"
 fi
 
 log "solver installed → $SOLVER_PATH"
@@ -506,15 +467,15 @@ SOLVER_VERSION_OUTPUT="$("$SOLVER_PATH" --version 2>&1 || true)"
     err "solver is not fork-ready: ${SOLVER_VERSION_OUTPUT:-version unavailable}"
 SOLVER_SHA256="$(sha256sum "$SOLVER_PATH" | awk '{print $1}')"
 cat > "${INSTALL_DIR}/install-source.txt" <<EOF
-source_ref=${SOURCE_REF}
-source_commit=${RESOLVED_SOURCE_REF}
-source_archive_sha256=${SOURCE_ARCHIVE_SHA256}
+release_repo=${RELEASE_REPO}
+prebuilds_tag=${PREBUILDS_TAG}
 wheel_filename=${WHEEL_FILENAME}
 wheel_sha256=${WHEEL_SHA256:-skipped}
 solver_sha256=${SOLVER_SHA256}
 solver_version=${SOLVER_VERSION_OUTPUT}
 EOF
-log "source commit: ${RESOLVED_SOURCE_REF}"
+log "release repo: ${RELEASE_REPO}"
+log "release tag: ${PREBUILDS_TAG}"
 log "miner version: ${INSTALLED_MINER_VERSION:-skipped}"
 log "solver sha256: ${SOLVER_SHA256}"
 
