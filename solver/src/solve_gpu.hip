@@ -123,7 +123,15 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         // The epsilon gate now compacts candidates before allocating full
         // MatMul state, so scan batches no longer consume one workspace per
         // input nonce.
-        launch_batch = std::min(launch_batch, 131072);
+        uint64_t max_scan_batch = 131072;
+        if (const char* value = std::getenv("BTX_MATMUL_MAX_SCAN_BATCH")) {
+            const uint64_t requested = std::strtoull(value, nullptr, 10);
+            if (requested > 0) {
+                max_scan_batch = requested;
+            }
+        }
+        launch_batch = std::min<uint64_t>(
+            static_cast<uint64_t>(launch_batch), max_scan_batch);
     }
     launch_batch = std::max(1, launch_batch);
 
@@ -149,16 +157,11 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
 
         const uint64_t this_batch =
             std::min<uint64_t>(max_tries, static_cast<uint64_t>(launch_batch));
-        std::vector<uint64_t> batch_nonces(this_batch);
-        for (uint64_t i = 0; i < this_batch; ++i) {
-            batch_nonces[i] = current_nonce + i;
-        }
-
-        std::vector<Uint256> digests;
-        std::vector<bool> found;
-        std::vector<bool> gate_passed;
-        if (!LaunchMatMulTranscriptBatch(
-                device, fused_job, batch_nonces, digests, found, &gate_passed)) {
+        std::vector<MatMulBatchHit> hits;
+        uint64_t batch_gate_passes = 0;
+        if (!LaunchMatMulTranscriptCompact(
+                device, fused_job, current_nonce, static_cast<size_t>(this_batch),
+                hits, &batch_gate_passes)) {
             std::fprintf(stderr, "Fused HIP kernel failed, falling back to CPU\n");
             InvalidateGpu();
             if (cpu_fallback) {
@@ -175,24 +178,20 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
         max_tries -= this_batch;
         current_nonce += this_batch;
         if (gate_passes) {
-            *gate_passes += static_cast<uint64_t>(
-                std::count(gate_passed.begin(), gate_passed.end(), true));
+            *gate_passes += batch_gate_passes;
         }
 
         uint32_t miss_logs = 0;
-        for (size_t bi = 0; bi < batch_nonces.size(); ++bi) {
-            if (!found[bi]) {
-                continue;
-            }
+        for (const MatMulBatchHit& hit : hits) {
             if (words_hits) {
                 ++(*words_hits);
             }
 
             PowState verify = state;
-            verify.nonce = batch_nonces[bi];
+            verify.nonce = hit.nonce;
             PrepareNonceSeeds(verify);
 
-            Uint256 digest = digests[bi];
+            Uint256 digest = hit.digest;
             if (!trust_gpu_shares) {
                 ComputeDigestForNonce(verify, n, b, r, digest);
             }
@@ -206,7 +205,7 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
                     std::fprintf(stderr,
                         "digest verify miss nonce=%llu gpu=%s cpu=%s\n",
                         static_cast<unsigned long long>(verify.nonce),
-                        Uint256ToHex(digests[bi]).substr(0, 16).c_str(),
+                        Uint256ToHex(hit.digest).substr(0, 16).c_str(),
                         Uint256ToHex(digest).substr(0, 16).c_str());
                     ++miss_logs;
                 }

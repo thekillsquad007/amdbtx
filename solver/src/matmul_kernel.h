@@ -16,6 +16,12 @@ struct FusedMatMulJob {
     Uint256 block_target;
 };
 
+struct MatMulBatchHit {
+    uint64_t nonce = 0;
+    Uint256 digest;
+    uint8_t found = 0;
+};
+
 size_t FusedWorkspaceBytesPerNonce(uint32_t n, uint32_t r, uint32_t b, bool use_v2_seeds);
 
 int AutoBatchSizeForDevice(
@@ -33,6 +39,14 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     std::vector<Uint256>& out_digests,
     std::vector<bool>& out_found,
     std::vector<bool>* out_gate_passed = nullptr);
+
+extern "C" bool LaunchMatMulTranscriptCompact(
+    int device,
+    const FusedMatMulJob& job,
+    uint64_t nonce_start,
+    size_t nonce_count,
+    std::vector<MatMulBatchHit>& out_hits,
+    uint64_t* out_gate_passes = nullptr);
 
 extern "C" bool HipVerifyAgainstCpu(
     const FusedMatMulJob& job,
