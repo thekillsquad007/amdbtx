@@ -156,7 +156,7 @@ amdbtx-miner --payout-address btx1z... --worker-name myrig --solver-backend rocm
 
 On rigs with multiple AMD GPUs, the miner can run **one HIP solver per card**.
 Each GPU searches a disjoint nonce range in parallel — **effective hashrate stacks**
-for both pool and solo (2× 0.30 kH/s cards ≈ 0.60 kH/s total).
+for both pool and solo (2× ~26 MN/s cards ≈ ~52 MN/s total on RDNA3).
 
 #### How to enable multi-GPU
 
@@ -213,7 +213,7 @@ multi-GPU mining: 2 solvers on devices [0, 1]
 During mining, look for combined hashrate:
 
 ```
-nonce_khps=1380 total (690+690 per GPU) backend=hip gpus=2
+nonce_khps=52000 total (26000+26000 per GPU) backend=hip gpus=2
 ```
 
 **Behaviour**
@@ -226,21 +226,41 @@ nonce_khps=1380 total (690+690 per GPU) backend=hip gpus=2
 Leave `gpu_devices` unset to keep single-GPU mode: auto-pick the best card
 (useful on laptops with iGPU + dGPU where you only want the dGPU).
 
-### Performance branch (`perf/miner-gpu-optimization`)
+### GPU performance (v1.1.9)
 
-Active GPU solver work targets the HIP path in `solver/src/solve_gpu.hip`:
+The HIP solver in `solver/src/solve_gpu.hip` includes:
 
 - Persistent device memory pool (no per-slice `hipFree`/`hipMalloc`)
 - GPU transcript digest filter (`HashTranscriptKernel` + `CompareDigestsKernel`)
 - V2 seeds/sigma re-derived on CPU after sigma gate (required for pool consensus)
-- Inner-loop unroll in `ComputeCompressedWordsFusedKernel`
+- Scan batch clamp fix: honors `BTX_MATMUL_MAX_SCAN_BATCH` (was hard-capped at 131072)
+- RDNA3 WMMA fast path for `gfx110*` / `gfx115*` (`DeviceIsGfx11`)
 
-Rebuild after pulling:
+**RX 7800 XT** (`gfx1101`) sweet spot: `solver_batch_size: 4194304` (~260 MN/s scan
+throughput vs ~97 MN/s at the old 131k clamp). RDNA2 (`gfx103*`) defaults to
+`1048576`; older GCN cards use smaller batches (see GPU Tuning table).
+
+Find the best batch for your card:
 
 ```bash
-cd solver && bash build.sh
-cp build/btx-gbt-solve-hip ~/.amdbtx-miner/bin/
+amdbtx-miner --benchmark --config ~/.amdbtx-miner/config.yaml
 ```
+
+Optional env tweak (small gain on RDNA3 in profiling):
+
+```bash
+export BTX_MATMUL_FAST_V3_SCAN=1
+```
+
+Rebuild after pulling source:
+
+```bash
+bash build_solver.sh
+cp solver/build/btx-gbt-solve-hip ~/.amdbtx-miner/bin/
+```
+
+Prebuilt binaries (no compiler): `bash install_amd.sh --use-prebuilt --yes`
+or see [Releases](#releases).
 
 ---
 
@@ -374,29 +394,61 @@ solo: BLOCK ACCEPTED ... reward user=1960000000 dev=40000000 sats (2.00% fee)
 
 ## GPU Tuning
 
-| GPU Family | Arch | GFX | Workers | Threads | Batch |
-|------------|------|-----|---------|---------|-------|
-| RX 470/480/570/580 | GCN 4 | gfx803 | 8 | 4 | 64 |
-| RX Vega 56/64 | GCN 5 | gfx900 | 8 | 4 | 64 |
-| Radeon VII | GCN 5 | gfx906 | 12 | 8 | 128 |
-| RX 5500/5600/5700 | RDNA 1 | gfx1010 | 12 | 8 | 128 |
-| RX 6600/6700/6800/6900 | RDNA 2 | gfx1030 | 16 | 8 | 128 |
-| RX 7600/7700/7800/7900 | RDNA 3 | gfx1100 | 16 | 8 | 128 |
-| RX 9070 | RDNA 4 | gfx1102 | 16 | 8 | 128 |
+Install-time defaults (`install_amd.sh`) — override in config or run `--benchmark`:
 
-Tuning is auto-detected during install. Override in config for optimization.
+| GPU Family | Arch | GFX | Workers | Threads | Default batch |
+|------------|------|-----|---------|---------|---------------|
+| RX 470/480/570/580 | GCN 4 | gfx803 | 8 | 4 | 64 |
+| RX Vega 56/64 | GCN 5 | gfx900 | 8 | 4 | 4096 |
+| Radeon VII | GCN 5 | gfx906 | 12 | 8 | 4096 |
+| RX 5500/5600/5700 | RDNA 1 | gfx1010 | 12 | 8 | 4096 |
+| RX 6600/6700/6800/6900 | RDNA 2 | gfx1030 | 16 | 8 | 1048576 |
+| RX 7600 | RDNA 3 | gfx1102 | 16 | 8 | 4194304 |
+| RX 7700/7800/7900 | RDNA 3 | gfx1100/1101 | 16 | 8 | 4194304 |
+| RX 9060 XT | RDNA 4 | gfx1200 | 16 | 8 | 4096* |
+| RX 9070 XT | RDNA 4 | gfx1201 | 16 | 8 | 4096* |
+
+\* **RDNA 4** (`gfx1200`/`gfx1201`): compiles from source on install, but the WMMA
+fast path is RDNA3-only today — run `--benchmark` to tune batch size until RDNA4
+optimization lands.
 
 ---
 
 ## Building Solver from Source
 
-Required if the pre-built binary doesn't support your GPU:
+Default install already compiles for your detected GPU. Rebuild manually if needed:
 
 ```bash
+git clone https://github.com/thekillsquad007/amdbtx.git
+cd amdbtx
 bash build_solver.sh
 ```
 
-Output: `amdbtx-private-solver/build/btx-gbt-solve-hip`. Point `gbt_solve_path` in config to this path.
+Output: `solver/build/btx-gbt-solve-hip`. Point `gbt_solve_path` in config to this
+path (or `~/.amdbtx-miner/bin/btx-gbt-solve-hip` after install).
+
+Compile all common AMD archs in one binary:
+
+```bash
+AMDBTX_HIP_ARCHS="gfx803 gfx900 gfx906 gfx1010 gfx1030 gfx1100 gfx1101 gfx1102" \
+  bash build_solver.sh
+```
+
+---
+
+## Releases
+
+Prebuilt wheel + multi-arch HIP solver are published to
+[amdbtx-releases](https://github.com/thekillsquad007/amdbtx-releases).
+
+Latest: [amdbtx-prebuilds-v1.1.9](https://github.com/thekillsquad007/amdbtx-releases/releases/tag/amdbtx-prebuilds-v1.1.9)
+
+```bash
+bash install_amd.sh --address btx1z... --use-prebuilt --yes
+```
+
+Assets: `amdbtx_miner-1.1.9-py3-none-any.whl`, `btx-gbt-solve-hip` (gfx900/906/1030/1100/1101).
+For **gfx1200/gfx1201** (RDNA 4) or other arches, use the default source-compile install.
 
 ---
 
@@ -415,10 +467,29 @@ Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
 
 ## Pool Information
 
-- **Pool Dashboard**: https://bitminerpool.xyz
+### BitMinerPool (default)
+
+- **Dashboard**: https://bitminerpool.xyz
 - **Stratum**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
 - **Algorithm**: MatMul PoW (BTX spec, n=512, b=16, r=8, M31 field)
 - **Pool Fee**: 2.5% (PPLNS, weekly payouts)
+
+### LuckyPool
+
+The miner auto-detects LuckyPool's JSON-RPC dialect when standard stratum
+`mining.subscribe` is unavailable. Point `pool_host` / `pool_port` at your
+LuckyPool endpoint (e.g. `btx-sg.lproute.com:8660`):
+
+```yaml
+pool_host: "btx-sg.lproute.com"
+pool_port: 8660
+```
+
+LuckyPool submits the full 16-character `nonce64` (not a truncated suffix).
+Sparse job updates preserve prior height fields automatically.
+
+### General
+
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
 
 ### Getting a BTX Address
@@ -438,6 +509,9 @@ The pool does **not** create wallets. Visit https://easybtx.com/wallet to create
 | GPU not detected in WSL | Set `HSA_ENABLE_DXG_DETECTION=1` in Windows env, `wsl --shutdown`, restart |
 | Low GPU utilization | Bump `solver_prepare_workers` and `solver_threads` |
 | Share rejected (code 21) | Normal after reconnect, wait 1–2 minutes |
+| LuckyPool `code=20 incorrect size of nonce64` | Ensure miner v1.1.8+; submits full 16-char nonce64 |
+| Low hashrate after upgrade | Run `--benchmark`; RDNA3 often needs `solver_batch_size: 4194304` |
+| `solver_batch_size` very large warning | Confirm VRAM headroom with `--benchmark` before mining |
 
 ---
 
@@ -445,5 +519,6 @@ The pool does **not** create wallets. Visit https://easybtx.com/wallet to create
 
 - **Pool**: https://bitminerpool.xyz
 - **Dashboard**: https://bitminerpool.xyz
+- **Releases**: https://github.com/thekillsquad007/amdbtx-releases
 - **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
 - **GitHub**: https://github.com/thekillsquad007/amdbtx
