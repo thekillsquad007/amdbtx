@@ -136,6 +136,21 @@ class Job:
             clean_jobs=bool(params.get("cleanJobs", False)),
         )
 
+    @staticmethod
+    def infer_luckypool_nonce_bits(nonce64_start: int) -> int:
+        """Infer LuckyPool suffix width from an aligned nonce prefix."""
+        if nonce64_start <= 0:
+            return 0
+        trailing = 0
+        value = int(nonce64_start)
+        while trailing < 64 and (value & 1) == 0:
+            trailing += 1
+            value >>= 1
+        # LuckyPool BTX jobs observed so far use a 40-bit nonce suffix.
+        # Only infer common byte-aligned suffix sizes to avoid masking a full nonce
+        # by accident if a pool ever sends an unaligned start.
+        return trailing if trailing in (32, 40, 48) else 0
+
     def should_replace(self, other: "Job") -> bool:
         # Same-height notify rotations (clean=true) update job_id/target only.
         return other.block_height != self.block_height
@@ -470,6 +485,12 @@ class StratumClient:
             try:
                 job = Job.from_luckypool(params)
                 if (
+                    job.luckypool_nonce_bits <= 0
+                    and self._current_job is not None
+                    and self._current_job.luckypool_nonce_bits > 0
+                ):
+                    job.luckypool_nonce_bits = self._current_job.luckypool_nonce_bits
+                if (
                     self._current_job is not None
                     and self._current_job.prev_hash == job.prev_hash
                     and self._current_job.block_height == job.block_height
@@ -478,8 +499,9 @@ class StratumClient:
                     job.luckypool_nonce_bits = self._current_job.luckypool_nonce_bits
                 self._current_job = job
                 log.info(
-                    "luckypool job=%s height=%d clean=%s nonce_start=%d",
-                    job.job_id, job.block_height, job.clean_jobs, job.nonce64_start,
+                    "luckypool job=%s height=%d clean=%s nonce_start=%d nonce_bits=%d",
+                    job.job_id, job.block_height, job.clean_jobs,
+                    job.nonce64_start, job.luckypool_nonce_bits,
                 )
             except (TypeError, ValueError) as e:
                 log.warning("malformed luckypool job: %s; params=%r", e, params)
@@ -622,6 +644,10 @@ class StratumClient:
         if "nonce64" in result:
             nonce64 = int(result["nonce64"])
             nonce_bits = int(getattr(job, "luckypool_nonce_bits", 0) or 0)
+            if nonce_bits <= 0:
+                nonce_bits = Job.infer_luckypool_nonce_bits(
+                    int(getattr(job, "nonce64_start", 0) or 0)
+                )
             if nonce_bits > 0:
                 nonce_mask = (1 << nonce_bits) - 1
                 nonce_width = (nonce_bits + 3) // 4
