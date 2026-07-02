@@ -20,7 +20,28 @@ from .hardware import (
 
 METRICS_REPORT_INTERVAL_SEC = 60.0
 
+# LuckyPool uses a different JSON-RPC dialect (login/submit). Only auto-enable it
+# on known LuckyPool hosts — never on BitMinerPool or other standard stratum pools.
+LUCKYPOOL_HOST_MARKERS = (
+    ".lproute.com",
+    "luckypool",
+)
+
 log = logging.getLogger(__name__)
+
+
+def is_luckypool_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    return any(marker in h for marker in LUCKYPOOL_HOST_MARKERS)
+
+
+def pool_allows_luckypool_protocol(host: str, cfg: dict | None) -> bool:
+    mode = str((cfg or {}).get("pool_protocol", "auto") or "auto").strip().lower()
+    if mode == "stratum":
+        return False
+    if mode == "luckypool":
+        return True
+    return is_luckypool_host(host)
 
 
 class Job:
@@ -246,9 +267,18 @@ class StratumClient:
         self._msg_id += 1
         return self._msg_id
 
+    def _open_socket(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = socket.create_connection((self.host, self.port))
+        self._buf = b""
+
     def _connect(self):
         log.info("connecting to %s:%d", self.host, self.port)
-        self.sock = socket.create_connection((self.host, self.port))
+        self._open_socket()
         self._handshake()
 
     def _handshake(self):
@@ -283,16 +313,44 @@ class StratumClient:
             "session_id": self._session_id,
         }
 
-        try:
-            sub = self._call("mining.subscribe", [USER_AGENT, extension])
-        except RuntimeError as e:
-            if "Method not found" in str(e):
-                log.info(
-                    "pool does not support mining.subscribe; trying LuckyPool login protocol"
+        sub = None
+        subscribe_variants = (
+            ("dexbtx extension", [USER_AGENT, extension]),
+            ("minimal", [USER_AGENT]),
+        )
+        for label, params in subscribe_variants:
+            try:
+                sub = self._call("mining.subscribe", params)
+                if label != "dexbtx extension":
+                    log.info("subscribed using %s mining.subscribe", label)
+                break
+            except ConnectionError:
+                log.warning(
+                    "pool closed connection during mining.subscribe (%s)", label,
                 )
-                self._lucky_handshake()
-                return
-            raise
+                if label == subscribe_variants[-1][0]:
+                    raise RuntimeError(
+                        f"pool {self.host}:{self.port} closed connection during handshake "
+                        f"(not LuckyPool — check pool_host/pool_port and network)"
+                    ) from None
+                self._open_socket()
+            except RuntimeError as e:
+                if "Method not found" in str(e):
+                    if pool_allows_luckypool_protocol(self.host, self.cfg):
+                        log.info(
+                            "pool does not support mining.subscribe; "
+                            "trying LuckyPool login protocol"
+                        )
+                        self._lucky_handshake()
+                        return
+                    raise RuntimeError(
+                        f"pool {self.host}:{self.port} does not support mining.subscribe "
+                        f"and LuckyPool protocol is disabled for this host "
+                        f"(set pool_protocol: luckypool only for LuckyPool endpoints)"
+                    ) from e
+                raise
+        if sub is None:
+            raise RuntimeError("mining.subscribe failed")
         if isinstance(sub, list) and len(sub) >= 3:
             self._extranonce1 = sub[1]
             self._extranonce2_size = int(sub[2])
@@ -626,7 +684,12 @@ class StratumClient:
 
     def _call(self, method: str, params: Any) -> Any:
         msg_id = self._next_id()
-        self._send({"id": msg_id, "method": method, "params": params})
+        self._send({
+            "id": msg_id,
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        })
         deadline = time.time() + 30.0
         while time.time() < deadline:
             msg = self._recv()
@@ -673,8 +736,7 @@ class StratumClient:
                 self.payout_address, self.operator_worker_name,
             )
             return
-        msg_id = self._next_id()
-        self._send({"id": msg_id, "method": "mining.authorize", "params": [worker, ""]})
+        self._call("mining.authorize", [worker, ""])
         log.info("re-authorized as %s", worker)
 
     def get_job(self) -> Job:
@@ -746,7 +808,12 @@ class StratumClient:
             "difficulty": float(getattr(self, "_difficulty", 0.0) or 0.0),
             "sent_at": time.time(),
         }
-        self._send({"id": msg_id, "method": "mining.submit", "params": params})
+        self._send({
+            "id": msg_id,
+            "jsonrpc": "2.0",
+            "method": "mining.submit",
+            "params": params,
+        })
         if not wait:
             return
         deadline = time.time() + 30.0

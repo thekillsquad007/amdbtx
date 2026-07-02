@@ -21,6 +21,9 @@ def validate_config(cfg: dict) -> dict:
         "pool_host": "127.0.0.1",
         "pool_port": 3333,
         "pool_tls": False,
+        # Pool wire protocol: auto (stratum; LuckyPool only on lproute/luckypool hosts),
+        # stratum (never LuckyPool), luckypool (force LuckyPool login/submit).
+        "pool_protocol": "auto",
         "rpc_url": "http://127.0.0.1:19334",
         "rpc_user": "",
         "rpc_password": "",

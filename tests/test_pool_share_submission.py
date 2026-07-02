@@ -6,7 +6,12 @@ import pytest
 from amdbtx_miner.__main__ import _solve_slice_continuous, _submitted_share_keys
 from amdbtx_miner.config import validate_config
 from amdbtx_miner.gbt_solve_wrapper import MultiGPUSolver
-from amdbtx_miner.stratum_client import Job, StratumClient
+from amdbtx_miner.stratum_client import (
+    Job,
+    StratumClient,
+    is_luckypool_host,
+    pool_allows_luckypool_protocol,
+)
 
 
 class DummySolver:
@@ -533,3 +538,40 @@ def test_job_copy_preserves_luckypool_nonce_suffix_width():
     )
 
     assert solve_job.luckypool_nonce_bits == 40
+
+
+def test_luckypool_host_detection():
+    assert is_luckypool_host("btx-sg.lproute.com")
+    assert is_luckypool_host("LuckyPool.example")
+    assert not is_luckypool_host("stratum.bitminerpool.xyz")
+    assert not is_luckypool_host("stratum.minebtx.com")
+
+
+def test_luckypool_protocol_gated_by_host_and_config():
+    assert pool_allows_luckypool_protocol("btx-sg.lproute.com", {})
+    assert not pool_allows_luckypool_protocol("stratum.bitminerpool.xyz", {})
+    assert pool_allows_luckypool_protocol(
+        "stratum.bitminerpool.xyz", {"pool_protocol": "luckypool"},
+    )
+    assert not pool_allows_luckypool_protocol(
+        "btx-sg.lproute.com", {"pool_protocol": "stratum"},
+    )
+
+
+def test_stratum_call_includes_jsonrpc():
+    sent = []
+    client = StratumClient.__new__(StratumClient)
+    client._msg_id = 0
+    client._pending_submits = {}
+    client._send = sent.append
+    client._recv = lambda: {"id": 1, "result": True}
+    client.sock = object()
+
+    client._call("mining.authorize", ["addr.worker", ""])
+
+    assert sent == [{
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": "mining.authorize",
+        "params": ["addr.worker", ""],
+    }]

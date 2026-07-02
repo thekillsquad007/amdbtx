@@ -155,7 +155,9 @@ pool_host: "btx-sg.lproute.com"
 pool_port: 8660
 ```
 
-The miner detects LuckyPool automatically — no extra setup.
+On LuckyPool hosts (`*.lproute.com`) the miner auto-switches to the LuckyPool
+login/submit dialect. Other pools (BitMinerPool, etc.) always use standard
+stratum. Force LuckyPool with `pool_protocol: luckypool` in config.
 
 ### Wallet
 
