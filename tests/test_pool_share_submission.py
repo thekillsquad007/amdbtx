@@ -254,3 +254,54 @@ def test_luckypool_submit_uses_login_protocol_payload_with_nonce_suffix():
             "result": "ab" * 32,
         },
     }]
+
+
+def test_luckypool_same_height_rotation_preserves_nonce_suffix_width():
+    sent = []
+    client = StratumClient.__new__(StratumClient)
+    client._protocol = "luckypool"
+    client._msg_id = 0
+    client._pending_submits = {}
+    client._difficulty = 0.0002
+    client._send = sent.append
+    client._current_job = Job.from_luckypool({
+        "jobId": "554",
+        "height": 147726,
+        "nVersion": 536870912,
+        "prevHash": "11" * 32,
+        "merkleRoot": "22" * 32,
+        "nTime": 1782972536,
+        "nBits": "1c4c2e02",
+        "noncePrefix": "7368840",
+        "nonceBits": 40,
+        "shareTarget": "00001387ec780000",
+        "parentMtp": 1782972000,
+    })
+
+    client._handle_server_message({
+        "method": "job",
+        "params": {
+            "jobId": "555",
+            "height": 147726,
+            "nVersion": 536870912,
+            "prevHash": "11" * 32,
+            "merkleRoot": "33" * 32,
+            "nTime": 1782972566,
+            "nBits": "1c4c2e02",
+            "shareTarget": "00001387ec780000",
+            "parentMtp": 1782972000,
+        },
+    })
+
+    assert client._current_job.luckypool_nonce_bits == 40
+
+    client.submit_share(
+        client._current_job,
+        {
+            "nonce64": 0x7069e703235b9f46,
+            "digest": "ab" * 32,
+            "is_block": False,
+        },
+    )
+
+    assert sent[0]["params"]["nonce"] == "03235b9f46"

@@ -37,8 +37,12 @@ def _target_probability_from_hex(target_hex: str | None) -> float:
     """Return final-digest pass probability for a compact/share target hex."""
     if not target_hex:
         return 0.0
+    target_str = str(target_hex).strip().lower()
+    if target_str.startswith("0x"):
+        target_str = target_str[2:]
+    target_str = target_str[:64].ljust(64, "0")
     try:
-        target = int(str(target_hex), 16)
+        target = int(target_str, 16)
     except (TypeError, ValueError):
         return 0.0
     if target <= 0:

@@ -475,6 +475,7 @@ class StratumClient:
                     and self._current_job.block_height == job.block_height
                 ):
                     job.nonce64_start = self._current_job.nonce64_start
+                    job.luckypool_nonce_bits = self._current_job.luckypool_nonce_bits
                 self._current_job = job
                 log.info(
                     "luckypool job=%s height=%d clean=%s nonce_start=%d",

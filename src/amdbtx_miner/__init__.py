@@ -1,4 +1,4 @@
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 USER_AGENT = f"amdbtx-miner/{__version__}"
 
