@@ -105,6 +105,35 @@ class Job:
             )
         raise ValueError(f"cannot parse notify params: type={type(params)}")
 
+    @classmethod
+    def from_luckypool(cls, params: dict) -> "Job":
+        """Parse LuckyPool's login/job JSON-RPC dialect."""
+        nonce_bits = int(params.get("nonceBits", 0) or 0)
+        nonce_prefix = str(params.get("noncePrefix", "") or "0")
+        try:
+            prefix_value = int(nonce_prefix, 10 if nonce_prefix.isdigit() else 16)
+        except ValueError:
+            prefix_value = int(nonce_prefix, 10)
+        return cls(
+            job_id=str(params.get("jobId", "")),
+            version=int(params.get("nVersion", 0)),
+            prev_hash=str(params.get("prevHash", "0" * 64)),
+            merkle_root=str(params.get("merkleRoot", "0" * 64)),
+            time=int(params.get("nTime", 0)),
+            bits=str(params.get("nBits", "1d17c609")),
+            target=str(params.get("shareTarget", "")),
+            seed_a="0" * 64,
+            seed_b="0" * 64,
+            block_height=int(params.get("height", 0)),
+            matmul_n=int(params.get("matmulDim", 512)),
+            matmul_b=int(params.get("b", 16)),
+            matmul_r=int(params.get("r", 8)),
+            epsilon_bits=int(params.get("epsilonBits", 18)),
+            parent_mtp=int(params["parentMtp"]) if params.get("parentMtp") is not None else None,
+            nonce64_start=prefix_value << nonce_bits,
+            clean_jobs=bool(params.get("cleanJobs", False)),
+        )
+
     def should_replace(self, other: "Job") -> bool:
         # Same-height notify rotations (clean=true) update job_id/target only.
         return other.block_height != self.block_height
@@ -142,6 +171,7 @@ class StratumClient:
         self._submit_worker = fully_qualified_worker(payout_address, worker_name)
         self.worker_name = self._submit_worker
         self._canonical_worker_name = ""
+        self._protocol = "stratum"
         self.cfg = cfg or {}
         self.sock: socket.socket | None = None
         self._buf = b""
@@ -202,7 +232,16 @@ class StratumClient:
             "session_id": self._session_id,
         }
 
-        sub = self._call("mining.subscribe", [USER_AGENT, extension])
+        try:
+            sub = self._call("mining.subscribe", [USER_AGENT, extension])
+        except RuntimeError as e:
+            if "Method not found" in str(e):
+                log.info(
+                    "pool does not support mining.subscribe; trying LuckyPool login protocol"
+                )
+                self._lucky_handshake()
+                return
+            raise
         if isinstance(sub, list) and len(sub) >= 3:
             self._extranonce1 = sub[1]
             self._extranonce2_size = int(sub[2])
@@ -241,8 +280,31 @@ class StratumClient:
             self._difficulty,
         )
 
+    def _lucky_handshake(self) -> None:
+        self._protocol = "luckypool"
+        ok = self._call(
+            "login",
+            {
+                "login": self._submit_worker,
+                "pass": "x",
+                "agent": USER_AGENT,
+                "algo": "btx",
+            },
+        )
+        if not ok:
+            raise RuntimeError(f"luckypool login rejected for worker={self._submit_worker}")
+        # LuckyPool currently advertises BTX vardiff start difficulty 0.0002.
+        self._difficulty = float(self.cfg.get("pool_difficulty", 0.0002) or 0.0002)
+        log.info(
+            "luckypool login OK as %s; waiting for job messages",
+            self._submit_worker,
+        )
+
     def start_metrics_reporter(self, solver: Any) -> None:
         """Background worker.report_metrics heartbeats (dexbtx-miner parity)."""
+        if self._protocol == "luckypool":
+            log.info("luckypool protocol: worker.report_metrics disabled")
+            return
         self._solver_ref = solver
         self._metrics_stop.clear()
         if self._metrics_thread is not None and self._metrics_thread.is_alive():
@@ -400,6 +462,23 @@ class StratumClient:
                          self._current_job.clean_jobs)
             except (IndexError, KeyError, ValueError) as e:
                 log.warning("malformed notify: %s", e)
+        elif method == "job":
+            params = msg.get("params", {})
+            try:
+                job = Job.from_luckypool(params)
+                if (
+                    self._current_job is not None
+                    and self._current_job.prev_hash == job.prev_hash
+                    and self._current_job.block_height == job.block_height
+                ):
+                    job.nonce64_start = self._current_job.nonce64_start
+                self._current_job = job
+                log.info(
+                    "luckypool job=%s height=%d clean=%s nonce_start=%d",
+                    job.job_id, job.block_height, job.clean_jobs, job.nonce64_start,
+                )
+            except (TypeError, ValueError) as e:
+                log.warning("malformed luckypool job: %s; params=%r", e, params)
         elif method == "mining.set_difficulty":
             params = msg.get("params", [])
             if params:
@@ -441,7 +520,7 @@ class StratumClient:
             return str(params.get("canonical_name", "") or "")
         return ""
 
-    def _call(self, method: str, params: list) -> Any:
+    def _call(self, method: str, params: Any) -> Any:
         msg_id = self._next_id()
         self._send({"id": msg_id, "method": method, "params": params})
         deadline = time.time() + 30.0
@@ -483,6 +562,10 @@ class StratumClient:
                     log.warning("malformed notify: %s; params=%r", e, params)
             else:
                 self._dispatch_message(msg)
+                if self._current_job is not None:
+                    job = self._current_job
+                    self._current_job = None
+                    return job
 
     def wait_for_job(self) -> Job:
         while True:
@@ -494,6 +577,8 @@ class StratumClient:
                 return job
 
     def submit_share(self, job: Job, result: dict, *, wait: bool = False):
+        if self._protocol == "luckypool":
+            return self._submit_luckypool_share(job, result, wait=wait)
         worker = self._submit_worker or self.worker_name or self.payout_address
         nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
         ntime_val = int(result.get("ntime") or job.time)
@@ -515,6 +600,45 @@ class StratumClient:
             "sent_at": time.time(),
         }
         self._send({"id": msg_id, "method": "mining.submit", "params": params})
+        if not wait:
+            return
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            if msg_id not in self._pending_submits:
+                return
+            resp = self._recv()
+            if resp.get("id") == msg_id:
+                self._complete_pending_submit(msg_id, resp)
+                return
+            self._dispatch_message(resp)
+        self._pending_submits.pop(msg_id, None)
+        log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
+
+    def _submit_luckypool_share(self, job: Job, result: dict, *, wait: bool = False):
+        nonce_hex = f"{int(result['nonce64']):016x}" if "nonce64" in result else ""
+        digest_hex = str(result.get("digest", ""))
+        log.info(
+            "submit luckypool job=%s nonce=%s digest=%s target=%s",
+            job.job_id, nonce_hex, digest_hex, (job.target or "")[:16],
+        )
+        msg_id = self._next_id()
+        is_block = bool(result.get("is_block", False))
+        self._pending_submits[msg_id] = {
+            "job_id": job.job_id,
+            "nonce_hex": nonce_hex,
+            "is_block": is_block,
+            "difficulty": float(self._difficulty or 0.0),
+            "sent_at": time.time(),
+        }
+        self._send({
+            "id": msg_id,
+            "method": "submit",
+            "params": {
+                "jobId": job.job_id,
+                "nonce": nonce_hex,
+                "result": digest_hex,
+            },
+        })
         if not wait:
             return
         deadline = time.time() + 30.0

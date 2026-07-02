@@ -184,3 +184,55 @@ def test_pool_credit_stats_reports_recent_credit_per_minute():
     assert stats["credit"] == 0.5
     assert stats["avg_diff"] == 0.5
     assert stats["credit_per_min"] == 0.5
+
+
+def test_luckypool_job_parser_maps_nonce_prefix_and_v3_fields():
+    job = Job.from_luckypool({
+        "jobId": "4f4",
+        "height": 147654,
+        "nVersion": 536870912,
+        "prevHash": "11" * 32,
+        "merkleRoot": "22" * 32,
+        "nTime": 1782965958,
+        "nBits": "1c477239",
+        "matmulDim": 512,
+        "b": 16,
+        "r": 8,
+        "epsilonBits": 18,
+        "noncePrefix": "9266998",
+        "nonceBits": 40,
+        "shareTarget": "00" + "ff" * 31,
+        "cleanJobs": True,
+        "parentMtp": 1782965509,
+    })
+
+    assert job.job_id == "4f4"
+    assert job.block_height == 147654
+    assert job.parent_mtp == 1782965509
+    assert job.nonce64_start == (9266998 << 40)
+    assert job.target == "00" + "ff" * 31
+
+
+def test_luckypool_submit_uses_login_protocol_payload():
+    sent = []
+    client = StratumClient.__new__(StratumClient)
+    client._protocol = "luckypool"
+    client._msg_id = 0
+    client._pending_submits = {}
+    client._difficulty = 0.0002
+    client._send = sent.append
+
+    client.submit_share(
+        _job(),
+        {"nonce64": 0x1234, "digest": "ab" * 32, "is_block": False},
+    )
+
+    assert sent == [{
+        "id": 1,
+        "method": "submit",
+        "params": {
+            "jobId": "job-1",
+            "nonce": "0000000000001234",
+            "result": "ab" * 32,
+        },
+    }]

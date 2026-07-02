@@ -24,3 +24,4 @@ solo-config.yaml
 
 # Ad-hoc dev/test scripts (run locally; not shipped in the repo)
 test_*.py
+!tests/test_*.py

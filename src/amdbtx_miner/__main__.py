@@ -33,6 +33,26 @@ log = logging.getLogger("amdbtx_miner")
 _submitted_share_keys: set[tuple[str, int, int]] = set()
 
 
+def _target_probability_from_hex(target_hex: str | None) -> float:
+    """Return final-digest pass probability for a compact/share target hex."""
+    if not target_hex:
+        return 0.0
+    try:
+        target = int(str(target_hex), 16)
+    except (TypeError, ValueError):
+        return 0.0
+    if target <= 0:
+        return 0.0
+    return min(target / float(1 << 256), 1.0)
+
+
+def _expected_shares_from_gate(gate_passes: int, target_hex: str | None) -> float:
+    """Expected accepted shares after the sigma gate for the current share target."""
+    if gate_passes <= 0:
+        return 0.0
+    return float(gate_passes) * _target_probability_from_hex(target_hex)
+
+
 def resolve_solver_path(configured_path: str = "") -> Path:
     if configured_path:
         return Path(configured_path).expanduser()
@@ -49,7 +69,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="AMD BTX Miner")
     p.add_argument("--config", default=str(Path.home() / ".amdbtx-miner" / "config.yaml"))
     p.add_argument("--payout-address", help="BTX payout address")
-    p.add_argument("--worker-name", default="default")
+    p.add_argument("--worker-name", default=None)
     p.add_argument("--pool-host", default=None, help="pool hostname (default: config or stratum.bitminerpool.xyz)")
     p.add_argument("--pool-port", type=int, default=None)
     p.add_argument("--solver-backend", default=None, choices=["rocm", "cpu"])
@@ -500,6 +520,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 matmul_khps = gate_passes / elapsed / 1000
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
             gate_ppm = (gate_passes / tries * 1_000_000) if tries else 0.0
+            expected_shares = _expected_shares_from_gate(gate_passes, current_job.target)
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
 
@@ -518,6 +539,10 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 )
                 slice_nps = tries / elapsed
                 gpu_nps = tries / solver_elapsed if solver_elapsed > 0 else slice_nps
+                observed_nps = gpu_nps if gpu_nps > 0 else slice_nps
+                ema_prev = float(getattr(solver, "_ema_nonce_nps", 0) or 0)
+                ema = observed_nps if ema_prev <= 0 else (ema_prev * 0.7 + observed_nps * 0.3)
+                solver._ema_nonce_nps = ema
                 peak = max(
                     float(getattr(solver, "_peak_nonce_nps", 0) or 0),
                     slice_nps,
@@ -525,7 +550,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 )
                 solver._peak_nonce_nps = peak
                 if hasattr(solver, "last_observed_nps"):
-                    solver.last_observed_nps = peak
+                    solver.last_observed_nps = ema
 
             if now - last_log >= log_interval or result.get("found") or result.get("error"):
                 backend = result.get("backend", "?")
@@ -556,11 +581,15 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                         )
                 slice_shares = result.get("shares_in_slice", 0)
                 slice_tag = f" slice_shares={slice_shares}" if slice_shares else ""
+                nonce_end = result.get("nonce64_end")
+                if nonce_end is None:
+                    nonce_end = current_job.nonce64_start + max(tries - 1, 0)
                 log.info(
-                    "solve: nonce=%d tries=%d gate=%d gate/s=%.0f gate_ppm=%.2f elapsed=%.2fs "
+                    "solve: nonce=%d nonce_end=%d tries=%d gate=%d gate/s=%.0f "
+                    "gate_ppm=%.2f exp_shares=%.3f elapsed=%.2fs "
                     "%s backend=%s%s found=%s shares=%d/%d target=%s%s%s",
-                    current_job.nonce64_start, tries, gate_passes, gate_per_s,
-                    gate_ppm, elapsed,
+                    current_job.nonce64_start, nonce_end, tries, gate_passes, gate_per_s,
+                    gate_ppm, expected_shares, elapsed,
                     khps_line, backend, gpu_tag, result.get("found"), a, r,
                     (current_job.target[:12] if current_job.target else "none"),
                     pool_note, slice_tag,
