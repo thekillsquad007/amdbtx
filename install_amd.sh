@@ -39,7 +39,7 @@ EXPECTED_SOLVER_VERSION="2.2.0"
 EXPECTED_SOLVER_SHA256="b4dc4194e348edbc691dbec9dad1b75bbf5fd626d099784d9a757ab6f172b21d"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.bitminerpool.xyz:3333}"
 # Used when --compile-all-archs is set (or AMDBTX_COMPILE_ALL_ARCHS=1).
-ALL_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx803 gfx900 gfx906 gfx908 gfx90a gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151}"
+ALL_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx803 gfx900 gfx906 gfx908 gfx90a gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1200 gfx1201}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
 SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
@@ -854,6 +854,9 @@ if [[ "$GPU_ARCH" == gfx103* ]]; then
     GPU_BATCH=1048576
 fi
 if [[ "$GPU_ARCH" == gfx110* || "$GPU_ARCH" == gfx115* ]]; then
+    GPU_BATCH=4194304
+fi
+if [[ "$GPU_ARCH" == gfx120* ]]; then
     GPU_BATCH=4194304
 fi
 

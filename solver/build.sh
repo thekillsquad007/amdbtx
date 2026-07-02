@@ -85,7 +85,7 @@ if [[ -z "$ARCHS" ]] && command -v rocm-smi >/dev/null 2>&1; then
 fi
 if [[ -z "$ARCHS" ]]; then
     # Fallback: compile for common targets (include gfx1101 for RX 7800 XT)
-    ARCHS="gfx803 gfx900 gfx906 gfx908 gfx90a gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151"
+    ARCHS="gfx803 gfx900 gfx906 gfx908 gfx90a gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1200 gfx1201"
     echo "Warning: could not detect GPU arch, compiling for all common targets"
 fi
 

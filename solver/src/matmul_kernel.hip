@@ -17,6 +17,13 @@
 
 #include <hip/hip_runtime.h>
 
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__) || defined(__gfx1153__) || defined(__gfx1200__) || \
+    defined(__gfx1201__)
+#define BTX_HIP_WMMA_TARGET 1
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -2555,9 +2562,7 @@ __global__ void batch_factored_words_wmma_512x16_kernel(
     const uint32_t* __restrict__ rhs,
     uint32_t* __restrict__ output)
 {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
-    defined(__gfx1152__) || defined(__gfx1153__)
+#ifdef BTX_HIP_WMMA_TARGET
     constexpr uint32_t kN = 512;
     constexpr uint32_t kB = 16;
     constexpr uint32_t kBlocksPerAxis = 32;
@@ -2637,9 +2642,7 @@ __global__ void batch_factored_words_wmma_partial_512x16_kernel(
     const uint32_t* __restrict__ rhs,
     uint32_t* __restrict__ partials)
 {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
-    defined(__gfx1152__) || defined(__gfx1153__)
+#ifdef BTX_HIP_WMMA_TARGET
     constexpr uint32_t kN = 512;
     constexpr uint32_t kB = 16;
     constexpr uint32_t kK = kB * kN;
@@ -3144,6 +3147,23 @@ bool DeviceIsGfx11(int device)
         return false;
     }
     return std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
+}
+
+bool DeviceIsGfx12(int device)
+{
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
+        return false;
+    }
+    return std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
+}
+
+bool DeviceSupportsWmma(int device)
+{
+    if (DeviceIsGfx11(device)) {
+        return true;
+    }
+    return DeviceIsGfx12(device) && EnvEnabled("BTX_MATMUL_EXPERIMENTAL_GFX12_WMMA");
 }
 
 struct MatmulProfile {
@@ -3665,8 +3685,18 @@ bool ProcessPassedNoncesBatched(
 
     const uint32_t total_words =
         static_cast<uint32_t>(batch) * words_per_nonce;
-    const bool use_wmma_words = use_512x16x8 && DeviceIsGfx11(device) &&
+    const bool use_wmma_words = use_512x16x8 && DeviceSupportsWmma(device) &&
         !EnvEnabled("BTX_MATMUL_NO_WMMA");
+    if (use_wmma_words && DeviceIsGfx12(device) &&
+        EnvEnabled("BTX_MATMUL_EXPERIMENTAL_GFX12_WMMA")) {
+        static bool logged_experimental_gfx12 = false;
+        if (!logged_experimental_gfx12) {
+            logged_experimental_gfx12 = true;
+            std::fprintf(
+                stderr,
+                "amdbtx: experimental RDNA4 WMMA path active (gfx12)\n");
+        }
+    }
     if (profile && profile->enabled) {
         if (use_wmma_words) {
             profile->words_path = "wmma";

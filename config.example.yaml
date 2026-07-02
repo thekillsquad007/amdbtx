@@ -25,6 +25,10 @@ solver_pipeline_async: 1
 gpu_inputs: 0
 pool_max_shares_per_slice: 0
 
+# Untested RDNA4 (RX 9060/9070, gfx1200/gfx1201) WMMA fast path.
+# Requires a solver binary compiled with gfx12. CLI: --experimental-rdna4
+# experimental_rdna4_wmma: false
+
 # Optional benchmark override, comma string or YAML list.
 benchmark_batch_sizes: [131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216]
 benchmark_sweep_threads: false

@@ -52,6 +52,7 @@ def validate_config(cfg: dict) -> dict:
         # Pool: cap shares per 5s slice. 0 means submit every valid share
         # returned by the solver.
         "pool_max_shares_per_slice": 0,
+        "experimental_rdna4_wmma": False,
         "reconnect_initial_s": 1.0,
     "reconnect_max_s": 60.0,
     "log_level": "INFO",

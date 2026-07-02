@@ -10,6 +10,12 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def apply_matmul_experimental_flags(env: dict, experimental_rdna4_wmma: bool = False) -> None:
+    """Pass optional solver env toggles from miner config/CLI."""
+    if experimental_rdna4_wmma:
+        env["BTX_MATMUL_EXPERIMENTAL_GFX12_WMMA"] = "1"
+
+
 class GBTSolveWrapper:
     @staticmethod
     def _supports_parent_mtp_v3(version_output: str) -> bool:
@@ -27,7 +33,8 @@ class GBTSolveWrapper:
                  prepare_workers: int = 16, batch_size: int = 81920,
                  prefetch_depth: int = 8, pipeline_async: int = 1,
                  gpu_inputs: int = 0, gpu_device: int = -1,
-                 runtime_ld_path: str = ""):
+                 runtime_ld_path: str = "",
+                 experimental_rdna4_wmma: bool = False):
         self.solver_path = Path(solver_path).expanduser()
         self.backend = backend
         self.threads = threads
@@ -38,6 +45,7 @@ class GBTSolveWrapper:
         self.gpu_inputs = gpu_inputs
         self.gpu_device = gpu_device
         self.runtime_ld_path = runtime_ld_path
+        self.experimental_rdna4_wmma = experimental_rdna4_wmma
         self.proc: subprocess.Popen | None = None
         self.last_observed_nps = None
         self._stderr_thread: threading.Thread | None = None
@@ -100,6 +108,7 @@ class GBTSolveWrapper:
         # Default trust-GPU to ON; pool re-verifies all shares, so a bad GPU
         # digest is just rejected.  Users can override via shell env.
         env.setdefault("BTX_MATMUL_TRUST_GPU_SHARES", "1")
+        apply_matmul_experimental_flags(env, self.experimental_rdna4_wmma)
         # Post-125k the matmul seed folds nTime. Upstream btx-gbt-solve auto-refreshes
         # header time every 4096 attempts by default; the wrapper still submits the
         # original job ntime, so the pool recomputes a different digest (code-23).
@@ -291,6 +300,7 @@ class MultiGPUSolver:
         gpu_inputs: int = 0,
         gpu_devices: list[int] | None = None,
         runtime_ld_path: str = "",
+        experimental_rdna4_wmma: bool = False,
     ):
         self.gpu_devices = list(gpu_devices or [0])
         self.last_observed_nps: float | None = None
@@ -309,6 +319,7 @@ class MultiGPUSolver:
                     gpu_inputs=gpu_inputs,
                     gpu_device=device,
                     runtime_ld_path=runtime_ld_path,
+                    experimental_rdna4_wmma=experimental_rdna4_wmma,
                 )
             )
         if len(self.solvers) > 1:

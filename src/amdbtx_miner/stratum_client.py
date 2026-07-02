@@ -415,6 +415,8 @@ class StratumClient:
             "BTX_MATMUL_PIPELINE_ASYNC": self.cfg.get("solver_pipeline_async", 1),
             "BTX_MATMUL_SOLVER_THREADS": self.cfg.get("solver_threads", 8),
         }
+        if self.cfg.get("experimental_rdna4_wmma"):
+            env["BTX_MATMUL_EXPERIMENTAL_GFX12_WMMA"] = "1"
         import os as _os
         for k, v in _os.environ.items():
             if k.startswith("BTX_MATMUL_") and k not in env:

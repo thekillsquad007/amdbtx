@@ -104,6 +104,11 @@ def parse_args():
         help="Comma-separated GPU indices or 'all' for multi-GPU (e.g. 0,1). Overrides --gpu-device.",
     )
     p.add_argument("--benchmark", action="store_true", help="run benchmark to find optimal config")
+    p.add_argument(
+        "--experimental-rdna4",
+        action="store_true",
+        help="enable untested RDNA4 (gfx1200/gfx1201) WMMA fast path; requires solver built with gfx12",
+    )
     p.add_argument("--solo", action="store_true", help="solo mine against a btxd node (local or remote)")
     p.add_argument("--rpc-url", default=None, help="btxd JSON-RPC URL (solo mode), e.g. http://192.168.1.15:19334")
     p.add_argument("--rpc-user", default=None, help="btxd RPC username (solo mode, required for remote nodes)")
@@ -262,6 +267,7 @@ def _make_solver(cfg: dict, solver_path: Path, gpu_devices: list[int]) -> MultiG
         gpu_inputs=cfg.get("gpu_inputs", 0),
         gpu_devices=gpu_devices,
         runtime_ld_path=cfg.get("runtime_ld_path", ""),
+        experimental_rdna4_wmma=bool(cfg.get("experimental_rdna4_wmma")),
     )
 
 
@@ -834,12 +840,20 @@ def run_miner():
         cfg["rpc_password"] = args.rpc_password
     if args.rpc_cookie_file:
         cfg["rpc_cookie_file"] = args.rpc_cookie_file
+    if args.experimental_rdna4:
+        cfg["experimental_rdna4_wmma"] = True
 
     if args.benchmark:
         run_benchmark(cfg, config_path=str(args.config))
         return
 
     cfg = validate_config(cfg)
+
+    if cfg.get("experimental_rdna4_wmma"):
+        log.warning(
+            "experimental RDNA4 WMMA enabled — untested on gfx1200/gfx1201; "
+            "set experimental_rdna4_wmma: false in config if shares fail"
+        )
 
     if int(cfg.get("solver_batch_size", 128) or 128) > 16777216:
         log.warning(

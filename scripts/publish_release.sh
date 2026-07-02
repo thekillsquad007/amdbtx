@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="${RELEASE_TAG:-amdbtx-prebuilds-v1.1.9}"
 REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx-releases}"
-ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1100 gfx1101}"
+ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1100 gfx1101 gfx1200 gfx1201}"
 MINER_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('$ROOT/pyproject.toml','rb'))['project']['version'])")"
 WHEEL_NAME="amdbtx_miner-${MINER_VERSION}-py3-none-any.whl"
 
