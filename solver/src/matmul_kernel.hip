@@ -3089,8 +3089,6 @@ DeviceMatrixCache g_matrix_cache[16];
 struct DeviceLaunchPool {
     int device = -1;
     uint32_t* d_workspace = nullptr;
-    uint8_t* d_digests = nullptr;
-    uint8_t* d_found = nullptr;
     uint32_t* d_gate_count = nullptr;
     uint64_t* d_passed_nonces = nullptr;
     uint8_t* d_passed_sigma = nullptr;
@@ -3289,8 +3287,6 @@ bool EnsureBatchedPool(
 void FreeLaunchPool(DeviceLaunchPool& pool)
 {
     if (pool.d_workspace) hipFree(pool.d_workspace);
-    if (pool.d_digests) hipFree(pool.d_digests);
-    if (pool.d_found) hipFree(pool.d_found);
     if (pool.d_gate_count) hipFree(pool.d_gate_count);
     if (pool.d_passed_nonces) hipFree(pool.d_passed_nonces);
     if (pool.d_passed_sigma) hipFree(pool.d_passed_sigma);
@@ -3322,10 +3318,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         }
         pool.ws_bytes = ws_bytes;
     }
-    const size_t digest_bytes = batch * 32;
     if (pool.digest_cap < batch) {
-        if (pool.d_digests) hipFree(pool.d_digests);
-        if (pool.d_found) hipFree(pool.d_found);
         if (pool.d_gate_count) hipFree(pool.d_gate_count);
         if (pool.d_passed_nonces) hipFree(pool.d_passed_nonces);
         if (pool.d_passed_sigma) hipFree(pool.d_passed_sigma);
@@ -3333,8 +3326,6 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         if (pool.d_passed_seed_b) hipFree(pool.d_passed_seed_b);
         if (pool.d_seed_midstate) hipFree(pool.d_seed_midstate);
         if (pool.d_header_midstate) hipFree(pool.d_header_midstate);
-        pool.d_digests = nullptr;
-        pool.d_found = nullptr;
         pool.d_gate_count = nullptr;
         pool.d_passed_nonces = nullptr;
         pool.d_passed_sigma = nullptr;
@@ -3342,9 +3333,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         pool.d_passed_seed_b = nullptr;
         pool.d_seed_midstate = nullptr;
         pool.d_header_midstate = nullptr;
-        if (hipMalloc(&pool.d_digests, digest_bytes) != hipSuccess ||
-            hipMalloc(&pool.d_found, batch) != hipSuccess ||
-            hipMalloc(&pool.d_gate_count, sizeof(uint32_t)) != hipSuccess ||
+        if (hipMalloc(&pool.d_gate_count, sizeof(uint32_t)) != hipSuccess ||
             hipMalloc(&pool.d_passed_nonces, batch * sizeof(uint64_t)) != hipSuccess ||
             hipMalloc(&pool.d_passed_sigma, batch * 32) != hipSuccess ||
             hipMalloc(&pool.d_passed_seed_a, batch * 32) != hipSuccess ||
@@ -3356,8 +3345,7 @@ bool EnsureLaunchPool(int device, size_t batch, size_t ws_bytes)
         }
         pool.digest_cap = batch;
     }
-    return pool.d_workspace && pool.d_digests && pool.d_found &&
-           pool.d_gate_count && pool.d_passed_nonces &&
+    return pool.d_workspace && pool.d_gate_count && pool.d_passed_nonces &&
            pool.d_passed_sigma && pool.d_passed_seed_a &&
            pool.d_passed_seed_b && pool.d_seed_midstate &&
            pool.d_header_midstate;

@@ -111,11 +111,12 @@ payout_address: "btx1z..."
 worker_name: "7800XT-ALPHA-1"
 gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve-hip"
 solver_backend: "rocm"     # "rocm" or "cpu"
-solver_threads: 8
+solver_threads: 16
 solver_prepare_workers: 16
-solver_batch_size: 81920
+solver_batch_size: 4194304  # RX 7800 XT sweet spot is around 2M-4M; run --benchmark per GPU
 solver_prefetch_depth: 8
 solver_pipeline_async: 1
+benchmark_batch_sizes: [131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216]
 pool_max_shares_per_slice: 0  # 0 = submit every valid share returned by solver
 gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU
 # gpu_devices: "all"     # multi-GPU: "all", "0,1", or [0, 1] — hashrate stacks

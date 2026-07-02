@@ -114,16 +114,17 @@ def parse_args():
 
 
 def _benchmark_job() -> dict:
-    """Representative mainnet job (height >= 125000 uses the V2 HIP path)."""
+    """Representative post-v3 mainnet job for the HIP fast path."""
     return {
         "version": 536870912,
         "prev_hash": "51619e6d8d37ab84bf7b9b8a6a8100d6fc1b92d2a6473b2bf153681a416215a1",
         "merkle_root": "f58785dbeb5a7033daa54958364388273cbf363cb50e3bcb0d2879e18e8bfeff",
         "time": int(time.time()),
-        "bits": "1d1ccc7b",
+        "bits": "1c4916ad",
         "seed_a": "43b5b748c3ad0928e56256e7c687c4907745220ba7053bc56905942c9a0fa1b2",
         "seed_b": "1190c8ed806ea11336f3ad6a20adb9da0beb7b05772afab86c38c67c919ae645",
-        "block_height": 130000,
+        "block_height": 147000,
+        "parent_mtp": 1782910000,
         "matmul_n": 512,
         "matmul_b": 16,
         "matmul_r": 8,
@@ -134,6 +135,19 @@ def _benchmark_job() -> dict:
 
 def run_benchmark(cfg: dict, config_path: str = ""):
     import yaml
+
+    def _parse_batch_sizes(value):
+        if value is None:
+            return [
+                131072, 262144, 524288, 1048576,
+                2097152, 4194304, 8388608, 16777216,
+            ]
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",")]
+        else:
+            parts = list(value)
+        sizes = sorted({int(p) for p in parts if str(p).strip()})
+        return [s for s in sizes if s > 0]
 
     solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
     if not solver_path.exists():
@@ -146,17 +160,19 @@ def run_benchmark(cfg: dict, config_path: str = ""):
     bench_threads = cfg.get("solver_threads", 8)
     bench_seconds = float(cfg.get("benchmark_seconds", 8.0))
     bench_tries = int(cfg.get("benchmark_tries_per_slice", 2_000_000))
+    batch_opts = _parse_batch_sizes(cfg.get("benchmark_batch_sizes"))
+    sweep_threads = bool(cfg.get("benchmark_sweep_threads", False))
 
     print("[BENCH] Starting benchmark to find optimal batch size...")
     print(f"[BENCH] workers={bench_workers} threads={bench_threads} "
           f"slice={bench_tries} nonces / {bench_seconds:.0f}s per test\n")
 
     configs = []
-    thread_opts = sorted({bench_threads, 8, 12, 16, 20, 24})
-    worker_opts = sorted({bench_workers, 8, 12, 16, 20, 24})
+    thread_opts = sorted({bench_threads, 8, 12, 16, 20, 24}) if sweep_threads else [bench_threads]
+    worker_opts = sorted({bench_workers, 8, 12, 16, 20, 24}) if sweep_threads else [bench_workers]
     for workers in worker_opts:
         for threads in thread_opts:
-            for batch in (128, 256, 512, 1024, 2048, 4096):
+            for batch in batch_opts:
                 configs.append({
                     "solver_prepare_workers": workers,
                     "solver_threads": threads,
@@ -170,6 +186,7 @@ def run_benchmark(cfg: dict, config_path: str = ""):
 
     for params in configs:
         print(f"[BENCH] testing batch={params['solver_batch_size']}...", end=" ", flush=True)
+        tries_for_batch = max(bench_tries, int(params["solver_batch_size"]))
 
         wrapper = GBTSolveWrapper(
             str(solver_path), backend, params["solver_threads"],
@@ -180,7 +197,7 @@ def run_benchmark(cfg: dict, config_path: str = ""):
 
         hip_ok = True
         for _ in range(2):
-            warmup = wrapper.solve(bench_job, max_tries=bench_tries, max_seconds=bench_seconds)
+            warmup = wrapper.solve(bench_job, max_tries=tries_for_batch, max_seconds=bench_seconds)
             if warmup.get("backend") == "cpu":
                 hip_ok = False
                 break
@@ -189,7 +206,7 @@ def run_benchmark(cfg: dict, config_path: str = ""):
             start = time.time()
             nonces = 0
             while time.time() - start < bench_seconds:
-                result = wrapper.solve(bench_job, max_tries=bench_tries, max_seconds=bench_seconds)
+                result = wrapper.solve(bench_job, max_tries=tries_for_batch, max_seconds=bench_seconds)
                 if result.get("backend") == "cpu":
                     hip_ok = False
                     break
@@ -824,7 +841,7 @@ def run_miner():
 
     cfg = validate_config(cfg)
 
-    if int(cfg.get("solver_batch_size", 128) or 128) > 65536:
+    if int(cfg.get("solver_batch_size", 128) or 128) > 16777216:
         log.warning(
             "solver_batch_size=%s is very large; run --benchmark to confirm VRAM headroom",
             cfg["solver_batch_size"],
