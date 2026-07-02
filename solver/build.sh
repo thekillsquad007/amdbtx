@@ -13,11 +13,15 @@ source "${SCRIPT_DIR}/hip_toolchain.sh"
 
 if ! resolve_hip_toolchain; then
     echo "Error: working HIP compiler not found."
-    echo "Install ROCm HIP dev tools (hip-dev / rocm-dev) so /opt/rocm/bin/hipcc works."
-    echo "Ubuntu /usr/bin/hipcc often points at a missing /opt/rocm/llvm/clang."
+    echo "Install ROCm HIP dev tools (hip-dev / rocm-dev) so hipcc matches your HIP headers."
+    echo "On Ubuntu/Bazzite, mixing /opt/rocm clang++ with /usr/include/hip breaks compilation."
+    echo "Fix: install hip-dev, ensure /opt/rocm/bin/hipcc works, then rerun the installer."
     exit 1
 fi
 echo "Using HIP compiler: $HIPCC"
+if [[ -n "${HIP_TOOLCHAIN_NOTE:-}" ]]; then
+    echo "Toolchain: ${HIP_TOOLCHAIN_NOTE}"
+fi
 if [[ -n "$ROCM_ROOT" ]]; then
     echo "ROCm root: $ROCM_ROOT"
 fi
@@ -28,6 +32,8 @@ if [[ -z "$ROCM_INCLUDE" || -z "$ROCM_LIB" ]]; then
 fi
 echo "ROCm include: $ROCM_INCLUDE"
 echo "ROCm lib: $ROCM_LIB"
+
+_export_hip_compile_env
 
 # --- Determine GPU architecture (discrete GPUs only; skip iGPU gfx90c) ---
 IGPU_ARCH_RE='^gfx90c$'
@@ -90,21 +96,33 @@ SOURCES=(
     "$SRC_DIR/matmul_kernel.hip"
 )
 
+COMMON_FLAGS=(
+    -O3
+    -std=c++17
+    -mllvm -amdgpu-early-inline-all=true
+    -D__HIP_PLATFORM_AMD__
+    -I"$ROCM_INCLUDE"
+    -I"$SRC_DIR"
+    -L"$ROCM_LIB"
+    -lamdhip64
+    -lpthread
+    -Wl,-rpath,"$ROCM_LIB"
+)
+
 echo "Building btx-gbt-solve-hip..."
-"$HIPCC" \
-    -x hip \
-    -O3 \
-    -std=c++17 \
-    -mllvm -amdgpu-early-inline-all=true \
-    $ARCH_FLAGS \
-    -D__HIP_PLATFORM_AMD__ \
-    -I"$ROCM_INCLUDE" \
-    -I"$SRC_DIR" \
-    "${SOURCES[@]}" \
-    -L"$ROCM_LIB" \
-    -lamdhip64 \
-    -lpthread \
-    -Wl,-rpath,"$ROCM_LIB" \
-    -o "${BUILD_DIR}/btx-gbt-solve-hip"
+if _compiler_is_raw_clang "$HIPCC"; then
+    "$HIPCC" \
+        -x hip \
+        "${COMMON_FLAGS[@]}" \
+        $ARCH_FLAGS \
+        "${SOURCES[@]}" \
+        -o "${BUILD_DIR}/btx-gbt-solve-hip"
+else
+    "$HIPCC" \
+        "${COMMON_FLAGS[@]}" \
+        $ARCH_FLAGS \
+        "${SOURCES[@]}" \
+        -o "${BUILD_DIR}/btx-gbt-solve-hip"
+fi
 
 echo "Build successful: ${BUILD_DIR}/btx-gbt-solve-hip"

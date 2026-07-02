@@ -211,6 +211,20 @@ install_rocm_apt_repo() {
     fi
 }
 
+repair_rocm_apt_repo_if_present() {
+    # Bazzite/Ubuntu images often ship a stale rocm.list without the AMDGPU GPG key.
+    local list="/etc/apt/sources.list.d/rocm.list"
+    [[ -f "$list" ]] || return 0
+    local repo_ver codename
+    repo_ver="$(grep -oE 'rocm/apt/[0-9.]+' "$list" 2>/dev/null | head -1 | sed 's#rocm/apt/##')"
+    codename="$(grep -oE '(noble|jammy|oracular|plucky)' "$list" 2>/dev/null | head -1 || true)"
+    [[ -n "$repo_ver" ]] || repo_ver="$(rocm_repo_for_codename "${UBUNTU_CODENAME:-noble}" "${OS_VERSION_ID:-}")"
+    [[ -n "$codename" ]] || codename="${UBUNTU_CODENAME:-noble}"
+    [[ -n "$repo_ver" && -n "$codename" ]] || return 0
+    log "repairing ROCm apt keyring (${repo_ver} ${codename})..."
+    install_rocm_apt_repo "$repo_ver" "$codename"
+}
+
 setup_rocm_environment() {
     local bindir libdir seen_path="" seen_lib=""
     # Prefer /opt/rocm hipcc over /usr/bin wrappers that point at missing clang paths.
@@ -316,7 +330,12 @@ ensure_hip_dev_for_compile() {
     setup_rocm_environment
     if hip_toolchain_ready; then
         log "HIP compiler ready: ${HIPCC}"
+        [[ -n "${HIP_TOOLCHAIN_NOTE:-}" ]] && log "HIP toolchain: ${HIP_TOOLCHAIN_NOTE}"
         return 0
+    fi
+    if [[ -d /usr/include/hip && -d /opt/rocm/include/hip ]]; then
+        warn "mixed ROCm toolchain: do not use /opt/rocm clang++ with /usr/include/hip"
+        warn "install hip-dev (provides /opt/rocm/bin/hipcc) or use system hip-dev + /usr/bin/hipcc"
     fi
     return 1
 }
@@ -433,6 +452,7 @@ if [[ "$IS_HIVEOS" -eq 1 ]]; then
 fi
 
 if have_apt; then
+    repair_rocm_apt_repo_if_present
     log "installing base system dependencies..."
     apt_install \
         ca-certificates curl wget gnupg2 lsb-release coreutils findutils grep gawk sed \
@@ -742,9 +762,21 @@ else
         else
             warn "solver compilation failed (see log below)"
             cat "$BUILD_LOG" >&2
+            if grep -q '__AMDGCN_WAVEFRONT_SIZE' "$BUILD_LOG" 2>/dev/null; then
+                warn "HIP header/compiler mismatch detected (common on Bazzite/Ubuntu noble)"
+                warn "retrying after ROCm hip-dev install..."
+                if ensure_hip_dev_for_compile "$SOLVER_SRC_DIR" && bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
+                    log "solver compilation successful (after hip-dev repair)"
+                    install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
+                    SOLVER_BUILT_FROM_SOURCE=1
+                    COMPILE_OK=1
+                else
+                    cat "$BUILD_LOG" >&2
+                fi
+            fi
         fi
     else
-        warn "HIP compiler unavailable (broken /usr/bin/hipcc or missing /opt/rocm/llvm)"
+        warn "HIP compiler unavailable (broken /usr/bin/hipcc or missing /opt/rocm/bin/hipcc)"
     fi
 
     if [[ "$COMPILE_OK" -eq 0 ]]; then
