@@ -148,8 +148,36 @@ def test_single_gpu_solver_derives_observed_nps_when_child_metric_missing():
     assert solver.last_observed_nps == 500.0
 
 
+def test_submit_response_rejects_luckypool_nonce_size_error():
+    client = StratumClient.__new__(StratumClient)
+    client._protocol = "luckypool"
+    client._submit_worker = "address.worker"
+    client._pending_submits = {
+        3: {
+            "job_id": "64a",
+            "nonce_hex": "006a20a2db",
+            "is_block": False,
+            "difficulty": 0.0002,
+        }
+    }
+    client._accepted_share_events = deque()
+    client.shares_accepted = 1
+    client.shares_rejected = 0
+    client.blocks_found = 0
+
+    client._complete_pending_submit(
+        3,
+        {"id": 3, "result": False, "error": {"code": 20, "message": "incorrect size of nonce64"}},
+    )
+
+    assert client.shares_accepted == 1
+    assert client.shares_rejected == 1
+
+
 def test_share_accept_records_submit_difficulty_for_pool_credit():
     client = StratumClient.__new__(StratumClient)
+    client._protocol = "stratum"
+    client._submit_worker = "address.worker"
     client._difficulty = 1.0
     client._pending_submits = {
         7: {
@@ -214,7 +242,7 @@ def test_luckypool_job_parser_maps_nonce_prefix_and_v3_fields():
     assert job.target == "00" + "ff" * 31
 
 
-def test_luckypool_submit_uses_login_protocol_payload_with_nonce_suffix():
+def test_luckypool_submit_uses_decimal_nonce64_and_job_ntime():
     sent = []
     client = StratumClient.__new__(StratumClient)
     client._protocol = "luckypool"
@@ -247,11 +275,12 @@ def test_luckypool_submit_uses_login_protocol_payload_with_nonce_suffix():
 
     assert sent == [{
         "id": 1,
+        "jsonrpc": "2.0",
         "method": "submit",
         "params": {
             "jobId": "504",
-            "nonce": "0074026c11",
-            "result": "ab" * 32,
+            "nTime": 1782967143,
+            "nonce64": str(0x8d67420074026c11),
         },
     }]
 
@@ -304,7 +333,11 @@ def test_luckypool_same_height_rotation_preserves_nonce_suffix_width():
         },
     )
 
-    assert sent[0]["params"]["nonce"] == "03235b9f46"
+    assert sent[0]["params"] == {
+        "jobId": "555",
+        "nTime": 1782972566,
+        "nonce64": str(0x7069e703235b9f46),
+    }
 
 
 def test_luckypool_sparse_job_keeps_or_infers_nonce_suffix_width():
@@ -356,10 +389,14 @@ def test_luckypool_sparse_job_keeps_or_infers_nonce_suffix_width():
         },
     )
 
-    assert sent[0]["params"]["nonce"] == "0093a6bdf4"
+    assert sent[0]["params"] == {
+        "jobId": "56c",
+        "nTime": 1782974198,
+        "nonce64": str(0x1a35890093a6bdf4),
+    }
 
 
-def test_luckypool_submit_infers_suffix_width_from_aligned_nonce_start():
+def test_luckypool_submit_emits_decimal_nonce64_even_without_nonce_bits():
     sent = []
     client = StratumClient.__new__(StratumClient)
     client._protocol = "luckypool"
@@ -391,7 +428,46 @@ def test_luckypool_submit_infers_suffix_width_from_aligned_nonce_start():
         },
     )
 
-    assert sent[0]["params"]["nonce"] == "0093a6bdf4"
+    assert sent[0]["params"] == {
+        "jobId": "56c",
+        "nTime": 1782974198,
+        "nonce64": str(0x1a35890093a6bdf4),
+    }
+
+
+def test_luckypool_sparse_job_preserves_parent_mtp():
+    client = StratumClient.__new__(StratumClient)
+    client._protocol = "luckypool"
+    client._current_job = Job.from_luckypool({
+        "jobId": "56b",
+        "height": 147744,
+        "nVersion": 536870912,
+        "prevHash": "11" * 32,
+        "merkleRoot": "22" * 32,
+        "nTime": 1782974168,
+        "nBits": "1c4c2e02",
+        "noncePrefix": "1717641",
+        "nonceBits": 40,
+        "shareTarget": "00001387ec780000",
+        "parentMtp": 1782974000,
+    })
+
+    client._handle_server_message({
+        "method": "job",
+        "params": {
+            "jobId": "56c",
+            "height": 147744,
+            "nVersion": 536870912,
+            "prevHash": "11" * 32,
+            "merkleRoot": "33" * 32,
+            "nTime": 1782974198,
+            "nBits": "1c4c2e02",
+            "shareTarget": "00001387ec780000",
+        },
+    })
+
+    assert client._current_job.parent_mtp == 1782974000
+    assert client._current_job.luckypool_nonce_bits == 40
 
 
 def test_job_copy_preserves_luckypool_nonce_suffix_width():

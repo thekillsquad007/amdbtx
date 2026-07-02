@@ -25,11 +25,11 @@ fi
 
 # ─── Configurables ──────────────────────────────────────────────────────────
 RELEASE_REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx-releases}"
-PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.1.7}"
+PREBUILDS_TAG="${PREBUILDS_TAG:-amdbtx-prebuilds-v1.1.8}"
 PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${RELEASE_REPO}/releases/download/${PREBUILDS_TAG}}"
-WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.7-py3-none-any.whl}"
-EXPECTED_MINER_VERSION="1.1.7"
-EXPECTED_WHEEL_SHA256="41d01a5a18d13dfa9d80ec23367e2571de5d42e1db87a7c9ae4089498b42bdc6"
+WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.8-py3-none-any.whl}"
+EXPECTED_MINER_VERSION="1.1.8"
+EXPECTED_WHEEL_SHA256="67bb9b9cfb3cdeb07e604795aa5f52baf57699c8ad285d65d87bbb0aac96aee4"
 EXPECTED_SOLVER_VERSION="2.1.0"
 EXPECTED_SOLVER_SHA256="a9909e1906862d3aef0848cfb126cc5c490ebb3db5c9e962783ec2bea198dcb8"
 DEFAULT_POOL="${DEXBTX_POOL:-stratum.bitminerpool.xyz:3333}"

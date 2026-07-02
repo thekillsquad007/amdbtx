@@ -308,9 +308,46 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> b
                 solve_job.job_id, key[2],
             )
             return False
-        _submitted_share_keys.add(key)
+    share_ntime = int(result.get("ntime") or solve_job.time)
+    if (
+        not solo
+        and getattr(client, "_protocol", "stratum") == "luckypool"
+        and share_ntime != int(solve_job.time)
+    ):
+        log.warning(
+            "luckypool: skip submit — share ntime=%d differs from job ntime=%d; "
+            "pool recomputes digest from the job header",
+            share_ntime, solve_job.time,
+        )
+        return False
+    if not solo and getattr(client, "_protocol", "stratum") == "luckypool":
+        nonce_bits = int(getattr(solve_job, "luckypool_nonce_bits", 0) or 0)
+        if nonce_bits > 0:
+            nonce = int(result["nonce64"])
+            lane_mask = ~((1 << nonce_bits) - 1) & ((1 << 64) - 1)
+            if (nonce & lane_mask) != (int(solve_job.nonce64_start) & lane_mask):
+                log.warning(
+                    "luckypool: skip submit — nonce64=%d outside assigned lane start=%d bits=%d",
+                    nonce, solve_job.nonce64_start, nonce_bits,
+                )
+                return False
+    if not solo:
+        _submitted_share_keys.add(_share_submit_key(solve_job, result))
     if not solo and client._current_job is not None:
         if client._current_job.job_id != solve_job.job_id:
+            if (
+                getattr(client, "_protocol", "stratum") == "luckypool"
+                and (
+                    client._current_job.block_height != solve_job.block_height
+                    or client._current_job.prev_hash != solve_job.prev_hash
+                )
+            ):
+                log.info(
+                    "luckypool: drop stale share job=%s current=%s height=%d/%d",
+                    solve_job.job_id, client._current_job.job_id,
+                    solve_job.block_height, client._current_job.block_height,
+                )
+                return False
             log.info(
                 "submitting found share for rotated job_id %s (current=%s); "
                 "pool JobCache handles same-parent staleness",
@@ -323,7 +360,10 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> b
         result.get("is_block"), solve_job.job_id,
         result.get("ntime", solve_job.time),
     )
-    client.submit_share(solve_job, result, wait=not solo or bool(result.get("is_block")))
+    wait_submit = bool(result.get("is_block")) if solo else (
+        getattr(client, "_protocol", "stratum") == "luckypool"
+    )
+    client.submit_share(solve_job, result, wait=wait_submit)
     return True
 
 
@@ -623,6 +663,16 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if client._current_job is not None:
                 new_job = client._current_job
                 client._current_job = None
+                if getattr(client, "_protocol", "stratum") == "luckypool":
+                    if new_job.job_id != current_job.job_id:
+                        log.info(
+                            "luckypool job replaced: %s -> %s (clean=%s height=%d)",
+                            current_job.job_id, new_job.job_id,
+                            new_job.clean_jobs, new_job.block_height,
+                        )
+                    _submitted_share_keys.clear()
+                    current_job = new_job
+                    continue
                 if new_job.block_height != current_job.block_height:
                     log.info(
                         "job replaced: %s -> %s (clean=%s height=%d)",
@@ -648,6 +698,16 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             if client._current_job is not None:
                 new_job = client._current_job
                 client._current_job = None
+                if getattr(client, "_protocol", "stratum") == "luckypool":
+                    if new_job.job_id != current_job.job_id:
+                        log.info(
+                            "luckypool job updated: %s -> %s (clean=%s height=%d)",
+                            current_job.job_id, new_job.job_id,
+                            new_job.clean_jobs, new_job.block_height,
+                        )
+                    _submitted_share_keys.clear()
+                    current_job = new_job
+                    continue
                 if new_job.block_height != current_job.block_height:
                     log.info(
                         "new job: %s (clean=%s height=%d)",
@@ -700,6 +760,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                     )
                     if hasattr(client, "start_metrics_reporter"):
                         client.start_metrics_reporter(solver)
+                _submitted_share_keys.clear()
                 current_job = None
             except Exception as e2:
                 log.error("Reconnect failed: %s", e2)

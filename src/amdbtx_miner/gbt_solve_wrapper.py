@@ -230,6 +230,24 @@ class GBTSolveWrapper:
                         tries = int(result.get("tries_used", 0) or 0)
                         if elapsed > 0 and tries > 0:
                             self.last_observed_nps = tries / elapsed
+                        solutions = result.get("solutions")
+                        if isinstance(solutions, list) and solutions:
+                            normalized = []
+                            for item in solutions:
+                                if not isinstance(item, dict):
+                                    continue
+                                entry = dict(item)
+                                if entry.get("nonce64") is None and entry.get("nonce") is not None:
+                                    nonce_val = entry["nonce"]
+                                    entry["nonce64"] = (
+                                        int(nonce_val, 16)
+                                        if isinstance(nonce_val, str)
+                                        and not nonce_val.lstrip("-").isdigit()
+                                        else int(nonce_val)
+                                    )
+                                normalized.append(entry)
+                            if normalized:
+                                result["solutions"] = normalized
                         return result
                 except json.JSONDecodeError:
                     continue
