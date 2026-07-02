@@ -190,8 +190,117 @@ confirm() {
 log "AMDBTX miner installer — AMD GPU edition"
 
 # HSA_ENABLE_DXG_DETECTION is required for AMD GPU detection in WSL2.
-# Setting it early ensures rocminfo/rocm-smi can see the GPU later.
 export HSA_ENABLE_DXG_DETECTION=1
+
+# Integrated GPU ISAs we never compile for (constant-memory issues / wrong target).
+IGPU_ARCHS_RE='^(gfx90c)$'
+
+setup_rocm_environment() {
+    local bindir libdir seen_path="" seen_lib=""
+    for bindir in /opt/rocm/bin /opt/rocm-*/bin /usr/bin /usr/local/bin; do
+        [[ -d "$bindir" ]] || continue
+        if [[ -x "$bindir/rocminfo" || -x "$bindir/rocm-smi" || -x "$bindir/hipcc" ]]; then
+            case ":$seen_path:" in
+                *":$bindir:"*) ;;
+                *) seen_path="${seen_path:+$seen_path:}$bindir" ;;
+            esac
+        fi
+    done
+    if [[ -n "$seen_path" ]]; then
+        export PATH="$seen_path:${PATH:-}"
+    fi
+    if [[ -d /opt/rocm ]]; then
+        export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+    fi
+    for libdir in /opt/rocm/lib /opt/rocm-*/lib /usr/lib /usr/lib/x86_64-linux-gnu; do
+        [[ -d "$libdir" ]] || continue
+        if [[ -f "$libdir/libamdhip64.so" || -f "$libdir/libamdhip64.so.6" || \
+              -f "$libdir/libamdhip64.so.7" ]]; then
+            case ":$seen_lib:" in
+                *":$libdir:"*) ;;
+                *) seen_lib="${seen_lib:+$seen_lib:}$libdir" ;;
+            esac
+        fi
+    done
+    if [[ -n "$seen_lib" ]]; then
+        export LD_LIBRARY_PATH="$seen_lib:${LD_LIBRARY_PATH:-}"
+    fi
+}
+
+log_rocm_tools() {
+    local tool path
+    for tool in rocminfo rocm-smi hipcc; do
+        path="$(command -v "$tool" 2>/dev/null || true)"
+        if [[ -n "$path" ]]; then
+            log "ROCm: ${tool} → ${path}"
+        fi
+    done
+}
+
+is_igpu_arch() {
+    [[ "$1" =~ $IGPU_ARCHS_RE ]]
+}
+
+pick_discrete_gpu_from_rocminfo() {
+    command -v rocminfo >/dev/null 2>&1 || return 1
+    local out line
+    out="$(rocminfo 2>/dev/null)" || return 1
+    [[ -n "$out" ]] || return 1
+    line="$(echo "$out" | awk '
+        function flush() {
+            if (dev == "GPU" && arch != "" && arch != "gfx90c") {
+                if (best_arch == "" || mem + 0 > best_mem + 0) {
+                    best_name = name
+                    best_arch = arch
+                    best_mem = mem + 0
+                }
+            }
+        }
+        /^(\*\*\*)?[[:space:]]*Agent[[:space:]]+[0-9]+/ { flush(); dev = ""; arch = ""; name = ""; mem = 0 }
+        /Device Type:.*GPU/ { dev = "GPU" }
+        /Marketing Name:/ {
+            sub(/^.*Marketing Name:[[:space:]]*/, "", $0)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+            name = $0
+        }
+        /Name:[[:space:]]*gfx/ { match($0, /gfx[0-9a-f]+/); arch = substr($0, RSTART, RLENGTH) }
+        /Size:[[:space:]]*[0-9]/ && dev == "GPU" { match($0, /[0-9]+/); mem = substr($0, RSTART, RLENGTH) + 0 }
+        END {
+            flush()
+            if (best_arch != "") {
+                printf "%s\t%s\t%s\n", best_name, best_arch, best_mem
+            }
+        }
+    ')" || true
+    [[ -n "$line" ]] || return 1
+    IFS=$'\t' read -r GPU_NAME GPU_ARCH _ <<< "$line"
+    return 0
+}
+
+pick_discrete_gpu_from_rocm_smi() {
+    command -v rocm-smi >/dev/null 2>&1 || return 1
+    local line idx name arch best_name="" best_arch="" best_idx=""
+    while IFS= read -r line; do
+        [[ "$line" =~ GPU\[([0-9]+)\][[:space:]]*:(.*) ]] || continue
+        idx="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]}"
+        name="${name#"${name%%[![:space:]]*}"}"
+        arch="$(rocm-smi -i "$idx" --showid 2>/dev/null | grep -oE 'gfx[0-9a-f]{3,}' | head -1 || true)"
+        [[ -n "$arch" ]] || continue
+        is_igpu_arch "$arch" && continue
+        best_name="$name"
+        best_arch="$arch"
+        best_idx="$idx"
+        break
+    done < <(rocm-smi --showproductname 2>/dev/null || true)
+    [[ -n "$best_arch" ]] || return 1
+    GPU_NAME="${best_name:-AMD-$best_arch}"
+    GPU_ARCH="$best_arch"
+    return 0
+}
+
+setup_rocm_environment
+log_rocm_tools
 
 OS="$(uname -s)"
 if [[ "$OS" != "Linux" ]]; then
@@ -240,50 +349,30 @@ else
     warn "apt-get not found; installer can still run, but you must provide Python 3.10+, curl, and ROCm runtime libraries"
 fi
 
-# Detect AMD GPU (first pass: rocm-smi/rocminfo if ROCm is already installed)
+# Detect discrete AMD GPU (skip iGPU targets such as gfx90c).
 HAS_AMD=0
 GPU_NAME=""
 GPU_ARCH=""
 detect_amd_gpu() {
-    local has=0 name="" arch=""
-    if command -v rocm-smi >/dev/null 2>&1; then
-        name="$(rocm-smi --showproductname 2>/dev/null | head -1 || true)"
-        if [[ -n "$name" && "$name" != *"None"* ]]; then
-            has=1
-            arch="$(rocm-smi --showid 2>/dev/null | head -1 | grep -oP 'gfx[0-9a-f]{3,}' || true)"
-        fi
-    fi
-    if [[ "$has" -eq 0 ]] && command -v rocminfo >/dev/null 2>&1; then
-        local out
-        out=$(rocminfo 2>/dev/null) || true
-        if [[ -n "$out" ]]; then
-            name=$(echo "$out" | awk '
-                /Agent [0-9]/ { mktname=""; devtype=""; }
-                /Marketing Name:/ { sub(/^.*Marketing Name: */, ""); mktname=$0; sub(/ *$/, "", mktname); }
-                /Device Type.*GPU/ { devtype="GPU"; }
-                devtype=="GPU" && mktname!="" { print mktname; devtype=""; exit; }
-            ' || true)
-            arch=$(echo "$out" | awk '
-                /Agent [0-9]/ { devtype=""; arch=""; }
-                /Device Type.*GPU/ { devtype="GPU"; }
-                /gfx[0-9a-f]{3,}/ && devtype=="GPU" && arch=="" { match($0, /gfx[0-9a-f]{3,}/); arch=substr($0, RSTART, RLENGTH); }
-                END { print arch; }
-            ' || true)
-            if [[ -n "$arch" ]]; then
-                has=1
-                [[ -z "$name" || "$name" == *"None"* ]] && name="AMD-$arch"
-            fi
-        fi
-    fi
-    if [[ "$has" -eq 1 ]]; then
+    local skipped_igpu=""
+    if pick_discrete_gpu_from_rocminfo; then
         HAS_AMD=1
-        GPU_NAME="$name"
-        GPU_ARCH="$arch"
-        if [[ -n "$GPU_ARCH" ]]; then
-            log "detected AMD GPU: ${GPU_NAME} (arch: ${GPU_ARCH})"
-        else
-            log "detected AMD GPU: ${GPU_NAME}"
-        fi
+        log "detected discrete AMD GPU: ${GPU_NAME} (arch: ${GPU_ARCH})"
+        return 0
+    fi
+    if pick_discrete_gpu_from_rocm_smi; then
+        HAS_AMD=1
+        log "detected discrete AMD GPU via rocm-smi: ${GPU_NAME} (arch: ${GPU_ARCH})"
+        return 0
+    fi
+    if command -v rocminfo >/dev/null 2>&1; then
+        skipped_igpu="$(rocminfo 2>/dev/null | awk '
+            /Device Type:.*GPU/ { dev="GPU" }
+            /Name:[[:space:]]*gfx/ && dev=="GPU" { match($0, /gfx[0-9a-f]+/); print substr($0, RSTART, RLENGTH) }
+        ' | grep -E '^gfx90c$' | head -1 || true)"
+    fi
+    if [[ -n "$skipped_igpu" ]]; then
+        warn "skipped iGPU arch ${skipped_igpu}; no discrete AMD GPU found in ROCm agent list"
     fi
 }
 detect_amd_gpu
@@ -411,6 +500,8 @@ else
             warn "Add to your shell: export PATH=/opt/rocm/bin:\$PATH"
         fi
 
+        setup_rocm_environment
+        log_rocm_tools
         # Re-detect GPU now that ROCm is installed
         detect_amd_gpu
         if [[ "$HAS_AMD" -eq 0 ]]; then
@@ -533,6 +624,7 @@ else
     SOLVER_SRC_DIR="$REPO_SRC_DIR/solver"
     [[ -f "$SOLVER_SRC_DIR/build.sh" ]] || err "solver sources missing at ${SOLVER_SRC_DIR}/build.sh"
 
+    setup_rocm_environment
     ensure_hip_compiler
 
     # Align HIP dev packages with the runtime ROCm version when possible.
@@ -555,11 +647,14 @@ else
     if [[ "$COMPILE_ALL_ARCHS" -eq 1 ]]; then
         log "compiling solver for all common AMD GPU architectures..."
         export AMDBTX_HIP_ARCHS="$ALL_HIP_ARCHS"
-    elif [[ -n "$GPU_ARCH" ]]; then
-        log "compiling solver for detected GPU arch ${GPU_ARCH}..."
+    elif [[ -n "$GPU_ARCH" ]] && ! is_igpu_arch "$GPU_ARCH"; then
+        log "compiling solver for discrete GPU arch ${GPU_ARCH}..."
         export AMDBTX_HIP_ARCHS="$GPU_ARCH"
     else
-        log "compiling solver (auto-detect arch, fallback to common AMD targets)..."
+        if [[ -n "$GPU_ARCH" ]] && is_igpu_arch "$GPU_ARCH"; then
+            warn "refusing to compile for iGPU arch ${GPU_ARCH}"
+        fi
+        log "compiling solver (auto-detect discrete GPU arch)..."
         unset AMDBTX_HIP_ARCHS || true
     fi
     if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then

@@ -73,27 +73,44 @@ fi
 echo "ROCm include: $ROCM_INCLUDE"
 echo "ROCm lib: $ROCM_LIB"
 
-# --- Determine GPU architecture ---
+# --- Determine GPU architecture (discrete GPUs only; skip iGPU gfx90c) ---
+IGPU_ARCH_RE='^gfx90c$'
+
+pick_discrete_archs_from_rocminfo() {
+    rocminfo 2>/dev/null | awk '
+        function flush() {
+            if (dev == "GPU" && arch != "" && arch != "gfx90c") {
+                gpus[arch] = 1
+            }
+        }
+        /^(\*\*\*)?[[:space:]]*Agent[[:space:]]+[0-9]+/ { flush(); dev = ""; arch = "" }
+        /Device Type:.*GPU/ { dev = "GPU" }
+        /Name:[[:space:]]*gfx/ { match($0, /gfx[0-9a-f]+/); arch = substr($0, RSTART, RLENGTH) }
+        END { flush(); for (a in gpus) print a }
+    ' | sort -u | tr '\n' ' '
+}
+
 ARCHS="${AMDBTX_HIP_ARCHS:-}"
 if [[ -n "$ARCHS" ]]; then
     echo "Using requested GPU architectures: $ARCHS"
-elif command -v rocminfo >/dev/null 2>&1; then
-    ARCHS=$(rocminfo 2>/dev/null | awk 'match($0,/gfx[0-9a-f]{3,}/){arch=substr($0,RSTART,RLENGTH); if(arch!="") gpus[arch]=1} END{for(a in gpus) print a}' | sort -u || true)
+fi
+if [[ -z "$ARCHS" ]] && command -v rocminfo >/dev/null 2>&1; then
+    ARCHS="$(pick_discrete_archs_from_rocminfo)"
 fi
 if [[ -z "$ARCHS" ]] && command -v rocm-smi >/dev/null 2>&1; then
-    ARCHS=$(rocm-smi --showid 2>/dev/null | grep -oP 'gfx[0-9a-f]{3,}' | sort -u)
+    ARCHS=$(rocm-smi --showid 2>/dev/null | grep -oP 'gfx[0-9a-f]{3,}' | grep -v '^gfx90c$' | sort -u | tr '\n' ' ')
 fi
 if [[ -z "$ARCHS" ]]; then
-    # Fallback: compile for common targets (include gfx1101 for RX 7800 XT)
     ARCHS="gfx803 gfx900 gfx906 gfx908 gfx90a gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1200 gfx1201"
-    echo "Warning: could not detect GPU arch, compiling for all common targets"
+    echo "Warning: no discrete GPU arch detected; compiling for common discrete targets"
 fi
 
-# Exclude integrated GPU architectures that cause runtime memory faults
-# on multi-GPU systems due to constant-memory context mismatch.
-ARCHS=$(echo "$ARCHS" | tr ' ' '\n' | grep -v 'gfx90c' | sort -u | tr '\n' ' ')
+ARCHS=$(echo "$ARCHS" | tr ' ' '\n' | grep -Ev "$IGPU_ARCH_RE" | sort -u | tr '\n' ' ')
 if [[ -z "$ARCHS" ]]; then
-    echo "Error: no suitable GPU architecture found after filtering"
+    ARCHS="$(pick_discrete_archs_from_rocminfo)"
+fi
+if [[ -z "$ARCHS" ]]; then
+    echo "Error: no discrete GPU architecture found (only iGPU gfx90c present?)"
     exit 1
 fi
 
