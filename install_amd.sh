@@ -72,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --local-solver) LOCAL_SOLVER="$2"; shift 2 ;;
         --use-prebuilt) USE_PREBUILT=1; shift ;;
         --source-ref) SOURCE_REF="$2"; shift 2 ;;
+        --prebuilds-tag) PREBUILDS_TAG="$2"; shift 2 ;;
         --compile-all-archs) COMPILE_ALL_ARCHS=1; shift ;;
         --skip-pip)    SKIP_PIP=1; shift ;;
         --skip-rocm)   SKIP_ROCM=1; shift ;;
@@ -79,6 +80,7 @@ while [[ $# -gt 0 ]]; do
             sed -n '2,22p' "$0"
             echo "  --use-prebuilt       download release wheel+solver instead of compiling"
             echo "  --source-ref REF     git ref for source compile (default: main)"
+            echo "  --prebuilds-tag TAG  release tag for prebuilt solver (default: v1.1.9)"
             echo "  --compile-all-archs  compile solver for all common gfx targets"
             echo "  --local-solver PATH  install an existing solver binary"
             exit 0
