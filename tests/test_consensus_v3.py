@@ -137,7 +137,7 @@ class ConsensusV3Tests(unittest.TestCase):
         )
         self.assertTrue(
             GBTSolveWrapper._supports_parent_mtp_v3(
-                "btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)"
+                "btx-gbt-solve-hip 2.2.0 (HIP scan-batch perf)"
             )
         )
 

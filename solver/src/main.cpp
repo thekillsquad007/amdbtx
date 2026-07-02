@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--batch-size" && i+1 < argc) config.batch_size = std::stoul(argv[++i]);
         else if (arg == "--share-target") { if (i+1 < argc) ++i; }
         else if (arg == "--version") {
-            std::cerr << "btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)" << std::endl;
+            std::cerr << "btx-gbt-solve-hip 2.2.0 (HIP scan-batch perf)" << std::endl;
             return 0;
         } else if (arg == "--help") {
             std::cerr << "Usage: " << argv[0] << " --daemon [--matmul-n N] [--matmul-b B] [--matmul-r R] "
