@@ -86,6 +86,25 @@ rocminfo | grep -m1 gfx
 
 ### Manual / Advanced
 
+Default `install_amd.sh` compiles the HIP solver for your detected GPU arch
+(fallback: all common gfx targets). For a fast install without a compiler:
+
+```bash
+bash install_amd.sh --address btx1z... --use-prebuilt --yes
+```
+
+Source-only entry point (same behavior as default):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd_source.sh | bash -s -- --address btx1z... --yes
+```
+
+Universal solver binary (all common AMD archs, slower compile):
+
+```bash
+bash install_amd.sh --address btx1z... --compile-all-archs --yes
+```
+
 ```bash
 git clone https://github.com/thekillsquad007/amdbtx.git
 cd amdbtx
