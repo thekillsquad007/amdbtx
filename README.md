@@ -1,124 +1,54 @@
 # AMDBTX — AMD GPU Miner for BTX (Pool + Solo)
 
-A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on the
-[BitMinerPool](https://bitminerpool.xyz) **or solo** against your own `btxd` node.
+A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on
+[BitMinerPool](https://bitminerpool.xyz), another supported pool, or solo against
+your own `btxd` node.
 
-- **Pool**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
-- **Solo**: `getblocktemplate` + `getmatmulchallenge` + `submitblock` via JSON-RPC
-- **Algorithm**: MatMul PoW (n=512, b=16, r=8, M31 field, sigma gate)
-- **Dev fee**: 2% transparent — time-sliced in pool mode, coinbase split in solo
-- **Dev wallet**: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
+- **Default pool**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
+- **Solo**: mine directly against a synced `btxd` node
+- **Dev fee**: 2% transparent (time-sliced in pool mode, coinbase split in solo)
 
 ---
 
 ## Quick Start
 
-### Linux (Native Ubuntu 22.04+)
+### Linux (Ubuntu 22.04+)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --yes
-```
-
-Launch:
-
-```bash
 amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
-The installer builds the Python wrapper and HIP solver from the same Git
-commit. Verify what was installed with:
+### Windows (WSL2 + AMD GPU)
 
-```bash
-cat ~/.amdbtx-miner/install-source.txt
-sha256sum ~/.amdbtx-miner/bin/btx-gbt-solve-hip
-```
-
-### Windows (WSL2 with AMD GPU)
-
-> Requires: Windows 11 with WSL2, AMD GPU (RDNA 2+ recommended), latest AMD Adrenalin driver.
+Requires Windows 11, WSL2, and a recent AMD Adrenalin driver.
 
 ```powershell
-# From PowerShell in the repo folder:
 .\install_amd.cmd btx1z...YOUR_ADDRESS
-```
-
-Launch:
-
-```powershell
 wsl -e amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
----
-
-## Installation Details
-
-### Linux
-
-**Prerequisites**: AMD GPU (GCN 4+), Ubuntu 22.04+. The installer auto-detects your Ubuntu version and installs the correct ROCm runtime (6.4 on 22.04, 7.2 on 24.04+), Python venv, solver binary, and config.
-
-Custom options:
+### Install options
 
 ```bash
-# With worker name and custom pool
-curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- \
-  --address btx1z... --worker myrig --pool stratum.bitminerpool.xyz:3333 --yes
-```
+# Default: compile solver for your GPU (best compatibility)
+bash install_amd.sh --address btx1z... --yes
 
-### Windows (WSL2)
-
-The `.cmd` launcher runs `install_amd.ps1` with `-ExecutionPolicy Bypass`, so no system policy changes are needed. It sets `HSA_ENABLE_DXG_DETECTION=1` for WSL GPU passthrough, installs the solver and Python wrapper inside WSL, and writes the config.
-
-### HiveOS
-
-HiveOS manages the AMD driver/ROCm stack itself. The installer detects HiveOS and skips ROCm package installation automatically.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd.sh | bash -s -- --address btx1z...YOUR_ADDRESS --yes
-```
-
-If GPU detection fails on HiveOS, check that Hive exposes ROCm/HIP libraries and devices:
-
-```bash
-ldconfig -p | grep libamdhip64
-ls -la /dev/kfd /dev/dri
-rocminfo | grep -m1 gfx
-```
-
-### Manual / Advanced
-
-Default `install_amd.sh` compiles the HIP solver for your detected GPU arch
-(fallback: all common gfx targets). For a fast install without a compiler:
-
-```bash
+# Fast install: download prebuilt release (no compiler needed)
 bash install_amd.sh --address btx1z... --use-prebuilt --yes
+
+# Custom pool and worker name
+bash install_amd.sh --address btx1z... --worker myrig --pool stratum.bitminerpool.xyz:3333 --yes
 ```
 
-Source-only entry point (same behavior as default):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install_amd_source.sh | bash -s -- --address btx1z... --yes
-```
-
-Universal solver binary (all common AMD archs, slower compile):
-
-```bash
-bash install_amd.sh --address btx1z... --compile-all-archs --yes
-```
-
-```bash
-git clone https://github.com/thekillsquad007/amdbtx.git
-cd amdbtx
-bash install_amd.sh --address btx1z... --skip-rocm
-# Edit ~/.amdbtx-miner/config.yaml if needed
-amdbtx-miner
-```
+Prebuilt releases: https://github.com/thekillsquad007/amdbtx-releases
 
 ---
 
 ## Configuration
 
-Edit `~/.amdbtx-miner/config.yaml` (generated during install). See
-[`config.example.yaml`](config.example.yaml) for all options including solo mode.
+Edit `~/.amdbtx-miner/config.yaml` after install. See
+[`config.example.yaml`](config.example.yaml) for all options.
 
 **Pool mode** (default):
 
@@ -127,398 +57,130 @@ mining_mode: "pool"
 pool_host: "stratum.bitminerpool.xyz"
 pool_port: 3333
 payout_address: "btx1z..."
-worker_name: "7800XT-ALPHA-1"
-gbt_solve_path: "/home/user/.amdbtx-miner/bin/btx-gbt-solve-hip"
-solver_backend: "rocm"     # "rocm" or "cpu"
+worker_name: "myrig"
+solver_backend: "rocm"
 solver_threads: 16
-solver_prepare_workers: 16
-solver_batch_size: 4194304  # RX 7800 XT sweet spot is around 2M-4M; run --benchmark per GPU
-solver_prefetch_depth: 8
-solver_pipeline_async: 1
-benchmark_batch_sizes: [131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216]
-pool_max_shares_per_slice: 0  # 0 = submit every valid share returned by solver
-gpu_device: -1           # -1 = auto (single best GPU), 0/1/.. = force one GPU
-# gpu_devices: "all"     # multi-GPU: "all", "0,1", or [0, 1] — hashrate stacks
-nonces_per_slice: 20000000
-solver_max_seconds_per_slice: 5.0
-reconnect_initial_s: 1.0
-reconnect_max_s: 60.0
+solver_batch_size: 4194304   # installer sets a GPU-specific default; tune with --benchmark
+gpu_device: -1               # -1 = auto; 0/1/... = force one GPU
+# gpu_devices: "all"         # multi-GPU: "all", "0,1", or [0, 1]
 log_level: "INFO"
 ```
 
-CLI flags override config values:
+CLI overrides:
 
 ```bash
-amdbtx-miner --payout-address btx1z... --worker-name myrig --solver-backend rocm
+amdbtx-miner --payout-address btx1z... --worker-name myrig
 ```
 
 ### Multi-GPU
 
-On rigs with multiple AMD GPUs, the miner can run **one HIP solver per card**.
-Each GPU searches a disjoint nonce range in parallel — **effective hashrate stacks**
-for both pool and solo (2× ~26 MN/s cards ≈ ~52 MN/s total on RDNA3).
-
-#### How to enable multi-GPU
-
-**1. Confirm GPUs are visible**
+Set `gpu_devices: "all"` (or `"0,1"`) in config. Each GPU mines in parallel and
+effective hashrate stacks.
 
 ```bash
-rocminfo | grep -E 'Marketing Name|gfx'
-# or
-rocm-smi --showproductname
-```
-
-You should see one entry per card (e.g. `gfx1100` for RX 7800 XT). Note the
-device indices — usually `0`, `1`, … in probe order.
-
-**2. Edit config** (`~/.amdbtx-miner/config.yaml`)
-
-```yaml
-# Mine on every detected AMD GPU:
-gpu_devices: "all"
-
-# Or pick specific cards (skip an iGPU or a busy display GPU):
-# gpu_devices: "0,1"
-```
-
-**3. Start the miner** (pool or solo — same `gpu_devices` setting)
-
-Pool:
-
-```bash
+rocminfo | grep -E 'Marketing Name|gfx'   # confirm cards are visible
 amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
-Solo:
+Or on the command line: `--gpu-devices all`
 
-```bash
-amdbtx-miner --solo \
-  --rpc-url http://192.168.1.15:19334 \
-  --rpc-user miner --rpc-password YOUR_PASSWORD \
-  --payout-address btx1z... \
-  --gpu-devices all
-```
+### Performance tuning
 
-CLI overrides config: `--gpu-devices 0,1` is equivalent to `gpu_devices: "0,1"`.
-
-**4. Verify in logs**
-
-Startup should show:
-
-```
-multi-GPU mining on devices [0, 1] (hashrate stacks)
-multi-GPU mining: 2 solvers on devices [0, 1]
-```
-
-During mining, look for combined hashrate:
-
-```
-nonce_khps=52000 total (26000+26000 per GPU) backend=hip gpus=2
-```
-
-**Behaviour**
-
-| Mode | Connection | Hashrate |
-|------|------------|----------|
-| Pool | One stratum worker; all GPUs submit shares | Stacks — pool sees sum of work |
-| Solo | One `btxd` RPC; first GPU to find a block submits | Stacks — ~2× faster expected block time |
-
-Leave `gpu_devices` unset to keep single-GPU mode: auto-pick the best card
-(useful on laptops with iGPU + dGPU where you only want the dGPU).
-
-### GPU performance (v1.1.9)
-
-The HIP solver in `solver/src/solve_gpu.hip` includes:
-
-- Persistent device memory pool (no per-slice `hipFree`/`hipMalloc`)
-- GPU transcript digest filter (`HashTranscriptKernel` + `CompareDigestsKernel`)
-- V2 seeds/sigma re-derived on CPU after sigma gate (required for pool consensus)
-- Scan batch clamp fix: honors `BTX_MATMUL_MAX_SCAN_BATCH` (was hard-capped at 131072)
-- RDNA3 WMMA fast path for `gfx110*` / `gfx115*` (`DeviceIsGfx11`)
-
-**RX 7800 XT** (`gfx1101`) sweet spot: `solver_batch_size: 4194304` (~260 MN/s scan
-throughput vs ~97 MN/s at the old 131k clamp). RDNA2 (`gfx103*`) defaults to
-`1048576`; older GCN cards use smaller batches (see GPU Tuning table).
-
-Find the best batch for your card:
+The installer picks sensible defaults for your GPU. To find the best batch size:
 
 ```bash
 amdbtx-miner --benchmark --config ~/.amdbtx-miner/config.yaml
 ```
 
-Optional env tweak (small gain on RDNA3 in profiling):
+Then copy the recommended `solver_batch_size` into your config.
 
-```bash
-export BTX_MATMUL_FAST_V3_SCAN=1
-```
-
-Rebuild after pulling source:
-
-```bash
-bash build_solver.sh
-cp solver/build/btx-gbt-solve-hip ~/.amdbtx-miner/bin/
-```
-
-Prebuilt binaries (no compiler): `bash install_amd.sh --use-prebuilt --yes`
-or see [Releases](#releases).
+| GPU | Typical batch size |
+|-----|-------------------|
+| RX 470/480/570/580 | 64 |
+| RX Vega / RDNA 1 | 4096 |
+| RX 6600–6900 (RDNA 2) | 1048576 |
+| RX 7600–7900 (RDNA 3) | 4194304 |
+| RX 9060/9070 (RDNA 4) | run `--benchmark` |
 
 ---
 
 ## Solo Mining
 
-Solo mode mines directly against a synced BTX full node (`btxd`). The miner
-fetches block templates over JSON-RPC, runs the same HIP MatMul solver, and
-submits full blocks with `submitblock` when a solution meets **network**
-difficulty (not pool share difficulty). A **2% dev fee** is taken from the
-coinbase reward (split outputs) on every block found — same rate as pool mode,
-applied differently.
+Mine against your own synced BTX node instead of a pool. Requires
+[BTX v0.32.3+](https://github.com/btxchain/btx/releases) with RPC enabled.
 
-### Requirements
-
-- A synced `btxd` node on **[BTX v0.32.3+](https://github.com/btxchain/btx/releases)**
-- RPC enabled with `getblocktemplate`, `getmatmulchallenge`, and `submitblock`
-- A BTX payout address (`btx1z...` or `btx1q...`) — block rewards go to this address
-- The same HIP solver binary used for pool mining
-
-### Local node (same machine)
-
-If `btxd` runs locally with cookie auth (default when no `rpcuser` is set):
+**Local node** (cookie auth):
 
 ```yaml
 mining_mode: solo
 rpc_url: "http://127.0.0.1:19334"
 rpc_cookie_file: "~/.btx/.cookie"
-payout_address: "btx1z...YOUR_ADDRESS..."
+payout_address: "btx1z..."
 ```
 
 ```bash
-amdbtx-miner --solo --payout-address btx1z...YOUR_ADDRESS...
+amdbtx-miner --solo --payout-address btx1z...
 ```
 
-### Remote node (LAN or VPS)
-
-Use `rpcuser` / `rpcpassword` from the node's `btx.conf`. Cookie files only work
-on the machine where `btxd` created them.
+**Remote node** (username/password):
 
 ```yaml
 mining_mode: solo
 rpc_url: "http://192.168.1.15:19334"
 rpc_user: "miner"
 rpc_password: "your_rpc_password"
-payout_address: "btx1z...YOUR_ADDRESS..."
-gbt_longpoll: true
-gbt_longpoll_timeout: 60.0
+payout_address: "btx1z..."
 ```
 
-```bash
-amdbtx-miner --solo \
-  --rpc-url http://192.168.1.15:19334 \
-  --rpc-user miner \
-  --rpc-password your_rpc_password \
-  --payout-address btx1z...YOUR_ADDRESS...
-```
-
-### How it works
-
-1. `getblocktemplate` + `getmatmulchallenge` — fetch the current block template and MatMul challenge (seeds, height, epsilon, merkle root).
-2. HIP solver — search nonces against **network** `bits` / target (same digest path as pool mining).
-3. `submitblock` — when `is_block=true`, assemble coinbase + mempool txs + MatMul header and submit the full block hex to your node.
-
-The miner polls for template updates each loop (new transactions, refreshed `nTime`)
-without resetting your nonce counter on the same block height.
-
-### Pool vs solo
-
-| | Pool | Solo |
-|---|------|------|
-| Work source | Stratum `mining.notify` | `getblocktemplate` + `getmatmulchallenge` |
-| Difficulty | Pool share target | Full network block target |
-| Submit | `mining.submit` (nonce + ntime) | `submitblock` (full block) |
-| Payout | Pool (PPLNS) | Full block reward to your address |
-| Dev fee | 2% time-sliced (stratum) | 2% coinbase split per block |
-
-### Expected logs
-
-```
-solo: connected to node height=125601 difficulty=0.035...
-solo template job=solo-125601-51619e6d8d37ab84 height=125601 ...
-FOUND! nonce=... digest=... is_block=true ...
-solo: BLOCK ACCEPTED height=125601 nonce=... digest=...
-```
-
-If you see `is_block=false`, the solver found a share-tier hit (not a valid block)
-and solo mode correctly skips `submitblock`.
-
-### When solo makes sense
-
-Solo competes against **total network hashrate**, not pool hashrate. It can be
-worth trying when network difficulty is low relative to your GPU's `nonce_khps`,
-or when you want the full block reward without pool fees. At typical single-GPU
-speeds on mainnet, blocks may be rare — check your `nonce_khps` in the solve logs
-and compare to network conditions on [BTXplorer](https://explorer.minebtx.com).
-
-### Solo dev fee
-
-By default, **2%** of each block's `coinbasevalue` is paid to the dev wallet
-as a second coinbase output; the rest goes to your `payout_address`. Disable or
-adjust in config:
-
-```yaml
-solo_dev_fee_bps: 200   # 200 = 2.00%; set 0 to disable
-# dev_wallet: "btx1z..."  # optional override (defaults to built-in dev wallet)
-```
-
-On startup you should see:
-
-```
-solo: dev fee 200 bps (2.00% of coinbase) -> btx1zdcnts8q7...
-```
-
-When a block is accepted:
-
-```
-solo: BLOCK ACCEPTED ... reward user=1960000000 dev=40000000 sats (2.00% fee)
-```
-
-### Solo troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| `cannot reach btxd RPC` | Check `rpc_url`, firewall, and that `btxd` is running |
-| `no RPC credentials` | Set `rpc_user`/`rpc_password` (remote) or `rpc_cookie_file` (local) |
-| `cannot resolve coinbase script` | Ensure `validateaddress` works on the node, or set `coinbase_script_pubkey` in config |
-| `solo: submitblock rejected` | Node may have moved to a new tip — usually resolves on next template; check `btxd` logs |
-| `merkle mismatch` | Template changed while assembling — miner will pick up the new template next loop |
+Solo uses the same GPU solver as pool mode but submits full blocks when network
+difficulty is met. A 2% dev fee is taken from the coinbase on each block found
+(set `solo_dev_fee_bps: 0` in config to disable).
 
 ---
 
-## GPU Tuning
-
-Install-time defaults (`install_amd.sh`) — override in config or run `--benchmark`:
-
-| GPU Family | Arch | GFX | Workers | Threads | Default batch |
-|------------|------|-----|---------|---------|---------------|
-| RX 470/480/570/580 | GCN 4 | gfx803 | 8 | 4 | 64 |
-| RX Vega 56/64 | GCN 5 | gfx900 | 8 | 4 | 4096 |
-| Radeon VII | GCN 5 | gfx906 | 12 | 8 | 4096 |
-| RX 5500/5600/5700 | RDNA 1 | gfx1010 | 12 | 8 | 4096 |
-| RX 6600/6700/6800/6900 | RDNA 2 | gfx1030 | 16 | 8 | 1048576 |
-| RX 7600 | RDNA 3 | gfx1102 | 16 | 8 | 4194304 |
-| RX 7700/7800/7900 | RDNA 3 | gfx1100/1101 | 16 | 8 | 4194304 |
-| RX 9060 XT | RDNA 4 | gfx1200 | 16 | 8 | 4096* |
-| RX 9070 XT | RDNA 4 | gfx1201 | 16 | 8 | 4096* |
-
-\* **RDNA 4** (`gfx1200`/`gfx1201`): compiles from source on install, but the WMMA
-fast path is RDNA3-only today — run `--benchmark` to tune batch size until RDNA4
-optimization lands.
-
----
-
-## Building Solver from Source
-
-Default install already compiles for your detected GPU. Rebuild manually if needed:
-
-```bash
-git clone https://github.com/thekillsquad007/amdbtx.git
-cd amdbtx
-bash build_solver.sh
-```
-
-Output: `solver/build/btx-gbt-solve-hip`. Point `gbt_solve_path` in config to this
-path (or `~/.amdbtx-miner/bin/btx-gbt-solve-hip` after install).
-
-Compile all common AMD archs in one binary:
-
-```bash
-AMDBTX_HIP_ARCHS="gfx803 gfx900 gfx906 gfx1010 gfx1030 gfx1100 gfx1101 gfx1102" \
-  bash build_solver.sh
-```
-
----
-
-## Releases
-
-Prebuilt wheel + multi-arch HIP solver are published to
-[amdbtx-releases](https://github.com/thekillsquad007/amdbtx-releases).
-
-Latest: [amdbtx-prebuilds-v1.1.9](https://github.com/thekillsquad007/amdbtx-releases/releases/tag/amdbtx-prebuilds-v1.1.9)
-
-```bash
-bash install_amd.sh --address btx1z... --use-prebuilt --yes
-```
-
-Assets: `amdbtx_miner-1.1.9-py3-none-any.whl`, `btx-gbt-solve-hip` (gfx900/906/1030/1100/1101).
-For **gfx1200/gfx1201** (RDNA 4) or other arches, use the default source-compile install.
-
----
-
-## Dev Fee (pool mode only)
-
-Transparent 2% dev fee: time-sliced in pool mode, coinbase split in solo mode.
-
-1. Mine with your address for ~58 minutes
-2. Switch authorization to dev wallet for ~2 minutes
-3. Switch back to your address
-4. All switches logged at `INFO` level
-
-Dev wallet: `btx1zdcnts8q7glg6dfk07jx35xnz9ad4ply3xag3m8f3xq4fdnltlnhqlvv5p4`
-
----
-
-## Pool Information
+## Pools
 
 ### BitMinerPool (default)
 
 - **Dashboard**: https://bitminerpool.xyz
 - **Stratum**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
-- **Algorithm**: MatMul PoW (BTX spec, n=512, b=16, r=8, M31 field)
-- **Pool Fee**: 2.5% (PPLNS, weekly payouts)
+- **Pool fee**: 1% (PPLNS)
 
 ### LuckyPool
 
-The miner auto-detects LuckyPool's JSON-RPC dialect when standard stratum
-`mining.subscribe` is unavailable. Point `pool_host` / `pool_port` at your
-LuckyPool endpoint (e.g. `btx-sg.lproute.com:8660`):
+Point your config at a LuckyPool endpoint:
 
 ```yaml
 pool_host: "btx-sg.lproute.com"
 pool_port: 8660
 ```
 
-LuckyPool submits the full 16-character `nonce64` (not a truncated suffix).
-Sparse job updates preserve prior height fields automatically.
+The miner detects LuckyPool automatically — no extra setup.
 
-### General
+### Wallet
 
-- **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
-
-### Getting a BTX Address
-
-The pool does **not** create wallets. Visit https://easybtx.com/wallet to create a BTX wallet and get a payout address (starts with `btx1z...` or `btx1q...`).
+Pools do not create wallets. Get a BTX address at https://easybtx.com/wallet
+(`btx1z...` or `btx1q...`).
 
 ---
 
 ## Troubleshooting
 
 | Symptom | Fix |
-|---------|------|
-| `invalid payout address` | Config has placeholder — edit `~/.amdbtx-miner/config.yaml` |
-| Solver binary does nothing | Build from source: `bash build_solver.sh` |
+|---------|-----|
+| `invalid payout address` | Replace the placeholder in `~/.amdbtx-miner/config.yaml` |
+| Solver not working | Re-run install, or `bash build_solver.sh` from a cloned repo |
 | `rocm-smi` not found | Install ROCm or `export PATH=/opt/rocm/bin:$PATH` |
 | `/dev/kfd` permission denied | `sudo chmod 666 /dev/kfd /dev/dri/*` |
-| GPU not detected in WSL | Set `HSA_ENABLE_DXG_DETECTION=1` in Windows env, `wsl --shutdown`, restart |
-| Low GPU utilization | Bump `solver_prepare_workers` and `solver_threads` |
-| Share rejected (code 21) | Normal after reconnect, wait 1–2 minutes |
-| LuckyPool `code=20 incorrect size of nonce64` | Ensure miner v1.1.8+; submits full 16-char nonce64 |
-| Low hashrate after upgrade | Run `--benchmark`; RDNA3 often needs `solver_batch_size: 4194304` |
-| `solver_batch_size` very large warning | Confirm VRAM headroom with `--benchmark` before mining |
+| GPU not detected in WSL | Set `HSA_ENABLE_DXG_DETECTION=1`, then `wsl --shutdown` and restart |
+| Low hashrate | Run `--benchmark` and update `solver_batch_size` |
+| Share rejected after reconnect | Wait 1–2 minutes for the pool to sync |
 
 ---
 
 ## Links
 
 - **Pool**: https://bitminerpool.xyz
-- **Dashboard**: https://bitminerpool.xyz
 - **Releases**: https://github.com/thekillsquad007/amdbtx-releases
-- **Telegram**: @btxdexbot (`/stats`, `/mybalance`, `/help`)
 - **GitHub**: https://github.com/thekillsquad007/amdbtx
+- **Telegram**: @btxdexbot
