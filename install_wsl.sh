@@ -10,7 +10,7 @@ fi
 
 ADDRESS="${ADDRESS:-}"
 WORKER="${WORKER:-}"
-POOL="${POOL:-stratum.bitminerpool.xyz:3333}"
+POOL="${POOL:-btx-sg.lproute.com:8660}"
 
 log() { echo -e "\033[1;34m[amdbtx]\033[0m $*"; }
 err() { echo -e "\033[1;31m[error]\033[0m $*" >&2; exit 1; }

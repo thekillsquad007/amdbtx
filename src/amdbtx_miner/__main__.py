@@ -92,7 +92,7 @@ def parse_args():
     p.add_argument("--config", default=str(Path.home() / ".amdbtx-miner" / "config.yaml"))
     p.add_argument("--payout-address", help="BTX payout address")
     p.add_argument("--worker-name", default=None)
-    p.add_argument("--pool-host", default=None, help="pool hostname (default: config or stratum.bitminerpool.xyz)")
+    p.add_argument("--pool-host", default=None, help="pool hostname (default: config or btx-sg.lproute.com)")
     p.add_argument("--pool-port", type=int, default=None)
     p.add_argument("--solver-backend", default=None, choices=["rocm", "cpu"])
     p.add_argument("--solver-threads", type=int, default=None)

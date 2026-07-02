@@ -7,7 +7,7 @@
 #   4. Revoke old PAT and create new one (prompts you)
 set -euo pipefail
 
-RELEASE_TAG="${RELEASE_TAG:-amdbtx-prebuilds-v1.1.9}"
+RELEASE_TAG="${RELEASE_TAG:-v1.2.0}"
 REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx-releases}"
 SRC_DIR="/var/home/bazzite/amdbtx-private-src"
 SOLVER_SRC="/var/home/bazzite/amdbtx-private-solver"
@@ -22,7 +22,7 @@ echo "Wheel: ${WHEEL_PATH}"
 
 # ── 2. Solver binary (via distrobox) ───────────────────────────────
 echo "=== Step 2: Build HIP solver in distrobox ==="
-AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1100 gfx1101}"
+AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103}"
 distrobox enter "${DISTROBOX}" -- env AMDBTX_HIP_ARCHS="${AMDBTX_HIP_ARCHS}" \
     bash /var/home/bazzite/amdbtx/build_solver.sh
 SOLVER_BINARY="${SOLVER_SRC}/build/btx-gbt-solve-hip"

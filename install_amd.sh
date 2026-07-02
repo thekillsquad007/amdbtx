@@ -27,20 +27,20 @@ if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
 fi
 
 # ─── Configurables ──────────────────────────────────────────────────────────
-SOURCE_REF="${AMDBTX_SOURCE_REF:-main}"
+SOURCE_REF="${AMDBTX_SOURCE_REF:-v1.2.0}"
 SOURCE_REPO="${AMDBTX_SOURCE_REPO:-thekillsquad007/amdbtx}"
 RELEASE_REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx}"
 # Default tag for prebuilt solver assets (overridden via --prebuilds-tag or AMDBTX_PREBUILDS_TAG)
-PREBUILDS_TAG="${AMDBTX_PREBUILDS_TAG:-v1.1.9}"
+PREBUILDS_TAG="${AMDBTX_PREBUILDS_TAG:-v1.2.0}"
 PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${RELEASE_REPO}/releases/download/${PREBUILDS_TAG}}"
-WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.9-py3-none-any.whl}"
-EXPECTED_MINER_VERSION="1.1.9"
-EXPECTED_WHEEL_SHA256="cf0cabb73741fbb571dc238b2247fc2c19cfcd4f67718bc7d86712b97e3ad7e0"
+WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.2.0-py3-none-any.whl}"
+EXPECTED_MINER_VERSION="1.2.0"
+EXPECTED_WHEEL_SHA256="9188b87f2a6abb4362e095fc25aeb38f53ff1406380fbb7d4b065b2899ac1b46"
 EXPECTED_SOLVER_VERSION="2.2.0"
-EXPECTED_SOLVER_SHA256="4567bbe55618f577ab15a8a59c74309f9904132d89011e094b764870a1f38390"
+EXPECTED_SOLVER_SHA256="14ed8118e92bad6abe10d4ecbd50ce278140766df99d8ed2d0dbd2e3046a2663"
 DEFAULT_POOL="${DEXBTX_POOL:-btx-sg.lproute.com:8660}"
 # Used when --compile-all-archs is set (or AMDBTX_COMPILE_ALL_ARCHS=1).
-ALL_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx803 gfx900 gfx906 gfx908 gfx90a gfx1010 gfx1011 gfx1012 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1200 gfx1201}"
+ALL_HIP_ARCHS="${AMDBTX_HIP_ARCHS:-gfx900 gfx906 gfx1030 gfx1031 gfx1032 gfx1100 gfx1101 gfx1102 gfx1103}"
 
 INSTALL_DIR="${HOME}/.amdbtx-miner"
 SOLVER_PATH="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
@@ -79,8 +79,8 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             sed -n '2,22p' "$0"
             echo "  --use-prebuilt       download release wheel+solver instead of compiling"
-            echo "  --source-ref REF     git ref for source compile (default: main)"
-            echo "  --prebuilds-tag TAG  release tag for prebuilt solver (default: v1.1.9)"
+            echo "  --source-ref REF     git ref for source compile (default: v1.2.0)"
+            echo "  --prebuilds-tag TAG  release tag for prebuilt solver (default: v1.2.0)"
             echo "  --compile-all-archs  compile solver for all common gfx targets"
             echo "  --local-solver PATH  install an existing solver binary"
             exit 0
@@ -293,18 +293,16 @@ is_igpu_arch() {
     [[ "$1" =~ $IGPU_ARCHS_RE ]]
 }
 
-# Architectures covered by the multi-arch release solver (amdbtx-releases).
-# Same-family chips (e.g. gfx1031) run via the gfx1030 / gfx1100 offload paths.
+# Architectures covered by the multi-arch release solver.
 arch_supported_by_prebuild() {
     local arch="${1:-}"
     if [[ -z "$arch" ]]; then
         return 0
     fi
     case "$arch" in
-        gfx900|gfx906|gfx908|gfx90a) return 0 ;;
+        gfx900|gfx906) return 0 ;;
         gfx1030|gfx1031|gfx1032) return 0 ;;
         gfx1100|gfx1101|gfx1102|gfx1103) return 0 ;;
-        gfx1150|gfx1151) return 0 ;;
         *) return 1 ;;
     esac
 }
