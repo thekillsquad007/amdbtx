@@ -195,8 +195,25 @@ export HSA_ENABLE_DXG_DETECTION=1
 # Integrated GPU ISAs we never compile for (constant-memory issues / wrong target).
 IGPU_ARCHS_RE='^(gfx90c)$'
 
+install_rocm_apt_repo() {
+    local repo_ver="$1"
+    local codename="$2"
+    local keyring="/usr/share/keyrings/rocm-archive-keyring.gpg"
+    need curl
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd gpg --dearmor -o "$keyring" 2>/dev/null || \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
+    if [[ -f "$keyring" ]]; then
+        echo "deb [arch=amd64 signed-by=${keyring}] https://repo.radeon.com/rocm/apt/${repo_ver} ${codename} main" | \
+            sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
+    else
+        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${repo_ver} ${codename} main" | \
+            sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
+    fi
+}
+
 setup_rocm_environment() {
     local bindir libdir seen_path="" seen_lib=""
+    # Prefer /opt/rocm hipcc over /usr/bin wrappers that point at missing clang paths.
     for bindir in /opt/rocm/bin /opt/rocm-*/bin /usr/bin /usr/local/bin; do
         [[ -d "$bindir" ]] || continue
         if [[ -x "$bindir/rocminfo" || -x "$bindir/rocm-smi" || -x "$bindir/hipcc" ]]; then
@@ -257,14 +274,51 @@ arch_supported_by_prebuild() {
     esac
 }
 
-hip_toolchain_ready() {
-    local out=""
-    command -v hipcc >/dev/null 2>&1 || return 1
-    out="$(hipcc --version 2>&1)" || return 1
-    if [[ "$out" == *"not found"* || "$out" == *"No such file"* ]]; then
-        return 1
+ensure_hip_dev_for_compile() {
+    local solver_dir="$1"
+    # shellcheck source=/dev/null
+    source "${solver_dir}/hip_toolchain.sh"
+
+    setup_rocm_environment
+    if hip_toolchain_ready; then
+        log "HIP compiler: ${HIPCC}"
+        return 0
     fi
-    return 0
+
+    log "ROCm HIP compiler missing or broken; installing dev packages..."
+    if have_apt; then
+        for pkg_set in "hip-dev rocminfo" "rocm-dev rocminfo" "hip-dev"; do
+            # shellcheck disable=SC2086
+            if apt_install $pkg_set 2>/dev/null; then
+                break
+            fi
+        done
+        setup_rocm_environment
+        if hip_toolchain_ready; then
+            log "HIP compiler ready: ${HIPCC}"
+            return 0
+        fi
+
+        local repo_ver
+        repo_ver="$(rocm_repo_for_codename "$UBUNTU_CODENAME" "$OS_VERSION_ID")"
+        if [[ -n "$repo_ver" ]]; then
+            log "trying ROCm ${repo_ver} dev packages from AMD repo..."
+            install_rocm_apt_repo "$repo_ver" "$UBUNTU_CODENAME"
+            sudo_cmd apt-get update -qq 2>&1 | grep -vE '^(W:|N:)' || true
+            for pkg_set in "hip-dev rocminfo" "rocm-dev rocminfo"; do
+                if sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkg_set 2>/dev/null; then
+                    break
+                fi
+            done
+        fi
+    fi
+
+    setup_rocm_environment
+    if hip_toolchain_ready; then
+        log "HIP compiler ready: ${HIPCC}"
+        return 0
+    fi
+    return 1
 }
 
 install_prebuilt_solver() {
@@ -502,7 +556,7 @@ else
                 err "ROCm packages were not available from system apt, and no supported Radeon repo mapping exists for Ubuntu ${OS_VERSION_ID:-unknown} (${UBUNTU_CODENAME}). Install ROCm manually, then rerun with --skip-rocm."
             fi
             log "system packages not available, trying external ROCm ${ROCM_REPO_VER} repo..."
-            echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/${ROCM_REPO_VER} ${UBUNTU_CODENAME} main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list > /dev/null
+            install_rocm_apt_repo "$ROCM_REPO_VER" "$UBUNTU_CODENAME"
 
             # Remove stale ROCm 5.x sources if any
             for old in /etc/apt/sources.list.d/rocm*.list; do
@@ -652,65 +706,53 @@ if [[ -n "$LOCAL_SOLVER" ]]; then
     install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
 elif [[ "$USE_PREBUILT" -eq 1 ]]; then
     install_prebuilt_solver
-elif ! hip_toolchain_ready; then
-    if arch_supported_by_prebuild "$GPU_ARCH"; then
-        warn "HIP compiler unavailable on this system; using release prebuilt solver"
-        install_prebuilt_solver
-    else
-        err "HIP compiler unavailable and release prebuilds do not cover arch ${GPU_ARCH:-unknown}. Install ROCm hip-dev or use --use-prebuilt on a supported GPU."
-    fi
 else
     SOLVER_SRC_DIR="$REPO_SRC_DIR/solver"
     [[ -f "$SOLVER_SRC_DIR/build.sh" ]] || err "solver sources missing at ${SOLVER_SRC_DIR}/build.sh"
 
-    setup_rocm_environment
-
-    # Align HIP dev packages with the runtime ROCm version when possible.
-    ROCM_DEV_NEEDED=0
-    set +e
-    ROCM_LIB_VER=$(dpkg -l libamdhip64-dev 2>/dev/null | awk '/libamdhip64-dev/ {print $3}' | head -1)
-    ROCM_VER=$(echo "${ROCM_LIB_VER:-}" | grep -oP '^\d+\.\d+' | head -1) || true
-    HIPCC_VER=$(hipcc --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1) || true
-    set -e
-    HIPCC_VER="${HIPCC_VER:-0}"
-    if [[ -n "$ROCM_VER" && -n "$HIPCC_VER" && "$ROCM_VER" != "$HIPCC_VER" ]]; then
-        ROCM_DEV_NEEDED=1
-    fi
-    if [[ "$ROCM_DEV_NEEDED" -eq 1 ]]; then
-        log "installing matching HIP dev packages..."
-        sudo_cmd env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hip-dev 2>/dev/null || true
-    fi
-
+    # Default: compile for the detected discrete GPU only (fast, small binary).
+    # --compile-all-archs builds a fat multi-arch binary (slow; for maintainers).
+    # Release prebuilds cover common arches; others need a working /opt/rocm HIP compiler.
     BUILD_LOG="$TMP_BUILD_DIR/build.log"
     COMPILE_OK=0
-    if [[ "$COMPILE_ALL_ARCHS" -eq 1 ]]; then
-        log "compiling solver for all common AMD GPU architectures..."
-        export AMDBTX_HIP_ARCHS="$ALL_HIP_ARCHS"
-    elif [[ -n "$GPU_ARCH" ]] && ! is_igpu_arch "$GPU_ARCH"; then
-        log "compiling solver for discrete GPU arch ${GPU_ARCH}..."
-        export AMDBTX_HIP_ARCHS="$GPU_ARCH"
-    else
-        if [[ -n "$GPU_ARCH" ]] && is_igpu_arch "$GPU_ARCH"; then
-            warn "refusing to compile for iGPU arch ${GPU_ARCH}"
+    TOOLCHAIN_OK=0
+    if ensure_hip_dev_for_compile "$SOLVER_SRC_DIR"; then
+        TOOLCHAIN_OK=1
+    fi
+
+    if [[ "$TOOLCHAIN_OK" -eq 1 ]]; then
+        if [[ "$COMPILE_ALL_ARCHS" -eq 1 ]]; then
+            log "compiling solver for all common AMD GPU architectures..."
+            export AMDBTX_HIP_ARCHS="$ALL_HIP_ARCHS"
+        elif [[ -n "$GPU_ARCH" ]] && ! is_igpu_arch "$GPU_ARCH"; then
+            log "compiling solver for discrete GPU arch ${GPU_ARCH}..."
+            export AMDBTX_HIP_ARCHS="$GPU_ARCH"
+        else
+            if [[ -n "$GPU_ARCH" ]] && is_igpu_arch "$GPU_ARCH"; then
+                warn "refusing to compile for iGPU arch ${GPU_ARCH}"
+            fi
+            log "compiling solver (auto-detect discrete GPU arch)..."
+            unset AMDBTX_HIP_ARCHS || true
         fi
-        log "compiling solver (auto-detect discrete GPU arch)..."
-        unset AMDBTX_HIP_ARCHS || true
-    fi
-    if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
-        log "solver compilation successful"
-        install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
-        SOLVER_BUILT_FROM_SOURCE=1
-        COMPILE_OK=1
+        if bash "$SOLVER_SRC_DIR/build.sh" > "$BUILD_LOG" 2>&1; then
+            log "solver compilation successful"
+            install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
+            SOLVER_BUILT_FROM_SOURCE=1
+            COMPILE_OK=1
+        else
+            warn "solver compilation failed (see log below)"
+            cat "$BUILD_LOG" >&2
+        fi
     else
-        warn "solver compilation failed (see log below)"
-        cat "$BUILD_LOG" >&2
+        warn "HIP compiler unavailable (broken /usr/bin/hipcc or missing /opt/rocm/llvm)"
     fi
+
     if [[ "$COMPILE_OK" -eq 0 ]]; then
         if arch_supported_by_prebuild "$GPU_ARCH"; then
             log "using release prebuilt solver for ${GPU_ARCH:-detected GPU} (${PREBUILDS_TAG})"
             install_prebuilt_solver
         else
-            err "solver compilation failed and release prebuilds do not cover arch ${GPU_ARCH:-unknown}. Install hip-dev/rocm-dev or use --compile-all-archs after fixing ROCm."
+            err "cannot build for arch ${GPU_ARCH:-unknown}: HIP compiler missing and no release prebuild. Install ROCm hip-dev (provides /opt/rocm/bin/hipcc) or use --compile-all-archs on a system with full ROCm dev."
         fi
     fi
 fi
@@ -886,8 +928,7 @@ if [[ -n "$MISSING" ]]; then
 
     if [[ "$ROCM_APT_OK" -eq 0 && -n "$ROCM_REPO_VER" ]]; then
         log "system packages not available, trying external ROCm ${ROCM_REPO_VER} repo..."
-        curl -sL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
-        echo "deb [arch=amd64 trusted=yes] https://repo.radeon.com/rocm/apt/$ROCM_REPO_VER $UBUNTU_CODENAME main" | sudo_cmd tee /etc/apt/sources.list.d/rocm.list >/dev/null
+        install_rocm_apt_repo "$ROCM_REPO_VER" "$UBUNTU_CODENAME"
         if sudo_cmd apt-get update -qq 2>/dev/null; then
             if [[ "$ROCM_REPO_VER" == "7."* ]]; then
                 EXTRA_ROCM_PACKAGES=(hip-runtime-amd rocminfo)

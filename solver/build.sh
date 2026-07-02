@@ -8,66 +8,22 @@ SRC_DIR="${SCRIPT_DIR}/src"
 BUILD_DIR="${SCRIPT_DIR}/build"
 mkdir -p "$BUILD_DIR"
 
-# --- Find HIP compiler (prefer /opt/rocm over system hipcc) ---
-HIPCC=""
-for cand in /opt/rocm /opt/rocm-*; do
-    if [[ -f "$cand/bin/hipcc" ]]; then
-        HIPCC="$cand/bin/hipcc"
-        break
-    fi
-done
-if [[ -z "$HIPCC" ]] && command -v hipcc >/dev/null 2>&1; then
-    HIPCC="hipcc"
-fi
-if [[ -z "$HIPCC" ]]; then
-    for cand in /opt/rocm /opt/rocm-*; do
-        if [[ -f "$cand/lib/llvm/bin/clang++" ]]; then
-            HIPCC="$cand/lib/llvm/bin/clang++"
-            break
-        fi
-    done
-fi
-if [[ -z "$HIPCC" ]]; then
-    echo "Error: HIP compiler (hipcc) not found."
-    echo "Install rocm-dev, hip-devel, or hip-dev first."
+# shellcheck source=hip_toolchain.sh
+source "${SCRIPT_DIR}/hip_toolchain.sh"
+
+if ! resolve_hip_toolchain; then
+    echo "Error: working HIP compiler not found."
+    echo "Install ROCm HIP dev tools (hip-dev / rocm-dev) so /opt/rocm/bin/hipcc works."
+    echo "Ubuntu /usr/bin/hipcc often points at a missing /opt/rocm/llvm/clang."
     exit 1
 fi
 echo "Using HIP compiler: $HIPCC"
+if [[ -n "$ROCM_ROOT" ]]; then
+    echo "ROCm root: $ROCM_ROOT"
+fi
 
-# --- Find ROCm include/lib paths ---
-# Use hipconfig by default (guarantees headers match the HIP compiler version).
-# Only prefer /opt/rocm when no hipconfig is available.
-ROCM_INCLUDE=""
-ROCM_LIB=""
-if command -v hipconfig >/dev/null 2>&1; then
-    for hipconfig_flag in --hip-path --path; do
-        HIP_PATH="$(hipconfig "$hipconfig_flag" 2>/dev/null | head -n1 | tr -d '\r' || true)"
-        # ROCm 7.x sometimes prints "HIP version: ..." instead of a directory.
-        if [[ -n "$HIP_PATH" && "$HIP_PATH" == /* && -d "$HIP_PATH/include/hip" ]]; then
-            ROCM_INCLUDE="$HIP_PATH/include"
-            ROCM_LIB="$HIP_PATH/lib"
-            break
-        fi
-    done
-fi
-if [[ -z "$ROCM_INCLUDE" ]]; then
-    for cand in /opt/rocm /opt/rocm-*; do
-        if [[ -d "$cand/include/hip" ]]; then
-            ROCM_INCLUDE="$cand/include"
-            ROCM_LIB="$cand/lib"
-            break
-        fi
-    done
-fi
-if [[ -z "$ROCM_INCLUDE" ]]; then
-    # System install (Ubuntu 26.04+)
-    if [[ -d "/usr/include/hip" ]]; then
-        ROCM_INCLUDE="/usr/include"
-        ROCM_LIB="/usr/lib/x86_64-linux-gnu"
-    fi
-fi
-if [[ -z "$ROCM_INCLUDE" ]]; then
-    echo "Error: HIP headers not found. Install rocm-dev or hip-dev."
+if [[ -z "$ROCM_INCLUDE" || -z "$ROCM_LIB" ]]; then
+    echo "Error: HIP headers/libs not found. Install rocm-dev or hip-dev."
     exit 1
 fi
 echo "ROCm include: $ROCM_INCLUDE"
@@ -135,7 +91,7 @@ SOURCES=(
 )
 
 echo "Building btx-gbt-solve-hip..."
-$HIPCC \
+"$HIPCC" \
     -x hip \
     -O3 \
     -std=c++17 \
