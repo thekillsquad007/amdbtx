@@ -392,3 +392,43 @@ def test_luckypool_submit_infers_suffix_width_from_aligned_nonce_start():
     )
 
     assert sent[0]["params"]["nonce"] == "0093a6bdf4"
+
+
+def test_job_copy_preserves_luckypool_nonce_suffix_width():
+    current_job = Job.from_luckypool({
+        "jobId": "599",
+        "height": 147780,
+        "nVersion": 536870912,
+        "prevHash": "33" * 32,
+        "merkleRoot": "44" * 32,
+        "nTime": 1782977306,
+        "nBits": "1c4c2e02",
+        "noncePrefix": "9545481",
+        "nonceBits": 40,
+        "shareTarget": "00001387ec780000",
+        "parentMtp": 1782977000,
+    })
+
+    solve_job = Job(
+        job_id=current_job.job_id,
+        version=current_job.version,
+        prev_hash=current_job.prev_hash,
+        merkle_root=current_job.merkle_root,
+        time=current_job.time,
+        bits=current_job.bits,
+        target=current_job.target,
+        seed_a=current_job.seed_a,
+        seed_b=current_job.seed_b,
+        block_height=current_job.block_height,
+        matmul_n=current_job.matmul_n,
+        matmul_b=current_job.matmul_b,
+        matmul_r=current_job.matmul_r,
+        epsilon_bits=current_job.epsilon_bits,
+        parent_mtp=current_job.parent_mtp,
+        nonce64_start=current_job.nonce64_start,
+        clean_jobs=current_job.clean_jobs,
+        received_at=current_job.received_at,
+        luckypool_nonce_bits=current_job.luckypool_nonce_bits,
+    )
+
+    assert solve_job.luckypool_nonce_bits == 40

@@ -495,6 +495,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                 nonce64_start=current_job.nonce64_start,
                 clean_jobs=current_job.clean_jobs,
                 received_at=current_job.received_at,
+                luckypool_nonce_bits=current_job.luckypool_nonce_bits,
             )
 
             result = _solve_slice_continuous(
