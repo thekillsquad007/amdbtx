@@ -12,13 +12,12 @@
 
 - Installed path: `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip`
 - Version: `btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)`
-- Current installed SHA256: `28f8f08b8c4b427be580261b9c47641745004c229cc0333a40e27d007e08bcdf`
-- Installed after trust-GPU solver-side fix on `2026-07-01 08:22`.
+- Current installed SHA256: `c46445d37324b069dba4d36ab6836689c2b8ebae8161631fdb366c7227f41135`
+- Restored from `bak-trust-gpu-20260701-082202` after `__launch_bounds__` experiment regressed performance.
 - Backup made before install:
   - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-trust-gpu-20260701-082202`
-- Previous useful backups from earlier work may also exist:
-  - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-fusedA-default-20260701-075232`
-  - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-main-perf-20260701-074022`
+- Newer backups from experiments:
+  - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-launchbounds-20260701-185024` (pre-experiment, same as trust-gpu)
 
 The currently running miner keeps using its already-open executable until it is restarted. Restart is required to pick up the installed solver above.
 
@@ -248,6 +247,28 @@ Expected effect:
 - This is separate from raw GPU kernel throughput and from the multi-share
   submission fix; both pool-facing fixes are needed before comparing to other rigs.
 
+## Experiment: `__launch_bounds__` on All Kernels (Regressed)
+
+Added `__launch_bounds__(256, 2)` to all 256-thread kernels and
+`__launch_bounds__(32, 10)` to 32-thread WMMA kernels. Result: **10% regression**
+(3.77 MN/s → 3.41 MN/s).
+
+Root cause:
+
+- `min_blocks=2` forced compiler to reduce SGPR/VGPR per thread, causing spill to
+  local memory (global memory) — ~100+ cycle penalty per spilled value.
+- WMMA kernels (`batch_factored_words_wmma_partial`) need ~100+ VGPRs for
+  16 × `i32x8` accumulators; `min_blocks=10` forced 51 VGPR budget → massive spill
+  → words stage 3× slower (1.6ms → 4.67ms).
+- The ROCm/HIP compiler already picks near-optimal register allocation for the
+  default no-hint case on gfx1101. Forcing lower registers through `__launch_bounds__`
+  hurt more than increased occupancy helped.
+
+Conclusion: The compiler's default register allocation is optimal for RDNA3
+SHA-256-heavy workloads. No further GPU occupancy tuning via launch bounds will help.
+The 10-20% efficient occupancy is a fundamental consequence of SHA-256's register
+demands, not a tuneable deficiency.
+
 ## Experiments Tried And Reverted Earlier
 
 - Fused hash+compare: slower due register pressure.
@@ -330,15 +351,16 @@ Full `pytest` was not claimed passing in the latest state. Earlier, main-branch 
 As of the latest update, `git status --short` showed:
 
 ```text
- M README.md
- M config.example.yaml
- M solver/CMakeLists.txt
- M solver/src/matmul_kernel.hip
- M solver/src/solve_gpu.hip
- M src/amdbtx_miner/config.py
- M src/amdbtx_miner/gbt_solve_wrapper.py
-?? bench_solver.py
+ M .gitignore
+ M src/amdbtx_miner/__main__.py
+?? solver/build-test/
+?? tests/test_pool_visibility_metrics.py
 ```
+
+`solver/build-test/` and `tests/test_pool_visibility_metrics.py` are untracked.
+Solver source files (`solver/src/matmul_kernel.hip`, `solver/src/solve_gpu.hip`,
+`src/amdbtx_miner/gbt_solve_wrapper.py`) are clean — the trust-GPU fix and all
+grouped RHS optimizations are committed in HEAD.
 
 `AGENTS.md` itself may be ignored by git. Do not assume it appears in `git status`.
 

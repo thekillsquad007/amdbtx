@@ -57,6 +57,24 @@ def _expected_shares_from_gate(gate_passes: int, target_hex: str | None) -> floa
     return float(gate_passes) * _target_probability_from_hex(target_hex)
 
 
+def _format_share_eta(gate_per_s: float, target_hex: str | None) -> str:
+    """Format expected wall-clock time to the next share at the observed gate rate."""
+    probability = _target_probability_from_hex(target_hex)
+    shares_per_s = max(float(gate_per_s), 0.0) * probability
+    if shares_per_s <= 0:
+        return "unknown"
+    seconds = 1.0 / shares_per_s
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60.0
+    if hours < 48:
+        return f"{hours:.1f}h"
+    return f"{hours / 24.0:.1f}d"
+
+
 def resolve_solver_path(configured_path: str = "") -> Path:
     if configured_path:
         return Path(configured_path).expanduser()
@@ -305,7 +323,7 @@ def _submit_pool_share(client, solve_job: Job, result: dict, *, solo: bool) -> b
         result.get("is_block"), solve_job.job_id,
         result.get("ntime", solve_job.time),
     )
-    client.submit_share(solve_job, result, wait=solo and bool(result.get("is_block")))
+    client.submit_share(solve_job, result, wait=not solo or bool(result.get("is_block")))
     return True
 
 
@@ -526,6 +544,7 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
             gate_per_s = gate_passes / elapsed if elapsed > 0 else 0.0
             gate_ppm = (gate_passes / tries * 1_000_000) if tries else 0.0
             expected_shares = _expected_shares_from_gate(gate_passes, current_job.target)
+            share_eta = _format_share_eta(gate_per_s, current_job.target)
             if result.get("error"):
                 log.warning("solver error: %s", result["error"])
 
@@ -591,10 +610,10 @@ def run_mining_loop(client, solver: MultiGPUSolver, cfg: dict, *, solo: bool = F
                     nonce_end = current_job.nonce64_start + max(tries - 1, 0)
                 log.info(
                     "solve: nonce=%d nonce_end=%d tries=%d gate=%d gate/s=%.0f "
-                    "gate_ppm=%.2f exp_shares=%.3f elapsed=%.2fs "
+                    "gate_ppm=%.2f exp_shares=%.6f share_eta=%s elapsed=%.2fs "
                     "%s backend=%s%s found=%s shares=%d/%d target=%s%s%s",
                     current_job.nonce64_start, nonce_end, tries, gate_passes, gate_per_s,
-                    gate_ppm, expected_shares, elapsed,
+                    gate_ppm, expected_shares, share_eta, elapsed,
                     khps_line, backend, gpu_tag, result.get("found"), a, r,
                     (current_job.target[:12] if current_job.target else "none"),
                     pool_note, slice_tag,

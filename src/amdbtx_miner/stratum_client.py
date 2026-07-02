@@ -433,11 +433,18 @@ class StratumClient:
     def _dispatch_message(self, msg: dict) -> bool:
         """Route one pool line. Returns True if it was a pending submit response."""
         msg_id = msg.get("id")
+        if isinstance(msg_id, str):
+            try:
+                msg_id = int(msg_id, 10)
+            except ValueError:
+                pass
         if msg_id is not None and msg_id in self._pending_submits:
             self._complete_pending_submit(msg_id, msg)
             return True
         if msg.get("method"):
             self._handle_server_message(msg)
+        elif msg_id is not None:
+            log.debug("unmatched pool response id=%r msg=%r", msg.get("id"), msg)
         return False
 
     def process_available_messages(self) -> int:
@@ -629,14 +636,22 @@ class StratumClient:
         if not wait:
             return
         deadline = time.time() + 30.0
-        while time.time() < deadline:
-            if msg_id not in self._pending_submits:
-                return
-            resp = self._recv()
-            if resp.get("id") == msg_id:
-                self._complete_pending_submit(msg_id, resp)
-                return
-            self._dispatch_message(resp)
+        old_timeout = self.sock.gettimeout() if self.sock is not None else None
+        try:
+            if self.sock is not None:
+                self.sock.settimeout(1.0)
+            while time.time() < deadline:
+                if msg_id not in self._pending_submits:
+                    return
+                try:
+                    resp = self._recv()
+                except socket.timeout:
+                    continue
+                if self._dispatch_message(resp):
+                    return
+        finally:
+            if self.sock is not None:
+                self.sock.settimeout(old_timeout)
         self._pending_submits.pop(msg_id, None)
         log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
 
@@ -682,14 +697,22 @@ class StratumClient:
         if not wait:
             return
         deadline = time.time() + 30.0
-        while time.time() < deadline:
-            if msg_id not in self._pending_submits:
-                return
-            resp = self._recv()
-            if resp.get("id") == msg_id:
-                self._complete_pending_submit(msg_id, resp)
-                return
-            self._dispatch_message(resp)
+        old_timeout = self.sock.gettimeout() if self.sock is not None else None
+        try:
+            if self.sock is not None:
+                self.sock.settimeout(1.0)
+            while time.time() < deadline:
+                if msg_id not in self._pending_submits:
+                    return
+                try:
+                    resp = self._recv()
+                except socket.timeout:
+                    continue
+                if self._dispatch_message(resp):
+                    return
+        finally:
+            if self.sock is not None:
+                self.sock.settimeout(old_timeout)
         self._pending_submits.pop(msg_id, None)
         log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
 
