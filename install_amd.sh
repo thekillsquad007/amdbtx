@@ -30,7 +30,8 @@ fi
 SOURCE_REF="${AMDBTX_SOURCE_REF:-main}"
 SOURCE_REPO="${AMDBTX_SOURCE_REPO:-thekillsquad007/amdbtx}"
 RELEASE_REPO="${AMDBTX_RELEASE_REPO:-thekillsquad007/amdbtx}"
-PREBUILDS_TAG="${PREBUILDS_TAG:-v1.1.9}"
+# Default tag for prebuilt solver assets (overridden via --prebuilds-tag or AMDBTX_PREBUILDS_TAG)
+PREBUILDS_TAG="${AMDBTX_PREBUILDS_TAG:-v1.1.9}"
 PREBUILDS_BASE="${PREBUILDS_BASE:-https://github.com/${RELEASE_REPO}/releases/download/${PREBUILDS_TAG}}"
 WHEEL_FILENAME="${AMDBTX_WHEEL_FILENAME:-amdbtx_miner-1.1.9-py3-none-any.whl}"
 EXPECTED_MINER_VERSION="1.1.9"
