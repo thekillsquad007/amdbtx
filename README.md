@@ -4,7 +4,7 @@ A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on
 [BitMinerPool](https://bitminerpool.xyz), another supported pool, or solo against
 your own `btxd` node.
 
-- **Default pool**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
+- **Default pool**: `stratum+tcp://btx-sg.lproute.com:8660` (LuckyPool)
 - **Solo**: mine directly against a synced `btxd` node
 - **Dev fee**: 2% transparent (time-sliced in pool mode, coinbase split in solo)
 
@@ -38,7 +38,7 @@ bash install_amd.sh --address btx1z... --yes
 bash install_amd.sh --address btx1z... --use-prebuilt --yes
 
 # Custom pool and worker name
-bash install_amd.sh --address btx1z... --worker myrig --pool stratum.bitminerpool.xyz:3333 --yes
+bash install_amd.sh --address btx1z... --worker myrig --pool btx-sg.lproute.com:8660 --yes
 ```
 
 Prebuilt releases: https://github.com/thekillsquad007/amdbtx-releases
@@ -54,8 +54,8 @@ Edit `~/.amdbtx-miner/config.yaml` after install. See
 
 ```yaml
 mining_mode: "pool"
-pool_host: "stratum.bitminerpool.xyz"
-pool_port: 3333
+pool_host: "btx-sg.lproute.com"
+pool_port: 8660
 payout_address: "btx1z..."
 worker_name: "myrig"
 solver_backend: "rocm"
@@ -140,18 +140,20 @@ difficulty is met. A 2% dev fee is taken from the coinbase on each block found
 
 ## Pools
 
-### BitMinerPool (default)
+### LuckyPool (default)
 
-- **Dashboard**: https://bitminerpool.xyz
-- **Stratum**: `stratum+tcp://stratum.bitminerpool.xyz:3333`
-- **Pool fee**: 1% (PPLNS)
+- **Dashboard**: https://luckypool.org
+- **Stratum**: `stratum+tcp://btx-sg.lproute.com:8660`
+- **Pool fee**: 0.5% (PPLNS)
 
-### LuckyPool
+### BitMinerPool
 
-Point your config at a LuckyPool endpoint:
+Point your config at a BitMinerPool endpoint (may need a local proxy):
 
 ```yaml
-pool_host: "btx-sg.lproute.com"
+pool_host: "stratum.bitminerpool.xyz"
+pool_port: 3333
+```
 pool_port: 8660
 ```
 

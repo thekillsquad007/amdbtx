@@ -3,10 +3,10 @@
 # Mining mode: "pool" (stratum) or "solo" (local btxd node)
 mining_mode: "pool"
 
-pool_host: "stratum.bitminerpool.xyz"
-pool_port: 3333
+pool_host: "btx-sg.lproute.com"
+pool_port: 8660
 pool_tls: false
-# pool_protocol: auto   # stratum on BitMinerPool; LuckyPool only on lproute.com hosts
+# pool_protocol: auto   # LuckyPool auto-detected; BitMinerPool needs --pool or proxy
 
 payout_address: "btx1z...YOUR_BTX_ADDRESS_HERE..."
 worker_name: "default"
