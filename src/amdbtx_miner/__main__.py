@@ -270,8 +270,10 @@ def _drain_pool_messages(client) -> None:
     if hasattr(client, "process_available_messages"):
         try:
             client.process_available_messages()
-        except Exception:
+        except (BlockingIOError, TimeoutError):
             pass
+        except ConnectionError:
+            raise
         return
     if not getattr(client, "sock", None):
         return
@@ -284,10 +286,12 @@ def _drain_pool_messages(client) -> None:
                     client._dispatch_message(msg)
                 else:
                     client._handle_server_message(msg)
-        except (BlockingIOError, ConnectionError):
+        except BlockingIOError:
             pass
         finally:
             client.sock.setblocking(True)
+    except ConnectionError:
+        raise
     except Exception:
         pass
 

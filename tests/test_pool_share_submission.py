@@ -1,6 +1,8 @@
 import time
 from collections import deque
 
+import pytest
+
 from amdbtx_miner.__main__ import _solve_slice_continuous, _submitted_share_keys
 from amdbtx_miner.config import validate_config
 from amdbtx_miner.gbt_solve_wrapper import MultiGPUSolver
@@ -64,6 +66,20 @@ class DummyInnerSolver:
             "tries_used": max_tries,
             "elapsed_s": 2.0,
         }
+
+
+class ClosedSocket:
+    def gettimeout(self):
+        return None
+
+    def setblocking(self, flag):
+        self.blocking = flag
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def recv(self, size):
+        return b""
 
 
 def _job():
@@ -146,6 +162,15 @@ def test_single_gpu_solver_derives_observed_nps_when_child_metric_missing():
     solver.solve(_job(), nonce_start=0, max_tries=1000, max_seconds=1.0)
 
     assert solver.last_observed_nps == 500.0
+
+
+def test_nonblocking_drain_propagates_closed_pool_socket():
+    client = StratumClient.__new__(StratumClient)
+    client.sock = ClosedSocket()
+    client._buf = b""
+
+    with pytest.raises(ConnectionError):
+        client.process_available_messages()
 
 
 def test_submit_response_rejects_luckypool_nonce_size_error():

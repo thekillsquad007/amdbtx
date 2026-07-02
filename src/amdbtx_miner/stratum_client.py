@@ -538,7 +538,7 @@ class StratumClient:
             while True:
                 try:
                     msg = self._recv()
-                except (BlockingIOError, ConnectionError):
+                except BlockingIOError:
                     break
                 self._dispatch_message(msg)
                 count += 1
@@ -803,7 +803,7 @@ class StratumClient:
             if self.sock is not None:
                 self.sock.settimeout(old_timeout)
         self._pending_submits.pop(msg_id, None)
-        log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_hex)
+        log.warning("submit timed out job=%s nonce=%s", job.job_id, nonce_text)
 
     def _prune_accepted_share_events(self, cutoff: float) -> None:
         while self._accepted_share_events and self._accepted_share_events[0][0] < cutoff:
