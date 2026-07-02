@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1756,6 +1757,57 @@ __global__ void batch_perturb_matrix_512x8_kernel(
         static_cast<uint32_t>(d_reduce64(acc)));
 }
 
+__global__ void batch_generate_perturb_matrix_512x8_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t tile_start =
+        static_cast<size_t>(blockIdx.x) * blockDim.x;
+    const size_t gid = tile_start + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = tile_start >> 18U;
+    const uint32_t local_base =
+        static_cast<uint32_t>(tile_start & (kMatrixElements - 1U));
+    const uint32_t local_index = local_base + threadIdx.x;
+    const uint32_t row = local_index >> 9U;
+    const uint32_t col = local_index & (kN - 1U);
+
+    const uint8_t* seed = seeds + batch_index * 32U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    __syncthreads();
+
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+        acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+               right[k * kN + col];
+        if ((k & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    const uint32_t base =
+        d_from_oracle_midstate(s_midstate, seed, local_index);
+    output[gid] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+}
+
 // One workgroup per output word. Threads map to the 16x16 compression
 // coordinates and accumulate all 32 inner blocks for that word.
 __global__ void batch_compressed_words_kernel(
@@ -1893,6 +1945,890 @@ __global__ void batch_compressed_words_512x16_kernel(
     }
 }
 
+__global__ void batch_build_factored_rhs_512x16_kernel(
+    const uint32_t* __restrict__ matrix_b,
+    const uint32_t* __restrict__ compress,
+    size_t total_elements,
+    uint32_t* __restrict__ rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid >> 18U;
+    const uint32_t local = static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+    const uint32_t m = local & (kN - 1U);
+    const uint32_t jx = local >> 9U;
+    const uint32_t x = jx & (kB - 1U);
+    const uint32_t j = jx >> 4U;
+
+    const uint32_t* B = matrix_b + batch_index * kMatrixElements;
+    const uint32_t* W = compress + (batch_index << 8U) + (x << 4U);
+    const uint32_t* b_row = B + static_cast<size_t>(m) * kN + j * kB;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t y = 0; y < kB; ++y) {
+        acc += static_cast<uint64_t>(W[y]) * b_row[y];
+        if ((y & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    rhs[gid] = static_cast<uint32_t>(d_reduce64(acc));
+}
+
+__global__ void batch_build_right_noise_rhs_512x16x8_kernel(
+    const uint32_t* __restrict__ noise_fr,
+    const uint32_t* __restrict__ compress,
+    size_t total_elements,
+    uint32_t* __restrict__ right_rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr size_t kNoiseElements = size_t{kR} * kN;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid >> 12U;
+    const uint32_t local = static_cast<uint32_t>(gid & 4095U);
+    const uint32_t k = local & (kR - 1U);
+    const uint32_t x = (local >> 3U) & (kB - 1U);
+    const uint32_t j = local >> 7U;
+
+    const uint32_t* FR = noise_fr + batch_index * kNoiseElements;
+    const uint32_t* W = compress + (batch_index << 8U) + (x << 4U);
+    const uint32_t* fr_row = FR + k * kN + j * kB;
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t y = 0; y < kB; ++y) {
+        acc += static_cast<uint64_t>(W[y]) * fr_row[y];
+        if ((y & 3U) == 3U) {
+            acc = d_reduce64(acc);
+        }
+    }
+    right_rhs[gid] = static_cast<uint32_t>(d_reduce64(acc));
+}
+
+__global__ void batch_build_right_noise_rhs_grouped_512x16x8_kernel(
+    const uint32_t* __restrict__ noise_fr,
+    const uint32_t* __restrict__ compress,
+    size_t total_pairs,
+    uint32_t* __restrict__ right_rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr uint32_t kPairsPerNonce = 32U * kB;
+    constexpr size_t kNoiseElements = size_t{kR} * kN;
+    constexpr size_t kRightRhsElements = 32U * kB * kR;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_pairs) {
+        return;
+    }
+
+    const size_t batch_index = gid / kPairsPerNonce;
+    const uint32_t local = static_cast<uint32_t>(gid & (kPairsPerNonce - 1U));
+    const uint32_t x = local & (kB - 1U);
+    const uint32_t j = local >> 4U;
+
+    const uint32_t* FR = noise_fr + batch_index * kNoiseElements;
+    const uint32_t* W = compress + (batch_index << 8U) + (x << 4U);
+
+    uint64_t acc0 = 0;
+    uint64_t acc1 = 0;
+    uint64_t acc2 = 0;
+    uint64_t acc3 = 0;
+    uint64_t acc4 = 0;
+    uint64_t acc5 = 0;
+    uint64_t acc6 = 0;
+    uint64_t acc7 = 0;
+
+    #pragma unroll
+    for (uint32_t y = 0; y < kB; ++y) {
+        const uint64_t w = W[y];
+        const uint32_t col = (j << 4U) + y;
+        acc0 += w * FR[col];
+        acc1 += w * FR[kN + col];
+        acc2 += w * FR[2U * kN + col];
+        acc3 += w * FR[3U * kN + col];
+        acc4 += w * FR[4U * kN + col];
+        acc5 += w * FR[5U * kN + col];
+        acc6 += w * FR[6U * kN + col];
+        acc7 += w * FR[7U * kN + col];
+        if ((y & 3U) == 3U) {
+            acc0 = d_reduce64(acc0);
+            acc1 = d_reduce64(acc1);
+            acc2 = d_reduce64(acc2);
+            acc3 = d_reduce64(acc3);
+            acc4 = d_reduce64(acc4);
+            acc5 = d_reduce64(acc5);
+            acc6 = d_reduce64(acc6);
+            acc7 = d_reduce64(acc7);
+        }
+    }
+
+    uint32_t* out = right_rhs + batch_index * kRightRhsElements +
+        ((j << 4U) + x) * kR;
+    out[0] = static_cast<uint32_t>(d_reduce64(acc0));
+    out[1] = static_cast<uint32_t>(d_reduce64(acc1));
+    out[2] = static_cast<uint32_t>(d_reduce64(acc2));
+    out[3] = static_cast<uint32_t>(d_reduce64(acc3));
+    out[4] = static_cast<uint32_t>(d_reduce64(acc4));
+    out[5] = static_cast<uint32_t>(d_reduce64(acc5));
+    out[6] = static_cast<uint32_t>(d_reduce64(acc6));
+    out[7] = static_cast<uint32_t>(d_reduce64(acc7));
+}
+
+__global__ void batch_build_factored_rhs_direct_512x16x8_kernel(
+    const uint32_t* __restrict__ base_b,
+    const uint32_t* __restrict__ noise_fl,
+    const uint32_t* __restrict__ right_rhs,
+    const uint32_t* __restrict__ compress,
+    size_t total_elements,
+    uint32_t* __restrict__ rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseLeftElements = size_t{kN} * kR;
+    constexpr size_t kRightRhsElements = 32U * kB * kR;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid >> 18U;
+    const uint32_t local = static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+    const uint32_t m = local & (kN - 1U);
+    const uint32_t jx = local >> 9U;
+    const uint32_t x = jx & (kB - 1U);
+    const uint32_t j = jx >> 4U;
+
+    const uint32_t* B = base_b + batch_index * kMatrixElements;
+    const uint32_t* FL = noise_fl + batch_index * kNoiseLeftElements;
+    const uint32_t* RR = right_rhs + batch_index * kRightRhsElements;
+    const uint32_t* W = compress + (batch_index << 8U) + (x << 4U);
+    const uint32_t* b_row = B + static_cast<size_t>(m) * kN + j * kB;
+    const uint32_t* fl_row = FL + static_cast<size_t>(m) * kR;
+    const uint32_t* rr_row = RR + ((j << 4U) + x) * kR;
+
+    uint64_t acc = 0;
+    uint32_t pending = 0;
+    #pragma unroll
+    for (uint32_t y = 0; y < kB; ++y) {
+        acc += static_cast<uint64_t>(W[y]) * b_row[y];
+        if (++pending == kReduceInterval) {
+            acc = d_reduce64(acc);
+            pending = 0;
+        }
+    }
+    #pragma unroll
+    for (uint32_t k = 0; k < kR; ++k) {
+        acc += static_cast<uint64_t>(fl_row[k]) * rr_row[k];
+        if (++pending == kReduceInterval) {
+            acc = d_reduce64(acc);
+            pending = 0;
+        }
+    }
+    rhs[gid] = static_cast<uint32_t>(d_reduce64(acc));
+}
+
+__global__ void batch_build_factored_rhs_fused_b_512x16x8_kernel(
+    const uint8_t* __restrict__ seed_b,
+    const uint32_t* __restrict__ seed_b_midstates,
+    const uint32_t* __restrict__ noise_fl,
+    const uint32_t* __restrict__ right_rhs,
+    const uint32_t* __restrict__ compress,
+    uint32_t* __restrict__ rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseLeftElements = size_t{kN} * kR;
+    constexpr size_t kRightRhsElements = kBlocksPerAxis * kB * kR;
+    constexpr uint32_t kTilesPerNonce = kBlocksPerAxis * kBlocksPerAxis;
+
+    __shared__ uint32_t s_midstate[16];
+    __shared__ uint32_t s_b[kB][kB];
+
+    const uint32_t tile = blockIdx.x;
+    const uint32_t batch_index = tile / kTilesPerNonce;
+    const uint32_t local_tile = tile & (kTilesPerNonce - 1U);
+    const uint32_t j = local_tile >> 5U;
+    const uint32_t m_tile = local_tile & (kBlocksPerAxis - 1U);
+    const uint32_t tid = threadIdx.x;
+
+    const uint8_t* seed = seed_b + static_cast<size_t>(batch_index) * 32U;
+    if (tid < 16U) {
+        s_midstate[tid] =
+            seed_b_midstates[static_cast<size_t>(batch_index) * 16U + tid];
+    }
+    __syncthreads();
+
+    const uint32_t b_local_m = tid >> 4U;
+    const uint32_t y = tid & (kB - 1U);
+    const uint32_t m_for_b = (m_tile << 4U) + b_local_m;
+    const uint32_t b_index = m_for_b * kN + (j << 4U) + y;
+    s_b[b_local_m][y] = d_from_oracle_midstate(s_midstate, seed, b_index);
+    __syncthreads();
+
+    const uint32_t x = tid >> 4U;
+    const uint32_t m_local = tid & (kB - 1U);
+    const uint32_t m = (m_tile << 4U) + m_local;
+    const uint32_t* W = compress + (static_cast<size_t>(batch_index) << 8U) + (x << 4U);
+    const uint32_t* FL = noise_fl + static_cast<size_t>(batch_index) * kNoiseLeftElements;
+    const uint32_t* RR = right_rhs + static_cast<size_t>(batch_index) * kRightRhsElements;
+    const uint32_t* fl_row = FL + static_cast<size_t>(m) * kR;
+    const uint32_t* rr_row = RR + ((j << 4U) + x) * kR;
+
+    uint64_t acc = 0;
+    uint32_t pending = 0;
+    #pragma unroll
+    for (uint32_t yy = 0; yy < kB; ++yy) {
+        acc += static_cast<uint64_t>(W[yy]) * s_b[m_local][yy];
+        if (++pending == kReduceInterval) {
+            acc = d_reduce64(acc);
+            pending = 0;
+        }
+    }
+    #pragma unroll
+    for (uint32_t k = 0; k < kR; ++k) {
+        acc += static_cast<uint64_t>(fl_row[k]) * rr_row[k];
+        if (++pending == kReduceInterval) {
+            acc = d_reduce64(acc);
+            pending = 0;
+        }
+    }
+
+    const size_t out_index =
+        static_cast<size_t>(batch_index) * kMatrixElements +
+        static_cast<size_t>((j << 4U) + x) * kN + m;
+    rhs[out_index] = static_cast<uint32_t>(d_reduce64(acc));
+}
+
+__global__ void batch_factored_words_512x16_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ rhs,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr uint32_t kTilesPerAxis = 16;
+    constexpr uint32_t kTilesPerNonce = kTilesPerAxis * kTilesPerAxis;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    __shared__ uint64_t partials[256][4];
+
+    const uint32_t global_tile = blockIdx.x;
+    const uint32_t batch_index = global_tile / kTilesPerNonce;
+    const uint32_t tile_index = global_tile & (kTilesPerNonce - 1U);
+    const uint32_t j0 = (tile_index & (kTilesPerAxis - 1U)) << 1U;
+    const uint32_t i0 = (tile_index >> 4U) << 1U;
+    const uint32_t tid = threadIdx.x;
+
+    const uint32_t* A = matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* D = rhs + static_cast<size_t>(batch_index) * kMatrixElements;
+
+    uint64_t acc00 = 0;
+    uint64_t acc01 = 0;
+    uint64_t acc10 = 0;
+    uint64_t acc11 = 0;
+    uint32_t pending = 0;
+    for (uint32_t idx = tid; idx < kB * kN; idx += blockDim.x) {
+        const uint32_t x = idx >> 9U;
+        const uint32_t m = idx & (kN - 1U);
+        const uint32_t* a_row0 = A + static_cast<size_t>(i0 * kB + x) * kN;
+        const uint32_t* a_row1 = a_row0 + static_cast<size_t>(kB) * kN;
+        const uint32_t* d_row0 = D + static_cast<size_t>(j0 * kB + x) * kN;
+        const uint32_t* d_row1 = d_row0 + static_cast<size_t>(kB) * kN;
+        const uint64_t a0 = a_row0[m];
+        const uint64_t a1 = a_row1[m];
+        const uint64_t d0 = d_row0[m];
+        const uint64_t d1 = d_row1[m];
+        acc00 += a0 * d0;
+        acc01 += a0 * d1;
+        acc10 += a1 * d0;
+        acc11 += a1 * d1;
+        if (++pending == kReduceInterval) {
+            acc00 = d_reduce64(acc00);
+            acc01 = d_reduce64(acc01);
+            acc10 = d_reduce64(acc10);
+            acc11 = d_reduce64(acc11);
+            pending = 0;
+        }
+    }
+
+    partials[tid][0] = d_reduce64(acc00);
+    partials[tid][1] = d_reduce64(acc01);
+    partials[tid][2] = d_reduce64(acc10);
+    partials[tid][3] = d_reduce64(acc11);
+    __syncthreads();
+
+    for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
+        if (tid < stride) {
+            partials[tid][0] += partials[tid + stride][0];
+            partials[tid][1] += partials[tid + stride][1];
+            partials[tid][2] += partials[tid + stride][2];
+            partials[tid][3] += partials[tid + stride][3];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const size_t out_base = (static_cast<size_t>(batch_index) << 10U);
+        output[out_base + i0 * kBlocksPerAxis + j0] =
+            static_cast<uint32_t>(d_reduce64(partials[0][0]));
+        output[out_base + i0 * kBlocksPerAxis + j0 + 1U] =
+            static_cast<uint32_t>(d_reduce64(partials[0][1]));
+        output[out_base + (i0 + 1U) * kBlocksPerAxis + j0] =
+            static_cast<uint32_t>(d_reduce64(partials[0][2]));
+        output[out_base + (i0 + 1U) * kBlocksPerAxis + j0 + 1U] =
+            static_cast<uint32_t>(d_reduce64(partials[0][3]));
+    }
+}
+
+__global__ void batch_factored_words_wmma_512x16_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ rhs,
+    uint32_t* __restrict__ output)
+{
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__) || defined(__gfx1153__)
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr uint32_t kK = kB * kN;
+    constexpr uint32_t kTileCount = 4;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr uint32_t kWeights[7] = {
+        1U, 256U, 65536U, 16777216U, 2U, 512U, 131072U};
+
+    using i32x4 = int __attribute__((ext_vector_type(4)));
+    using i32x8 = int __attribute__((ext_vector_type(8)));
+
+    const uint32_t global_tile = blockIdx.x;
+    const uint32_t batch_index = global_tile / kTileCount;
+    const uint32_t tile_index = global_tile & (kTileCount - 1U);
+    const uint32_t row_base = (tile_index >> 1U) << 4U;
+    const uint32_t col_base = (tile_index & 1U) << 4U;
+    const uint32_t lane = threadIdx.x & 15U;
+    const uint32_t lane_group = threadIdx.x >> 4U;
+
+    const uint32_t* A = matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* D = rhs + static_cast<size_t>(batch_index) * kMatrixElements;
+    uint64_t acc[8] = {};
+
+    #pragma unroll
+    for (uint32_t limb_a = 0; limb_a < 4; ++limb_a) {
+        #pragma unroll
+        for (uint32_t limb_b = 0; limb_b < 4; ++limb_b) {
+            i32x8 frag_c = {};
+            for (uint32_t k0 = 0; k0 < kK; k0 += 16U) {
+                i32x4 frag_a;
+                i32x4 frag_b;
+                #pragma unroll
+                for (uint32_t pack = 0; pack < 4; ++pack) {
+                    uint32_t packed_a = 0;
+                    uint32_t packed_b = 0;
+                    #pragma unroll
+                    for (uint32_t q = 0; q < 4; ++q) {
+                        const uint32_t kk = k0 + pack * 4U + q;
+                        const uint32_t x = kk >> 9U;
+                        const uint32_t m = kk & (kN - 1U);
+                        const uint32_t a_val = A[static_cast<size_t>((row_base + lane) * kB + x) * kN + m];
+                        const uint32_t d_val = D[static_cast<size_t>((col_base + lane) * kB + x) * kN + m];
+                        const uint32_t a_limb = (a_val >> (limb_a * 8U)) & (limb_a == 3U ? 0x7fU : 0xffU);
+                        const uint32_t b_limb = (d_val >> (limb_b * 8U)) & (limb_b == 3U ? 0x7fU : 0xffU);
+                        packed_a |= a_limb << (q * 8U);
+                        packed_b |= b_limb << (q * 8U);
+                    }
+                    frag_a[pack] = static_cast<int>(packed_a);
+                    frag_b[pack] = static_cast<int>(packed_b);
+                }
+                frag_c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    false, frag_a, false, frag_b, frag_c, false);
+            }
+
+            const uint64_t weight = kWeights[limb_a + limb_b];
+            #pragma unroll
+            for (uint32_t e = 0; e < 8; ++e) {
+                acc[e] += weight * static_cast<uint32_t>(frag_c[e]);
+                acc[e] = d_reduce64(acc[e]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t e = 0; e < 8; ++e) {
+        const uint32_t row = row_base + e * 2U + lane_group;
+        const uint32_t col = col_base + lane;
+        output[(static_cast<size_t>(batch_index) << 10U) + row * kBlocksPerAxis + col] =
+            static_cast<uint32_t>(d_reduce64(acc[e]));
+    }
+#endif
+}
+
+__global__ void batch_factored_words_wmma_partial_512x16_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ rhs,
+    uint32_t* __restrict__ partials)
+{
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__) || defined(__gfx1153__)
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kK = kB * kN;
+    constexpr uint32_t kTileCount = 4;
+    constexpr uint32_t kGroups = 64;
+    constexpr uint32_t kGroupK = kK / kGroups;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr uint32_t kWeights[7] = {
+        1U, 256U, 65536U, 16777216U, 2U, 512U, 131072U};
+
+    using i32x4 = int __attribute__((ext_vector_type(4)));
+    using i32x8 = int __attribute__((ext_vector_type(8)));
+
+    const uint32_t global = blockIdx.x;
+    const uint32_t group = global & (kGroups - 1U);
+    const uint32_t tile_global = global >> 6U;
+    const uint32_t batch_index = tile_global / kTileCount;
+    const uint32_t tile_index = tile_global & (kTileCount - 1U);
+    const uint32_t row_base = (tile_index >> 1U) << 4U;
+    const uint32_t col_base = (tile_index & 1U) << 4U;
+    const uint32_t lane = threadIdx.x & 15U;
+    const uint32_t lane_group = threadIdx.x >> 4U;
+
+    const uint32_t* A = matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* D = rhs + static_cast<size_t>(batch_index) * kMatrixElements;
+    uint64_t acc[8] = {};
+    const uint32_t k_begin = group * kGroupK;
+    const uint32_t k_end = k_begin + kGroupK;
+
+    i32x8 frag_c00 = {};
+    i32x8 frag_c01 = {};
+    i32x8 frag_c02 = {};
+    i32x8 frag_c03 = {};
+    i32x8 frag_c10 = {};
+    i32x8 frag_c11 = {};
+    i32x8 frag_c12 = {};
+    i32x8 frag_c13 = {};
+    i32x8 frag_c20 = {};
+    i32x8 frag_c21 = {};
+    i32x8 frag_c22 = {};
+    i32x8 frag_c23 = {};
+    i32x8 frag_c30 = {};
+    i32x8 frag_c31 = {};
+    i32x8 frag_c32 = {};
+    i32x8 frag_c33 = {};
+    for (uint32_t k0 = k_begin; k0 < k_end; k0 += 16U) {
+        i32x4 frag_a0;
+        i32x4 frag_a1;
+        i32x4 frag_a2;
+        i32x4 frag_a3;
+        i32x4 frag_b0;
+        i32x4 frag_b1;
+        i32x4 frag_b2;
+        i32x4 frag_b3;
+        #pragma unroll
+        for (uint32_t pack = 0; pack < 4; ++pack) {
+            uint32_t packed_a0 = 0;
+            uint32_t packed_a1 = 0;
+            uint32_t packed_a2 = 0;
+            uint32_t packed_a3 = 0;
+            uint32_t packed_b0 = 0;
+            uint32_t packed_b1 = 0;
+            uint32_t packed_b2 = 0;
+            uint32_t packed_b3 = 0;
+            #pragma unroll
+            for (uint32_t q = 0; q < 4; ++q) {
+                const uint32_t kk = k0 + pack * 4U + q;
+                const uint32_t x = kk >> 9U;
+                const uint32_t m = kk & (kN - 1U);
+                const uint32_t a_val = A[static_cast<size_t>((row_base + lane) * kB + x) * kN + m];
+                const uint32_t d_val = D[static_cast<size_t>((col_base + lane) * kB + x) * kN + m];
+                const uint32_t shift = q * 8U;
+                packed_a0 |= ((a_val & 0xffU) << shift);
+                packed_a1 |= (((a_val >> 8U) & 0xffU) << shift);
+                packed_a2 |= (((a_val >> 16U) & 0xffU) << shift);
+                packed_a3 |= (((a_val >> 24U) & 0x7fU) << shift);
+                packed_b0 |= ((d_val & 0xffU) << shift);
+                packed_b1 |= (((d_val >> 8U) & 0xffU) << shift);
+                packed_b2 |= (((d_val >> 16U) & 0xffU) << shift);
+                packed_b3 |= (((d_val >> 24U) & 0x7fU) << shift);
+            }
+            frag_a0[pack] = static_cast<int>(packed_a0);
+            frag_a1[pack] = static_cast<int>(packed_a1);
+            frag_a2[pack] = static_cast<int>(packed_a2);
+            frag_a3[pack] = static_cast<int>(packed_a3);
+            frag_b0[pack] = static_cast<int>(packed_b0);
+            frag_b1[pack] = static_cast<int>(packed_b1);
+            frag_b2[pack] = static_cast<int>(packed_b2);
+            frag_b3[pack] = static_cast<int>(packed_b3);
+        }
+        frag_c00 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a0, false, frag_b0, frag_c00, false);
+        frag_c01 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a0, false, frag_b1, frag_c01, false);
+        frag_c02 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a0, false, frag_b2, frag_c02, false);
+        frag_c03 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a0, false, frag_b3, frag_c03, false);
+        frag_c10 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a1, false, frag_b0, frag_c10, false);
+        frag_c11 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a1, false, frag_b1, frag_c11, false);
+        frag_c12 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a1, false, frag_b2, frag_c12, false);
+        frag_c13 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a1, false, frag_b3, frag_c13, false);
+        frag_c20 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a2, false, frag_b0, frag_c20, false);
+        frag_c21 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a2, false, frag_b1, frag_c21, false);
+        frag_c22 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a2, false, frag_b2, frag_c22, false);
+        frag_c23 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a2, false, frag_b3, frag_c23, false);
+        frag_c30 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a3, false, frag_b0, frag_c30, false);
+        frag_c31 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a3, false, frag_b1, frag_c31, false);
+        frag_c32 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a3, false, frag_b2, frag_c32, false);
+        frag_c33 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, frag_a3, false, frag_b3, frag_c33, false);
+    }
+
+    #pragma unroll
+    for (uint32_t e = 0; e < 8; ++e) {
+        acc[e] += static_cast<uint32_t>(frag_c00[e]) * static_cast<uint64_t>(kWeights[0]);
+        acc[e] += static_cast<uint32_t>(frag_c01[e]) * static_cast<uint64_t>(kWeights[1]);
+        acc[e] += static_cast<uint32_t>(frag_c02[e]) * static_cast<uint64_t>(kWeights[2]);
+        acc[e] += static_cast<uint32_t>(frag_c03[e]) * static_cast<uint64_t>(kWeights[3]);
+        acc[e] += static_cast<uint32_t>(frag_c10[e]) * static_cast<uint64_t>(kWeights[1]);
+        acc[e] += static_cast<uint32_t>(frag_c11[e]) * static_cast<uint64_t>(kWeights[2]);
+        acc[e] += static_cast<uint32_t>(frag_c12[e]) * static_cast<uint64_t>(kWeights[3]);
+        acc[e] += static_cast<uint32_t>(frag_c13[e]) * static_cast<uint64_t>(kWeights[4]);
+        acc[e] += static_cast<uint32_t>(frag_c20[e]) * static_cast<uint64_t>(kWeights[2]);
+        acc[e] += static_cast<uint32_t>(frag_c21[e]) * static_cast<uint64_t>(kWeights[3]);
+        acc[e] += static_cast<uint32_t>(frag_c22[e]) * static_cast<uint64_t>(kWeights[4]);
+        acc[e] += static_cast<uint32_t>(frag_c23[e]) * static_cast<uint64_t>(kWeights[5]);
+        acc[e] += static_cast<uint32_t>(frag_c30[e]) * static_cast<uint64_t>(kWeights[3]);
+        acc[e] += static_cast<uint32_t>(frag_c31[e]) * static_cast<uint64_t>(kWeights[4]);
+        acc[e] += static_cast<uint32_t>(frag_c32[e]) * static_cast<uint64_t>(kWeights[5]);
+        acc[e] += static_cast<uint32_t>(frag_c33[e]) * static_cast<uint64_t>(kWeights[6]);
+        acc[e] = d_reduce64(acc[e]);
+    }
+
+    const size_t partial_base =
+        (((static_cast<size_t>(batch_index) * kTileCount + tile_index) * kGroups + group) << 8U);
+    #pragma unroll
+    for (uint32_t e = 0; e < 8; ++e) {
+        const uint32_t local_row = e * 2U + lane_group;
+        partials[partial_base + local_row * 16U + lane] =
+            static_cast<uint32_t>(d_reduce64(acc[e]));
+    }
+#endif
+}
+
+__global__ void batch_reduce_wmma_partials_512x16_kernel(
+    const uint32_t* __restrict__ partials,
+    size_t total_words,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr uint32_t kTileCount = 4;
+    constexpr uint32_t kGroups = 64;
+    constexpr uint32_t kWordsPerNonce = 1024;
+    constexpr uint32_t kWordsPerTile = 256;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_words) {
+        return;
+    }
+    const size_t batch_index = gid >> 10U;
+    const uint32_t word = static_cast<uint32_t>(gid & (kWordsPerNonce - 1U));
+    const uint32_t row = word >> 5U;
+    const uint32_t col = word & 31U;
+    const uint32_t tile = ((row >> 4U) << 1U) | (col >> 4U);
+    const uint32_t local = ((row & 15U) << 4U) | (col & 15U);
+
+    uint64_t acc = 0;
+    #pragma unroll
+    for (uint32_t group = 0; group < kGroups; ++group) {
+        const size_t idx =
+            (((static_cast<size_t>(batch_index) * kTileCount + tile) * kGroups + group) *
+             kWordsPerTile) + local;
+        acc += partials[idx];
+        acc = d_reduce64(acc);
+    }
+    output[batch_index * kWordsPerNonce + row * kBlocksPerAxis + col] =
+        static_cast<uint32_t>(d_reduce64(acc));
+}
+
+__global__ void batch_build_left_noise_projection_512x16x8_kernel(
+    const uint32_t* __restrict__ noise_er,
+    const uint32_t* __restrict__ rhs,
+    size_t total_elements,
+    uint32_t* __restrict__ left_proj)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr size_t kNoiseRightElements = size_t{kR} * kN;
+    constexpr size_t kRhsElements = size_t{kN} * kN;
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid >> 12U;
+    const uint32_t local = static_cast<uint32_t>(gid & 4095U);
+    const uint32_t k = local & (kR - 1U);
+    const uint32_t x = (local >> 3U) & (kB - 1U);
+    const uint32_t j = local >> 7U;
+
+    const uint32_t* ER = noise_er + batch_index * kNoiseRightElements;
+    const uint32_t* D = rhs + batch_index * kRhsElements;
+    const uint32_t* er_row = ER + k * kN;
+    const uint32_t* d_row = D + ((j << 4U) + x) * kN;
+
+    uint64_t acc = 0;
+    uint32_t pending = 0;
+    for (uint32_t m = 0; m < kN; ++m) {
+        acc += static_cast<uint64_t>(er_row[m]) * d_row[m];
+        if (++pending == kReduceInterval) {
+            acc = d_reduce64(acc);
+            pending = 0;
+        }
+    }
+    left_proj[gid] = static_cast<uint32_t>(d_reduce64(acc));
+}
+
+__global__ void batch_factored_words_direct_a_512x16x8_kernel(
+    const uint32_t* __restrict__ base_a,
+    const uint32_t* __restrict__ noise_el,
+    const uint32_t* __restrict__ left_proj,
+    const uint32_t* __restrict__ rhs,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr uint32_t kTilesPerAxis = 16;
+    constexpr uint32_t kTilesPerNonce = kTilesPerAxis * kTilesPerAxis;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseLeftElements = size_t{kN} * kR;
+    constexpr size_t kLeftProjElements = 32U * kB * kR;
+    __shared__ uint64_t partials[256][4];
+
+    const uint32_t global_tile = blockIdx.x;
+    const uint32_t batch_index = global_tile / kTilesPerNonce;
+    const uint32_t tile_index = global_tile & (kTilesPerNonce - 1U);
+    const uint32_t j0 = (tile_index & (kTilesPerAxis - 1U)) << 1U;
+    const uint32_t i0 = (tile_index >> 4U) << 1U;
+    const uint32_t tid = threadIdx.x;
+
+    const uint32_t* A = base_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* EL = noise_el + static_cast<size_t>(batch_index) * kNoiseLeftElements;
+    const uint32_t* LP = left_proj + static_cast<size_t>(batch_index) * kLeftProjElements;
+    const uint32_t* D = rhs + static_cast<size_t>(batch_index) * kMatrixElements;
+
+    uint64_t acc00 = 0;
+    uint64_t acc01 = 0;
+    uint64_t acc10 = 0;
+    uint64_t acc11 = 0;
+    uint32_t pending = 0;
+    for (uint32_t idx = tid; idx < kB * kN; idx += blockDim.x) {
+        const uint32_t x = idx >> 9U;
+        const uint32_t m = idx & (kN - 1U);
+        const uint32_t* a_row0 = A + static_cast<size_t>(i0 * kB + x) * kN;
+        const uint32_t* a_row1 = a_row0 + static_cast<size_t>(kB) * kN;
+        const uint32_t* d_row0 = D + static_cast<size_t>(j0 * kB + x) * kN;
+        const uint32_t* d_row1 = d_row0 + static_cast<size_t>(kB) * kN;
+        const uint64_t a0 = a_row0[m];
+        const uint64_t a1 = a_row1[m];
+        const uint64_t d0 = d_row0[m];
+        const uint64_t d1 = d_row1[m];
+        acc00 += a0 * d0;
+        acc01 += a0 * d1;
+        acc10 += a1 * d0;
+        acc11 += a1 * d1;
+        if (++pending == kReduceInterval) {
+            acc00 = d_reduce64(acc00);
+            acc01 = d_reduce64(acc01);
+            acc10 = d_reduce64(acc10);
+            acc11 = d_reduce64(acc11);
+            pending = 0;
+        }
+    }
+    for (uint32_t idx = tid; idx < kB * kR; idx += blockDim.x) {
+        const uint32_t x = idx >> 3U;
+        const uint32_t k = idx & (kR - 1U);
+        const uint32_t el0 = EL[static_cast<size_t>(i0 * kB + x) * kR + k];
+        const uint32_t el1 = EL[static_cast<size_t>((i0 + 1U) * kB + x) * kR + k];
+        const uint32_t lp0 = LP[((j0 << 4U) + x) * kR + k];
+        const uint32_t lp1 = LP[(((j0 + 1U) << 4U) + x) * kR + k];
+        acc00 += static_cast<uint64_t>(el0) * lp0;
+        acc01 += static_cast<uint64_t>(el0) * lp1;
+        acc10 += static_cast<uint64_t>(el1) * lp0;
+        acc11 += static_cast<uint64_t>(el1) * lp1;
+        if (++pending == kReduceInterval) {
+            acc00 = d_reduce64(acc00);
+            acc01 = d_reduce64(acc01);
+            acc10 = d_reduce64(acc10);
+            acc11 = d_reduce64(acc11);
+            pending = 0;
+        }
+    }
+
+    partials[tid][0] = d_reduce64(acc00);
+    partials[tid][1] = d_reduce64(acc01);
+    partials[tid][2] = d_reduce64(acc10);
+    partials[tid][3] = d_reduce64(acc11);
+    __syncthreads();
+
+    for (uint32_t stride = 128; stride > 0; stride >>= 1U) {
+        if (tid < stride) {
+            partials[tid][0] += partials[tid + stride][0];
+            partials[tid][1] += partials[tid + stride][1];
+            partials[tid][2] += partials[tid + stride][2];
+            partials[tid][3] += partials[tid + stride][3];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const size_t out_base = (static_cast<size_t>(batch_index) << 10U);
+        output[out_base + i0 * kBlocksPerAxis + j0] =
+            static_cast<uint32_t>(d_reduce64(partials[0][0]));
+        output[out_base + i0 * kBlocksPerAxis + j0 + 1U] =
+            static_cast<uint32_t>(d_reduce64(partials[0][1]));
+        output[out_base + (i0 + 1U) * kBlocksPerAxis + j0] =
+            static_cast<uint32_t>(d_reduce64(partials[0][2]));
+        output[out_base + (i0 + 1U) * kBlocksPerAxis + j0 + 1U] =
+            static_cast<uint32_t>(d_reduce64(partials[0][3]));
+    }
+}
+
+__global__ void batch_generate_matrix_midstate_512_kernel(
+    const uint8_t* __restrict__ seeds,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    __shared__ uint8_t s_seed[32];
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t tile_start = static_cast<size_t>(blockIdx.x) * blockDim.x;
+    const size_t batch_index = tile_start >> 18U;
+    const uint32_t local_base = static_cast<uint32_t>(tile_start & (kMatrixElements - 1U));
+    const uint8_t* seed = seeds + batch_index * 32;
+
+    if (threadIdx.x < 32U) {
+        s_seed[threadIdx.x] = seed[threadIdx.x];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        d_compute_seed_midstate(s_seed, s_midstate);
+    }
+    __syncthreads();
+
+    const uint32_t local_index = local_base + threadIdx.x;
+    if (local_index < kMatrixElements) {
+        output[tile_start + threadIdx.x] =
+            d_from_oracle_midstate(s_midstate, s_seed, local_index);
+    }
+}
+
+void GenerateMatrixMidstate512(
+    const uint8_t* seeds,
+    size_t batch,
+    uint32_t* output)
+{
+    constexpr uint32_t kThreads = 256;
+    constexpr size_t kMatrixElements = size_t{512} * 512;
+    const uint32_t blocks = static_cast<uint32_t>(
+        (batch * kMatrixElements + kThreads - 1) / kThreads);
+    batch_generate_matrix_midstate_512_kernel<<<blocks, kThreads>>>(
+        seeds, output);
+}
+
+__global__ void batch_generate_matrix_from_midstate_512_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t gid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (gid >= total_elements) {
+        return;
+    }
+
+    const size_t batch_index = gid >> 18U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    __syncthreads();
+
+    const uint32_t local_index =
+        static_cast<uint32_t>(gid & (kMatrixElements - 1U));
+    output[gid] = d_from_oracle_midstate(
+        s_midstate, seeds + batch_index * 32U, local_index);
+}
+
+void GenerateMatrixFromMidstate512(
+    const uint8_t* seeds,
+    const uint32_t* midstates,
+    size_t batch,
+    uint32_t* output)
+{
+    constexpr uint32_t kThreads = 256;
+    constexpr size_t kMatrixElements = size_t{512} * 512;
+    const size_t total_elements = batch * kMatrixElements;
+    const uint32_t blocks = static_cast<uint32_t>(
+        (total_elements + kThreads - 1) / kThreads);
+    batch_generate_matrix_from_midstate_512_kernel<<<blocks, kThreads>>>(
+        seeds, midstates, total_elements, output);
+}
+
+__global__ void batch_compute_seed_midstates_kernel(
+    const uint8_t* __restrict__ seeds,
+    size_t batch,
+    uint32_t* __restrict__ midstates)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) {
+        return;
+    }
+    d_compute_seed_midstate(
+        seeds + static_cast<size_t>(idx) * 32U,
+        midstates + static_cast<size_t>(idx) * 16U);
+}
+
+void ComputeSeedMidstates(
+    const uint8_t* seeds,
+    size_t batch,
+    uint32_t* midstates)
+{
+    constexpr uint32_t kThreads = 256;
+    const uint32_t blocks = static_cast<uint32_t>(
+        (batch + kThreads - 1) / kThreads);
+    batch_compute_seed_midstates_kernel<<<blocks, kThreads>>>(
+        seeds, batch, midstates);
+}
+
 struct DeviceMatrixCache {
     int device = -1;
     uint8_t seed_a[32]{};
@@ -1927,6 +2863,8 @@ struct BatchedMatMulPool {
     int device = -1;
     uint8_t* d_seed_a = nullptr;
     uint8_t* d_seed_b = nullptr;
+    uint32_t* d_seed_a_midstate = nullptr;
+    uint32_t* d_seed_b_midstate = nullptr;
     uint8_t* d_sigma = nullptr;
     uint8_t* d_noise_seeds = nullptr;
     uint8_t* d_compress_seeds = nullptr;
@@ -1949,10 +2887,81 @@ struct BatchedMatMulPool {
 
 BatchedMatMulPool g_batched_pool[16];
 
+bool EnvEnabled(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+bool DeviceIsGfx11(int device)
+{
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
+        return false;
+    }
+    return std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
+}
+
+struct MatmulProfile {
+    bool enabled = false;
+    size_t scan_batch = 0;
+    size_t passed = 0;
+    const char* words_path = "none";
+    char arch[64] = "unknown";
+    float sigma_ms = 0.0f;
+    float matrix_ms = 0.0f;
+    float noise_seed_ms = 0.0f;
+    float noise_ms = 0.0f;
+    float compress_ms = 0.0f;
+    float rhs_ms = 0.0f;
+    float rhs_a_ms = 0.0f;
+    float rhs_right_ms = 0.0f;
+    float rhs_b_ms = 0.0f;
+    float words_ms = 0.0f;
+    float hash_compare_ms = 0.0f;
+};
+
+struct GpuStageTimer {
+    bool enabled = false;
+    hipEvent_t start = nullptr;
+    hipEvent_t stop = nullptr;
+
+    explicit GpuStageTimer(bool enable) : enabled(enable)
+    {
+        if (!enabled) {
+            return;
+        }
+        if (hipEventCreate(&start) != hipSuccess ||
+            hipEventCreate(&stop) != hipSuccess ||
+            hipEventRecord(start, 0) != hipSuccess) {
+            enabled = false;
+        }
+    }
+
+    float finish()
+    {
+        float ms = 0.0f;
+        if (enabled &&
+            hipEventRecord(stop, 0) == hipSuccess &&
+            hipEventSynchronize(stop) == hipSuccess) {
+            (void)hipEventElapsedTime(&ms, start, stop);
+        }
+        if (start) {
+            (void)hipEventDestroy(start);
+        }
+        if (stop) {
+            (void)hipEventDestroy(stop);
+        }
+        return ms;
+    }
+};
+
 void FreeBatchedPool(BatchedMatMulPool& pool)
 {
     hipFree(pool.d_seed_a);
     hipFree(pool.d_seed_b);
+    hipFree(pool.d_seed_a_midstate);
+    hipFree(pool.d_seed_b_midstate);
     hipFree(pool.d_sigma);
     hipFree(pool.d_noise_seeds);
     hipFree(pool.d_compress_seeds);
@@ -2006,6 +3015,8 @@ bool EnsureBatchedPool(
     const bool ok =
         HipAlloc(pool.d_seed_a, batch * 32) &&
         HipAlloc(pool.d_seed_b, batch * 32) &&
+        HipAlloc(pool.d_seed_a_midstate, batch * 16) &&
+        HipAlloc(pool.d_seed_b_midstate, batch * 16) &&
         HipAlloc(pool.d_sigma, batch * 32) &&
         HipAlloc(pool.d_noise_seeds, batch * 4 * 32) &&
         HipAlloc(pool.d_compress_seeds, batch * 32) &&
@@ -2224,7 +3235,8 @@ bool ProcessPassedNoncesBatched(
     const uint8_t* d_seed_b,
     const uint8_t* d_sigma,
     std::vector<Uint256>& digests,
-    std::vector<uint8_t>& found)
+    std::vector<uint8_t>& found,
+    MatmulProfile* profile = nullptr)
 {
     if (batch == 0) {
         return true;
@@ -2262,69 +3274,213 @@ bool ProcessPassedNoncesBatched(
     const uint32_t noise_left_elements = n * r;
     const uint32_t noise_right_elements = r * n;
     const uint32_t compress_elements = bsz * bsz;
+    const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
+    const bool use_fused_b_rhs = use_512x16x8 && !EnvEnabled("BTX_MATMUL_NO_FUSED_B");
+    const bool use_fused_a_perturb = use_512x16x8 &&
+        !EnvEnabled("BTX_MATMUL_NO_FUSED_A");
+    const bool use_precomputed_midstates = use_512x16x8 &&
+        (use_fused_a_perturb || !EnvEnabled("BTX_MATMUL_NO_PRECOMP_A_MIDSTATE"));
 
-    gpasha::GenerateMatrixKernel_launch(
-        pool.d_seed_a, static_cast<uint32_t>(batch), n, pool.d_base_a);
-    gpasha::GenerateMatrixKernel_launch(
-        pool.d_seed_b, static_cast<uint32_t>(batch), n, pool.d_base_b);
-    gpasha::DeriveNoiseSeedsKernel_launch(
-        pool.d_sigma, pool.d_noise_seeds, pool.d_compress_seeds,
-        static_cast<uint32_t>(batch));
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, static_cast<uint32_t>(batch),
-        noise_left_elements, 0, pool.d_noise_el);
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, static_cast<uint32_t>(batch),
-        noise_right_elements, 1, pool.d_noise_er);
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, static_cast<uint32_t>(batch),
-        noise_left_elements, 2, pool.d_noise_fl);
-    gpasha::GenerateNoiseKernel_launch(
-        pool.d_noise_seeds, static_cast<uint32_t>(batch),
-        noise_right_elements, 3, pool.d_noise_fr);
-    gpasha::GenerateCompressKernel_launch(
-        pool.d_compress_seeds, static_cast<uint32_t>(batch),
-        compress_elements, pool.d_compress);
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        if (use_precomputed_midstates) {
+            if (use_fused_a_perturb ||
+                !EnvEnabled("BTX_MATMUL_NO_PRECOMP_A_MIDSTATE")) {
+                ComputeSeedMidstates(pool.d_seed_a, batch, pool.d_seed_a_midstate);
+            }
+            if (use_fused_b_rhs) {
+                ComputeSeedMidstates(pool.d_seed_b, batch, pool.d_seed_b_midstate);
+            } else {
+                GenerateMatrixMidstate512(pool.d_seed_b, batch, pool.d_base_b);
+            }
+        } else if (n == 512) {
+            GenerateMatrixMidstate512(pool.d_seed_a, batch, pool.d_base_a);
+            if (!use_fused_b_rhs) {
+                GenerateMatrixMidstate512(pool.d_seed_b, batch, pool.d_base_b);
+            }
+        } else {
+            gpasha::GenerateMatrixKernel_launch(
+                pool.d_seed_a, static_cast<uint32_t>(batch), n, pool.d_base_a);
+            gpasha::GenerateMatrixKernel_launch(
+                pool.d_seed_b, static_cast<uint32_t>(batch), n, pool.d_base_b);
+        }
+        if (profile && profile->enabled) {
+            profile->matrix_ms += timer.finish();
+        }
+    }
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        gpasha::DeriveNoiseSeedsKernel_launch(
+            pool.d_sigma, pool.d_noise_seeds, pool.d_compress_seeds,
+            static_cast<uint32_t>(batch));
+        if (profile && profile->enabled) {
+            profile->noise_seed_ms += timer.finish();
+        }
+    }
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        gpasha::GenerateNoiseKernel_launch(
+            pool.d_noise_seeds, static_cast<uint32_t>(batch),
+            noise_left_elements, 0, pool.d_noise_el);
+        gpasha::GenerateNoiseKernel_launch(
+            pool.d_noise_seeds, static_cast<uint32_t>(batch),
+            noise_right_elements, 1, pool.d_noise_er);
+        gpasha::GenerateNoiseKernel_launch(
+            pool.d_noise_seeds, static_cast<uint32_t>(batch),
+            noise_left_elements, 2, pool.d_noise_fl);
+        gpasha::GenerateNoiseKernel_launch(
+            pool.d_noise_seeds, static_cast<uint32_t>(batch),
+            noise_right_elements, 3, pool.d_noise_fr);
+        if (profile && profile->enabled) {
+            profile->noise_ms += timer.finish();
+        }
+    }
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        gpasha::GenerateCompressKernel_launch(
+            pool.d_compress_seeds, static_cast<uint32_t>(batch),
+            compress_elements, pool.d_compress);
+        if (profile && profile->enabled) {
+            profile->compress_ms += timer.finish();
+        }
+    }
 
     constexpr uint32_t kThreads = 256;
     const uint32_t matrix_blocks = static_cast<uint32_t>(
         (total_matrix_elements + kThreads - 1) / kThreads);
-    const bool use_512x16x8 = n == 512 && bsz == 16 && r == 8;
-    if (use_512x16x8) {
-        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
-            pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
-            total_matrix_elements, pool.d_matrix_a);
-        batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
-            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr,
-            total_matrix_elements, pool.d_matrix_b);
-    } else {
-        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
-            pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
-            matrix_elements, total_matrix_elements, pool.d_matrix_a);
-        batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
-            pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
-            matrix_elements, total_matrix_elements, pool.d_matrix_b);
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        if (use_512x16x8) {
+            {
+                GpuStageTimer sub_timer(profile && profile->enabled);
+                if (use_fused_a_perturb) {
+                    const uint32_t fused_a_threads =
+                        EnvEnabled("BTX_MATMUL_FUSED_A_512T") ? 512U : 256U;
+                    const uint32_t fused_a_blocks = static_cast<uint32_t>(
+                        (total_matrix_elements + fused_a_threads - 1) /
+                        fused_a_threads);
+                    batch_generate_perturb_matrix_512x8_kernel<<<fused_a_blocks, fused_a_threads>>>(
+                        pool.d_seed_a, pool.d_seed_a_midstate,
+                        pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
+                        pool.d_matrix_a);
+                } else {
+                    if (use_precomputed_midstates) {
+                        GenerateMatrixFromMidstate512(
+                            pool.d_seed_a, pool.d_seed_a_midstate, batch,
+                            pool.d_base_a);
+                    }
+                    batch_perturb_matrix_512x8_kernel<<<matrix_blocks, kThreads>>>(
+                        pool.d_base_a, pool.d_noise_el, pool.d_noise_er,
+                        total_matrix_elements, pool.d_matrix_a);
+                }
+                if (profile && profile->enabled) {
+                    profile->rhs_a_ms += sub_timer.finish();
+                }
+            }
+            const size_t right_rhs_elements = batch * 32U * 16U * 8U;
+            const uint32_t right_rhs_blocks = static_cast<uint32_t>(
+                (right_rhs_elements + kThreads - 1) / kThreads);
+            {
+                GpuStageTimer sub_timer(profile && profile->enabled);
+                if (EnvEnabled("BTX_MATMUL_OLD_RIGHT_RHS")) {
+                    batch_build_right_noise_rhs_512x16x8_kernel<<<right_rhs_blocks, kThreads>>>(
+                        pool.d_noise_fr, pool.d_compress, right_rhs_elements,
+                        pool.d_noise_er);
+                } else {
+                    const size_t right_rhs_pairs = batch * 32U * 16U;
+                    const uint32_t right_rhs_pair_blocks = static_cast<uint32_t>(
+                        (right_rhs_pairs + kThreads - 1) / kThreads);
+                    batch_build_right_noise_rhs_grouped_512x16x8_kernel<<<right_rhs_pair_blocks, kThreads>>>(
+                        pool.d_noise_fr, pool.d_compress, right_rhs_pairs,
+                        pool.d_noise_er);
+                }
+                if (profile && profile->enabled) {
+                    profile->rhs_right_ms += sub_timer.finish();
+                }
+            }
+            {
+                GpuStageTimer sub_timer(profile && profile->enabled);
+                if (use_fused_b_rhs) {
+                    const uint32_t fused_b_tiles = static_cast<uint32_t>(batch) * 32U * 32U;
+                    batch_build_factored_rhs_fused_b_512x16x8_kernel<<<fused_b_tiles, kThreads>>>(
+                        pool.d_seed_b, pool.d_seed_b_midstate,
+                        pool.d_noise_fl, pool.d_noise_er, pool.d_compress,
+                        pool.d_matrix_b);
+                } else {
+                    batch_build_factored_rhs_direct_512x16x8_kernel<<<matrix_blocks, kThreads>>>(
+                        pool.d_base_b, pool.d_noise_fl, pool.d_noise_er,
+                        pool.d_compress, total_matrix_elements, pool.d_matrix_b);
+                }
+                if (profile && profile->enabled) {
+                    profile->rhs_b_ms += sub_timer.finish();
+                }
+            }
+        } else {
+            batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
+                pool.d_base_a, pool.d_noise_el, pool.d_noise_er, n, r,
+                matrix_elements, total_matrix_elements, pool.d_matrix_a);
+            batch_perturb_matrix_kernel<<<matrix_blocks, kThreads>>>(
+                pool.d_base_b, pool.d_noise_fl, pool.d_noise_fr, n, r,
+                matrix_elements, total_matrix_elements, pool.d_matrix_b);
+        }
+        if (profile && profile->enabled) {
+            profile->rhs_ms += timer.finish();
+        }
     }
 
     const uint32_t total_words =
         static_cast<uint32_t>(batch) * words_per_nonce;
-    if (use_512x16x8) {
-        batch_compressed_words_512x16_kernel<<<total_words, kThreads>>>(
-            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
-            pool.d_words);
-    } else {
-        batch_compressed_words_kernel<<<total_words, kThreads>>>(
-            pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
-            n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
-            pool.d_words);
+    const bool use_wmma_words = use_512x16x8 && DeviceIsGfx11(device) &&
+        !EnvEnabled("BTX_MATMUL_NO_WMMA");
+    if (profile && profile->enabled) {
+        if (use_wmma_words) {
+            profile->words_path = "wmma";
+        } else if (use_512x16x8) {
+            profile->words_path = "factored";
+        } else {
+            profile->words_path = "generic";
+        }
+    }
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        if (use_wmma_words) {
+            constexpr uint32_t kWmmaGroups = 64;
+            const uint32_t total_wmma_tiles = static_cast<uint32_t>(batch) * 4U * kWmmaGroups;
+            batch_factored_words_wmma_partial_512x16_kernel<<<total_wmma_tiles, 32>>>(
+                pool.d_matrix_a, pool.d_matrix_b,
+                pool.d_base_a);
+            const uint32_t reduce_blocks = (total_words + kThreads - 1) / kThreads;
+            batch_reduce_wmma_partials_512x16_kernel<<<reduce_blocks, kThreads>>>(
+                pool.d_base_a, total_words,
+                pool.d_words);
+        } else if (use_512x16x8) {
+            const uint32_t total_factored_tiles = static_cast<uint32_t>(batch) * 16U * 16U;
+            batch_factored_words_512x16_kernel<<<total_factored_tiles, kThreads>>>(
+                pool.d_matrix_a, pool.d_matrix_b,
+                pool.d_words);
+        } else {
+            batch_compressed_words_kernel<<<total_words, kThreads>>>(
+                pool.d_matrix_a, pool.d_matrix_b, pool.d_compress,
+                n, bsz, blocks_per_axis, words_per_nonce, matrix_elements,
+                pool.d_words);
+        }
+        if (profile && profile->enabled) {
+            profile->words_ms += timer.finish();
+        }
     }
 
-    gpasha::HashTranscriptKernel_launch(
-        pool.d_words, pool.d_sigma, words_per_nonce, n, bsz,
-        static_cast<uint32_t>(batch), pool.d_digests);
-    gpasha::CompareDigestsKernel_launch(
-        pool.d_digests, pool.d_block_target, pool.d_share_target,
-        static_cast<uint32_t>(batch), pool.d_results);
+    {
+        GpuStageTimer timer(profile && profile->enabled);
+        gpasha::HashTranscriptKernel_launch(
+            pool.d_words, pool.d_sigma, words_per_nonce, n, bsz,
+            static_cast<uint32_t>(batch), pool.d_digests);
+        gpasha::CompareDigestsKernel_launch(
+            pool.d_digests, pool.d_block_target, pool.d_share_target,
+            static_cast<uint32_t>(batch), pool.d_results);
+        if (profile && profile->enabled) {
+            profile->hash_compare_ms += timer.finish();
+        }
+    }
 
     hipError_t err = hipGetLastError();
     if (err == hipSuccess) {
@@ -2470,17 +3626,32 @@ extern "C" bool LaunchMatMulTranscriptBatch(
         return false;
     }
 
-    init_scan_midstates_kernel<<<1, 1>>>(
-        h_params, pool.d_seed_midstate, pool.d_header_midstate);
-    // RDNA3 (gfx11): 512-wide launches improve sigma-gate occupancy vs 256.
-    constexpr int kGateThreads = 512;
-    const int gate_blocks =
-        static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
-    sigma_gate_kernel<<<gate_blocks, kGateThreads>>>(
-        h_params, nonces.front(), batch,
-        pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
-        pool.d_passed_nonces, pool.d_passed_sigma,
-        pool.d_passed_seed_a, pool.d_passed_seed_b);
+    MatmulProfile profile{};
+    profile.enabled = EnvEnabled("BTX_MATMUL_PROFILE");
+    profile.scan_batch = batch;
+    if (profile.enabled) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) == hipSuccess) {
+            std::snprintf(profile.arch, sizeof(profile.arch), "%s", prop.gcnArchName);
+        }
+    }
+    {
+        GpuStageTimer timer(profile.enabled);
+        init_scan_midstates_kernel<<<1, 1>>>(
+            h_params, pool.d_seed_midstate, pool.d_header_midstate);
+        // RDNA3 (gfx11): 512-wide launches improve sigma-gate occupancy vs 256.
+        constexpr int kGateThreads = 512;
+        const int gate_blocks =
+            static_cast<int>((batch + kGateThreads - 1) / kGateThreads);
+        sigma_gate_kernel<<<gate_blocks, kGateThreads>>>(
+            h_params, nonces.front(), batch,
+            pool.d_seed_midstate, pool.d_header_midstate, pool.d_gate_count,
+            pool.d_passed_nonces, pool.d_passed_sigma,
+            pool.d_passed_seed_a, pool.d_passed_seed_b);
+        if (profile.enabled) {
+            profile.sigma_ms = timer.finish();
+        }
+    }
 
     if (hipGetLastError() != hipSuccess) {
         return false;
@@ -2494,8 +3665,14 @@ extern "C" bool LaunchMatMulTranscriptBatch(
             hipMemcpyDeviceToHost) != hipSuccess) {
         return false;
     }
+    profile.passed = passed;
 
     if (passed == 0) {
+        if (profile.enabled) {
+            std::fprintf(stderr,
+                "matmul_profile scan=%zu passed=0 arch=%s words_path=none sigma_ms=%.3f\n",
+                profile.scan_batch, profile.arch, profile.sigma_ms);
+        }
         return true;
     }
 
@@ -2511,8 +3688,23 @@ extern "C" bool LaunchMatMulTranscriptBatch(
     if (!ProcessPassedNoncesBatched(
             device, job, passed, pool.d_passed_seed_a,
             pool.d_passed_seed_b, pool.d_passed_sigma,
-            passed_digests, passed_found)) {
+            passed_digests, passed_found, &profile)) {
         return false;
+    }
+
+    if (profile.enabled) {
+        std::fprintf(stderr,
+            "matmul_profile scan=%zu passed=%zu arch=%s words_path=%s "
+            "sigma_ms=%.3f matrix_ms=%.3f "
+            "noise_seed_ms=%.3f noise_ms=%.3f compress_ms=%.3f rhs_ms=%.3f "
+            "rhs_a_ms=%.3f rhs_right_ms=%.3f rhs_b_ms=%.3f "
+            "words_ms=%.3f hash_compare_ms=%.3f\n",
+            profile.scan_batch, profile.passed, profile.arch, profile.words_path,
+            profile.sigma_ms,
+            profile.matrix_ms, profile.noise_seed_ms, profile.noise_ms,
+            profile.compress_ms, profile.rhs_ms, profile.rhs_a_ms,
+            profile.rhs_right_ms, profile.rhs_b_ms, profile.words_ms,
+            profile.hash_compare_ms);
     }
 
     bool any_hit = false;

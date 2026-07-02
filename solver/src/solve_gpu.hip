@@ -4,6 +4,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 struct GpuContext {
@@ -59,6 +60,12 @@ static int GpuDeviceId()
 static void InvalidateGpu()
 {
     g_gpu.initialized = false;
+}
+
+static bool EnvEnabled(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value && value[0] != '\0' && value[0] != '0';
 }
 
 bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
@@ -132,6 +139,7 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
     uint64_t current_nonce = state.nonce;
     PowState first_solution{};
     bool have_solution = false;
+    const bool trust_gpu_shares = EnvEnabled("BTX_MATMUL_TRUST_GPU_SHARES");
     while (max_tries > 0) {
         auto now = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(now - t0).count();
@@ -184,10 +192,12 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
             verify.nonce = batch_nonces[bi];
             PrepareNonceSeeds(verify);
 
-            Uint256 cpu_digest;
-            ComputeDigestForNonce(verify, n, b, r, cpu_digest);
-            const bool is_block = Uint256LE(cpu_digest, block_target);
-            const bool is_share = !is_block && Uint256LE(cpu_digest, share_target);
+            Uint256 digest = digests[bi];
+            if (!trust_gpu_shares) {
+                ComputeDigestForNonce(verify, n, b, r, digest);
+            }
+            const bool is_block = Uint256LE(digest, block_target);
+            const bool is_share = !is_block && Uint256LE(digest, share_target);
             if (!is_block && !is_share) {
                 if (cpu_verify_misses) {
                     ++(*cpu_verify_misses);
@@ -197,13 +207,13 @@ bool SolveGPU(PowState& state, uint32_t n, uint32_t b, uint32_t r,
                         "digest verify miss nonce=%llu gpu=%s cpu=%s\n",
                         static_cast<unsigned long long>(verify.nonce),
                         Uint256ToHex(digests[bi]).substr(0, 16).c_str(),
-                        Uint256ToHex(cpu_digest).substr(0, 16).c_str());
+                        Uint256ToHex(digest).substr(0, 16).c_str());
                     ++miss_logs;
                 }
                 continue;
             }
 
-            verify.digest = cpu_digest;
+            verify.digest = digest;
             if (!have_solution) {
                 first_solution = verify;
                 have_solution = true;
