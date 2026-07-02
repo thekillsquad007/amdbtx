@@ -241,6 +241,46 @@ is_igpu_arch() {
     [[ "$1" =~ $IGPU_ARCHS_RE ]]
 }
 
+# Architectures covered by the multi-arch release solver (amdbtx-releases).
+# Same-family chips (e.g. gfx1031) run via the gfx1030 / gfx1100 offload paths.
+arch_supported_by_prebuild() {
+    local arch="${1:-}"
+    if [[ -z "$arch" ]]; then
+        return 0
+    fi
+    case "$arch" in
+        gfx900|gfx906|gfx908|gfx90a) return 0 ;;
+        gfx1030|gfx1031|gfx1032) return 0 ;;
+        gfx1100|gfx1101|gfx1102|gfx1103) return 0 ;;
+        gfx1150|gfx1151) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+hip_toolchain_ready() {
+    local out=""
+    command -v hipcc >/dev/null 2>&1 || return 1
+    out="$(hipcc --version 2>&1)" || return 1
+    if [[ "$out" == *"not found"* || "$out" == *"No such file"* ]]; then
+        return 1
+    fi
+    return 0
+}
+
+install_prebuilt_solver() {
+    local asset_path="${TMP_BUILD_DIR}/btx-gbt-solve-hip"
+    local url="${PREBUILDS_BASE}/btx-gbt-solve-hip"
+    local sha=""
+    log "downloading release solver ${EXPECTED_SOLVER_VERSION} (${PREBUILDS_TAG})..."
+    curl -fsSL "$url" -o "$asset_path" 2>/dev/null || \
+        err "failed to download solver from ${url}"
+    sha="$(sha256sum "$asset_path" | awk '{print $1}')"
+    [[ "$sha" == "$EXPECTED_SOLVER_SHA256" ]] || \
+        err "solver checksum mismatch: got ${sha}"
+    install -m 0755 "$asset_path" "$SOLVER_PATH"
+    SOLVER_BUILT_FROM_SOURCE=0
+}
+
 pick_discrete_gpu_from_rocminfo() {
     command -v rocminfo >/dev/null 2>&1 || return 1
     local out line
@@ -611,21 +651,19 @@ if [[ -n "$LOCAL_SOLVER" ]]; then
     log "using local solver at ${LOCAL_SOLVER}"
     install -m 0755 "$LOCAL_SOLVER" "$SOLVER_PATH"
 elif [[ "$USE_PREBUILT" -eq 1 ]]; then
-    SOLVER_ASSET_PATH="${TMP_BUILD_DIR}/btx-gbt-solve-hip"
-    SOLVER_URL="${PREBUILDS_BASE}/btx-gbt-solve-hip"
-    log "downloading btx-gbt-solve-hip ${EXPECTED_SOLVER_VERSION} (prebuilt)..."
-    curl -fsSL "$SOLVER_URL" -o "$SOLVER_ASSET_PATH" 2>/dev/null || \
-        err "failed to download solver binary from ${SOLVER_URL}"
-    SOLVER_ASSET_SHA256="$(sha256sum "$SOLVER_ASSET_PATH" | awk '{print $1}')"
-    [[ "$SOLVER_ASSET_SHA256" == "$EXPECTED_SOLVER_SHA256" ]] || \
-        err "solver checksum mismatch: got ${SOLVER_ASSET_SHA256}"
-    install -m 0755 "$SOLVER_ASSET_PATH" "$SOLVER_PATH"
+    install_prebuilt_solver
+elif ! hip_toolchain_ready; then
+    if arch_supported_by_prebuild "$GPU_ARCH"; then
+        warn "HIP compiler unavailable on this system; using release prebuilt solver"
+        install_prebuilt_solver
+    else
+        err "HIP compiler unavailable and release prebuilds do not cover arch ${GPU_ARCH:-unknown}. Install ROCm hip-dev or use --use-prebuilt on a supported GPU."
+    fi
 else
     SOLVER_SRC_DIR="$REPO_SRC_DIR/solver"
     [[ -f "$SOLVER_SRC_DIR/build.sh" ]] || err "solver sources missing at ${SOLVER_SRC_DIR}/build.sh"
 
     setup_rocm_environment
-    ensure_hip_compiler
 
     # Align HIP dev packages with the runtime ROCm version when possible.
     ROCM_DEV_NEEDED=0
@@ -644,6 +682,7 @@ else
     fi
 
     BUILD_LOG="$TMP_BUILD_DIR/build.log"
+    COMPILE_OK=0
     if [[ "$COMPILE_ALL_ARCHS" -eq 1 ]]; then
         log "compiling solver for all common AMD GPU architectures..."
         export AMDBTX_HIP_ARCHS="$ALL_HIP_ARCHS"
@@ -661,10 +700,18 @@ else
         log "solver compilation successful"
         install -m 0755 "$SOLVER_SRC_DIR/build/btx-gbt-solve-hip" "$SOLVER_PATH"
         SOLVER_BUILT_FROM_SOURCE=1
+        COMPILE_OK=1
     else
-        warn "solver compilation failed (see log below). Try: sudo apt install hip-dev"
+        warn "solver compilation failed (see log below)"
         cat "$BUILD_LOG" >&2
-        err "solver compilation failed. Use --use-prebuilt for release binaries, or install hip-dev/rocm-dev."
+    fi
+    if [[ "$COMPILE_OK" -eq 0 ]]; then
+        if arch_supported_by_prebuild "$GPU_ARCH"; then
+            log "using release prebuilt solver for ${GPU_ARCH:-detected GPU} (${PREBUILDS_TAG})"
+            install_prebuilt_solver
+        else
+            err "solver compilation failed and release prebuilds do not cover arch ${GPU_ARCH:-unknown}. Install hip-dev/rocm-dev or use --compile-all-archs after fixing ROCm."
+        fi
     fi
 fi
 
