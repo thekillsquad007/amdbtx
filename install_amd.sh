@@ -221,7 +221,8 @@ install_rocm_apt_repo() {
     local codename="$2"
     local keyring="/usr/share/keyrings/rocm-archive-keyring.gpg"
     need curl
-    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd gpg --dearmor -o "$keyring" 2>/dev/null || \
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | \
+        sudo_cmd gpg --batch --no-tty --yes --dearmor -o "$keyring" 2>/dev/null || \
         curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo_cmd apt-key add - 2>/dev/null || true
     if [[ -f "$keyring" ]]; then
         echo "deb [arch=amd64 signed-by=${keyring}] https://repo.radeon.com/rocm/apt/${repo_ver} ${codename} main" | \
