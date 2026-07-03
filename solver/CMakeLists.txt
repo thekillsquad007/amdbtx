@@ -23,7 +23,7 @@ set(SOURCES
 )
 
 set(HIP_ARCHS
-    gfx900;gfx906;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103
+    gfx900;gfx906;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201
     CACHE STRING "Semicolon-separated list of HIP offload architectures"
 )
 
