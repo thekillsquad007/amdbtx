@@ -737,9 +737,24 @@ assert "matmul_parent_mtp_seed_v3" in amdbtx_miner.PROTOCOL_CAPABILITIES
 exec "$VENV_DIR/bin/amdbtx-miner" "\$@"
 EOF
     chmod +x "$LAUNCHER_PATH"
+    rc_file=""
+    if [[ -f "$HOME/.bashrc" ]]; then
+        rc_file="$HOME/.bashrc"
+    elif [[ -f "$HOME/.bash_profile" ]]; then
+        rc_file="$HOME/.bash_profile"
+    elif [[ -f "$HOME/.profile" ]]; then
+        rc_file="$HOME/.profile"
+    fi
+    if [[ -n "$rc_file" ]] && ! grep -q '\.local/bin' "$rc_file" 2>/dev/null; then
+        echo "" >> "$rc_file"
+        echo "# Added by amdbtx-miner installer" >> "$rc_file"
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc_file"
+        log "added ~/.local/bin to PATH in ${rc_file}"
+    fi
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) : ;;
-        *) warn "add to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+        *) export PATH="$HOME/.local/bin:$PATH"
+           log "exported PATH=\$HOME/.local/bin:\$PATH for this session" ;;
     esac
 fi
 
@@ -1210,15 +1225,11 @@ echo "  GPU:      ${GPU_NAME:-CPU only}"
 echo "  Dev fee:  2% (time-sliced, transparent)"
 echo "  Dev fee wallet: ${DEV_WALLET}"
 echo
-echo "Setup PATH (add to ~/.bashrc if not already):"
-echo " export PATH=/opt/rocm/bin:\$PATH"
-echo " export LD_LIBRARY_PATH=$RUNTIME_DIR:/opt/rocm/lib:\$LD_LIBRARY_PATH"
-echo
-echo "Launch the miner:"
-echo "  amdbtx-miner --config ${CONFIG_PATH}"
+echo "Launch the miner via:"
+echo "  ${LAUNCHER_PATH} --config ${CONFIG_PATH}"
 echo
 echo "Or, for a long-running daemon:"
-echo "  tmux new -d -s amdbtx 'amdbtx-miner --config ${CONFIG_PATH} 2>&1 | tee -a ${INSTALL_DIR}/miner.log'"
+echo "  tmux new -d -s amdbtx '${LAUNCHER_PATH} --config ${CONFIG_PATH} 2>&1 | tee -a ${INSTALL_DIR}/miner.log'"
 echo "  tmux attach -t amdbtx"
 echo
 echo "Stats + payouts via Telegram: @btxdexbot   /stats /mybalance /help"
