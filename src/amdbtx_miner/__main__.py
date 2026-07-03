@@ -104,6 +104,10 @@ def parse_args():
         help="Comma-separated GPU indices or 'all' for multi-GPU (e.g. 0,1). Overrides --gpu-device.",
     )
     p.add_argument("--benchmark", action="store_true", help="run benchmark to find optimal config")
+    p.add_argument("--auto-tune", action="store_true",
+                   help="quick-sweep batch sizes at startup and pick the fastest")
+    p.add_argument("--auto-tune-seconds", type=int, default=3, metavar="N",
+                   help="seconds per batch size in auto-tune (default: 3)")
     p.add_argument(
         "--experimental-rdna4",
         action="store_true",
@@ -253,6 +257,104 @@ def run_benchmark(cfg: dict, config_path: str = ""):
             yaml.dump(yaml_cfg, f, default_flow_style=False)
         print(f"\n[BENCH] Updated {cp} with optimal settings")
     return best[1]
+
+
+def auto_tune(cfg: dict, batch_sizes: list[int] | None = None,
+              seconds_per_test: float = 3.0,
+              config_path: str = "") -> int:
+    """Quick batch-size sweep; returns best solver_batch_size, updates cfg."""
+    solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
+    if not solver_path.exists():
+        log.warning("auto-tune: solver not found at %s", solver_path)
+        return int(cfg.get("solver_batch_size", 4194304))
+
+    if not batch_sizes:
+        batch_sizes = [131072, 262144, 524288, 1048576,
+                       2097152, 4194304, 8388608, 16777216]
+
+    backend = cfg.get("solver_backend", "rocm")
+    workers = int(cfg.get("solver_prepare_workers", 16))
+    threads = int(cfg.get("solver_threads", 8))
+    runtime_ld = cfg.get("runtime_ld_path", "")
+
+    log.info("auto-tune: sweeping batch sizes (%.0fs per test)...", seconds_per_test)
+    results: list[tuple[float, int]] = []
+    bench_job = _benchmark_job()
+    best_so_far, best_batch = 0.0, batch_sizes[0]
+
+    for batch in batch_sizes:
+        tries = max(batch * 2, 500_000)
+        wrapper = GBTSolveWrapper(
+            str(solver_path), backend, threads,
+            prepare_workers=workers, batch_size=batch,
+            runtime_ld_path=runtime_ld,
+        )
+        hip_ok = True
+        for _ in range(2):
+            warmup = wrapper.solve(bench_job, max_tries=tries // 2, max_seconds=2.0)
+            if warmup.get("backend") == "cpu":
+                hip_ok = False
+                break
+
+        if not hip_ok:
+            log.info("  batch=%d CPU fallback — skip", batch)
+            wrapper.stop()
+            continue
+
+        start = time.time()
+        nonces = 0
+        while time.time() - start < seconds_per_test:
+            r = wrapper.solve(bench_job, max_tries=tries, max_seconds=seconds_per_test)
+            if r.get("backend") == "cpu":
+                hip_ok = False
+                break
+            nonces += r.get("tries_used", 0)
+
+        elapsed = time.time() - start
+        wrapper.stop()
+
+        if hip_ok and elapsed > 0 and nonces > 0:
+            khps = nonces / elapsed / 1000
+            results.append((khps, batch))
+            marker = " <<" if khps > best_so_far else ""
+            if khps > best_so_far:
+                best_so_far, best_batch = khps, batch
+            log.info("  batch=%d %9d  %8.0f kH/s%s", batch, nonces, khps, marker)
+
+    if not results:
+        log.warning("auto-tune: no batch size produced HIP results; keeping current value")
+        return int(cfg.get("solver_batch_size", 4194304))
+
+    log.info("auto-tune: best batch=%d (%s%.0f kH/s)", best_batch,
+             "matches current " if best_batch == int(cfg.get("solver_batch_size", 0)) else "",
+             best_so_far)
+
+    # Only update if best is at least 3% faster than the fallback default
+    fallback = int(cfg.get("solver_batch_size", 4194304))
+    if best_batch != fallback and fallback in [b for _, b in results]:
+        fallback_khps = next((kh for kh, b in results if b == fallback), 0)
+        if fallback_khps > 0 and (best_so_far - fallback_khps) / fallback_khps < 0.03:
+            log.info("auto-tune: best is within 3%% of current (%d); keeping current",
+                     fallback)
+            return fallback
+
+    cfg["solver_batch_size"] = best_batch
+
+    if config_path:
+        cp = Path(config_path)
+        import yaml
+        if cp.exists():
+            try:
+                with open(cp) as f:
+                    yaml_cfg = yaml.safe_load(f) or {}
+                yaml_cfg["solver_batch_size"] = best_batch
+                with open(cp, "w") as f:
+                    yaml.dump(yaml_cfg, f, default_flow_style=False)
+                log.info("auto-tune: saved solver_batch_size=%d to %s", best_batch, cp)
+            except Exception as e:
+                log.warning("auto-tune: failed to save config: %s", e)
+
+    return best_batch
 
 
 def _make_solver(cfg: dict, solver_path: Path, gpu_devices: list[int]) -> MultiGPUSolver:
@@ -845,6 +947,11 @@ def run_miner():
 
     if args.benchmark:
         run_benchmark(cfg, config_path=str(args.config))
+        return
+
+    if args.auto_tune:
+        auto_tune(cfg, seconds_per_test=max(2.0, float(args.auto_tune_seconds)),
+                  config_path=str(args.config))
         return
 
     cfg = validate_config(cfg)

@@ -1101,7 +1101,7 @@ if [[ "$GPU_ARCH" == gfx103* ]]; then
     GPU_BATCH=1048576
 fi
 if [[ "$GPU_ARCH" == gfx110* || "$GPU_ARCH" == gfx115* ]]; then
-    GPU_BATCH=4194304
+    GPU_BATCH=8388608
 fi
 if [[ "$GPU_ARCH" == gfx120* ]]; then
     GPU_BATCH=4194304
@@ -1123,6 +1123,7 @@ worker_name: "${WORKER}"
 gbt_solve_path: "${SOLVER_PATH}"
 
 # Solver tuning (AMD GPU: ${GPU_NAME:-CPU only})
+# Run --auto-tune at startup to sweep batch sizes and pick the fastest
 solver_backend: "rocm"
 solver_threads: ${GPU_THREADS}
 solver_batch_size: ${GPU_BATCH}
@@ -1181,6 +1182,19 @@ if [[ "$HAS_AMD" -eq 1 ]]; then
     else
         warn "GPU smoke test: solver ran but didn't find a share — could be hard luck"
         warn "Check 'rocm-smi' to verify GPU is detected"
+    fi
+
+    # ─── Auto-tune batch size ───────────────────────────────────────────
+    if [[ "$HAS_AMD" -eq 1 && -f "$CONFIG_PATH" ]]; then
+        log "running auto-tune to find optimal batch size for this GPU..."
+        log "this sweeps 8 batch sizes, takes ~20s..."
+        if "$VENV_DIR/bin/amdbtx-miner" \
+            --auto-tune --auto-tune-seconds 2 \
+            --config "$CONFIG_PATH" 2>&1; then
+            log "auto-tune complete — config updated with optimal batch size"
+        else
+            warn "auto-tune failed (GPU may be busy); using installer default batch=${GPU_BATCH}"
+        fi
     fi
 fi
 

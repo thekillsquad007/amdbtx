@@ -112,7 +112,29 @@ def _hostname() -> str | None:
         return None
 
 
-def _amd_gfx_target(env: dict[str, str] | None = None) -> str | None:
+_MODEL_TO_GFX: dict[str, str] = {
+    "7900 xtx": "gfx1100", "7900 xt": "gfx1100", "7900 gre": "gfx1100",
+    "7800 xt": "gfx1101", "7700 xt": "gfx1102", "7600": "gfx1102",
+    "6900 xt": "gfx1030", "6800 xt": "gfx1030", "6800": "gfx1031",
+    "6700 xt": "gfx1031", "6600 xt": "gfx1032", "6600": "gfx1032",
+    "rx 6400": "gfx1032", "rx 6500": "gfx1032",
+    "mi250x": "gfx90a", "mi250": "gfx90a", "mi100": "gfx908",
+    "mi50": "gfx906", "mi60": "gfx906",
+    "w7900": "gfx1100", "w7800": "gfx1101", "w7700": "gfx1102",
+    "pro w7900": "gfx1100", "pro w7800": "gfx1101",
+}
+
+
+def _gfx_from_model_name(name: str) -> str | None:
+    lower = name.lower()
+    for key, gfx in _MODEL_TO_GFX.items():
+        if key in lower:
+            return gfx
+    return None
+
+
+def _amd_gfx_target(env: dict[str, str] | None = None,
+                    model_fallback: str | None = None) -> str | None:
     rocminfo_path = shutil.which("rocminfo")
     if not rocminfo_path:
         for d in sorted(Path("/opt").glob("rocm*/bin"), reverse=True):
@@ -133,6 +155,28 @@ def _amd_gfx_target(env: dict[str, str] | None = None) -> str | None:
                 m = re.search(r"\bgfx\d{3,4}[a-z]?\b", result.stdout)
                 if m:
                     return m.group(0)
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            pass
+    if model_fallback:
+        mapped = _gfx_from_model_name(model_fallback)
+        if mapped:
+            return mapped
+    # Fallback: try hipconfig
+    hipconfig = shutil.which("hipconfig")
+    if not hipconfig:
+        for d in sorted(Path("/opt").glob("rocm*/bin"), reverse=True):
+            candidate = d / "hipconfig"
+            if candidate.is_file():
+                hipconfig = str(candidate)
+                break
+    if hipconfig:
+        try:
+            out = subprocess.check_output(
+                [hipconfig, "--arch"], stderr=subprocess.DEVNULL, timeout=5,
+            )
+            arch = out.decode("utf-8", errors="replace").strip()
+            if re.match(r"gfx\d{3,4}[a-z]?$", arch):
+                return arch
         except (subprocess.SubprocessError, subprocess.TimeoutExpired):
             pass
     return None
@@ -189,9 +233,25 @@ def _amd_gpus_from_rocm_smi() -> list[dict[str, Any]]:
     j = _rocm_smi_json(["--showproductname", "--showuniqueid", "--showmeminfo", "vram"])
     if not j:
         return []
-    gfx = _amd_gfx_target()
-    pci_bdfs = _amd_pci_bdfs()
+    first_model: str | None = None
     gpus: list[dict[str, Any]] = []
+    card_idx = 0
+    for card, info in j.items():
+        if not str(card).lower().startswith("card"):
+            continue
+        low = {str(k).lower(): v for k, v in info.items()}
+        model = (
+            low.get("card series")
+            or low.get("card model")
+            or low.get("device name")
+            or low.get("gpu id")
+            or "AMD GPU"
+        )
+        model = str(model).strip() or "AMD GPU"
+        if first_model is None:
+            first_model = model
+    gfx = _amd_gfx_target(model_fallback=first_model)
+    pci_bdfs = _amd_pci_bdfs()
     card_idx = 0
     for card, info in j.items():
         if not str(card).lower().startswith("card"):
@@ -663,6 +723,7 @@ def _gpu_runtime() -> list[dict[str, Any]]:
             if g.get("gpu_uuid")
         ]
 
+    model_fallback = static_gpus[0].get("model") if static_gpus else None
     out: list[dict[str, Any]] = []
     card_idx = 0
     for card, info in j.items():
@@ -671,7 +732,7 @@ def _gpu_runtime() -> list[dict[str, Any]]:
         low = {str(k).lower(): v for k, v in info.items()}
         uniq = str(low.get("unique id", "")).strip()
         ident = re.sub(r"[^a-z0-9]", "", uniq.lower()) if uniq else ""
-        gfx = _amd_gfx_target()
+        gfx = _amd_gfx_target(model_fallback=model_fallback)
         gpu_uuid = _make_amd_gpu_uuid(gfx, ident) if ident else None
         if not gpu_uuid and card_idx < len(static_gpus):
             gpu_uuid = static_gpus[card_idx].get("gpu_uuid")
