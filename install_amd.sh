@@ -170,7 +170,24 @@ rocm_repo_for_codename() {
     case "$codename" in
         noble|oracular|plucky) echo "7.2" ;;
         jammy) echo "6.4" ;;
-        *) echo "" ;;
+        focal) echo "5.7" ;;
+        *)
+            # Derive from numeric version if codename is unknown
+            if [[ -n "$version_id" ]]; then
+                local major="${version_id%%.*}"
+                if [[ "$major" -ge 25 ]]; then echo "7.2"; return 0; fi
+                if [[ "$major" -ge 24 ]]; then echo "7.2"; return 0; fi
+                if [[ "$major" -ge 22 ]]; then echo "6.4"; return 0; fi
+                if [[ "$major" -ge 20 ]]; then echo "5.7"; return 0; fi
+            fi
+            # Debian codenames: map to nearest Ubuntu equivalent
+            case "$codename" in
+                bookworm) echo "6.4" ;;   # Debian 12 ~= Ubuntu 22.04 era
+                bullseye) echo "5.7" ;;   # Debian 11 ~= Ubuntu 20.04 era
+                trixie|sid) echo "7.2" ;;
+                *) echo "" ;;
+            esac
+            ;;
     esac
 }
 
