@@ -18,8 +18,8 @@ def fully_qualified_worker(payout_address: str, worker_name: str) -> str:
 def validate_config(cfg: dict) -> dict:
     defaults = {
         "mining_mode": "pool",
-        "pool_host": "127.0.0.1",
-        "pool_port": 3333,
+        "pool_host": "btx-sg.lproute.com",
+        "pool_port": 8660,
         "pool_tls": False,
         # Pool wire protocol: auto (stratum; LuckyPool only on lproute/luckypool hosts),
         # stratum (never LuckyPool), luckypool (force LuckyPool login/submit).
