@@ -19,6 +19,18 @@ curl -fsSL https://raw.githubusercontent.com/thekillsquad007/amdbtx/main/install
 amdbtx-miner --config ~/.amdbtx-miner/config.yaml
 ```
 
+### HiveOS custom miner
+
+Build the lightweight HiveOS wrapper from [`hiveos/amdbtx`](hiveos/amdbtx):
+
+```bash
+bash hiveos/build-package.sh
+```
+
+Upload `dist/amdbtx-1.2.0_hiveos.tar.gz` as a HiveOS custom miner. The wrapper
+installs AMDBTX `v1.2.0` on first run with `--skip-rocm`, uses LuckyPool by
+default, and enables all AMD GPUs with `gpu_devices: "all"`.
+
 ### Windows (WSL2 + AMD GPU)
 
 Requires Windows 11, WSL2, and a recent AMD Adrenalin driver.
