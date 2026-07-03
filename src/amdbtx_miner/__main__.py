@@ -350,17 +350,17 @@ def auto_tune(cfg: dict, batch_sizes: list[int] | None = None,
 
     if config_path:
         cp = Path(config_path)
+        cp.parent.mkdir(parents=True, exist_ok=True)
         import yaml
-        if cp.exists():
-            try:
-                with open(cp) as f:
-                    yaml_cfg = yaml.safe_load(f) or {}
-                yaml_cfg["solver_batch_size"] = best_batch
-                with open(cp, "w") as f:
-                    yaml.dump(yaml_cfg, f, default_flow_style=False)
-                log.info("auto-tune: saved solver_batch_size=%d to %s", best_batch, cp)
-            except Exception as e:
-                log.warning("auto-tune: failed to save config: %s", e)
+        try:
+            yaml_cfg = yaml.safe_load(cp.read_text()) if cp.exists() else {}
+            if not isinstance(yaml_cfg, dict):
+                yaml_cfg = {}
+            yaml_cfg["solver_batch_size"] = best_batch
+            cp.write_text(yaml.dump(yaml_cfg, default_flow_style=False))
+            log.info("auto-tune: saved solver_batch_size=%d to %s", best_batch, cp)
+        except Exception as e:
+            log.warning("auto-tune: failed to save config: %s", e)
 
     return best_batch
 
