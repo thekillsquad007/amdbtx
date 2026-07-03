@@ -32,6 +32,12 @@ foreach(ARCH IN LISTS HIP_ARCHS)
     list(APPEND HIP_ARCH_FLAGS "--offload-arch=${ARCH}")
 endforeach()
 
+if(WIN32)
+    set(HIP_LINK_FLAGS "")
+else()
+    set(HIP_LINK_FLAGS "-lpthread" "-Wl,-rpath,/opt/rocm/lib:/opt/rocm-7.2.0/lib")
+endif()
+
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/btx-gbt-solve-hip
     COMMAND ${HIPCC}
@@ -40,8 +46,7 @@ add_custom_command(
         -D__HIP_PLATFORM_AMD__
         -I${CMAKE_CURRENT_SOURCE_DIR}/src
         ${SOURCES}
-        -lpthread
-        -Wl,-rpath,/opt/rocm/lib:/opt/rocm-7.2.0/lib
+        ${HIP_LINK_FLAGS}
         -o ${CMAKE_CURRENT_BINARY_DIR}/btx-gbt-solve-hip
     DEPENDS ${SOURCES}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

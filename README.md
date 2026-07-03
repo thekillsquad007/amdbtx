@@ -1,8 +1,8 @@
 # AMDBTX — AMD GPU Miner for BTX (Pool + Solo)
 
 A native AMD GPU miner for BTX MatMul PoW using ROCm/HIP. Mine on
-[BitMinerPool](https://bitminerpool.xyz), another supported pool, or solo against
-your own `btxd` node.
+[LuckyPool](https://luckypool.org) (default), another supported pool, or solo
+against your own `btxd` node.
 
 - **Default pool**: `stratum+tcp://btx-sg.lproute.com:8660` (LuckyPool)
 - **Solo**: mine directly against a synced `btxd` node
@@ -72,7 +72,7 @@ payout_address: "btx1z..."
 worker_name: "myrig"
 solver_backend: "rocm"
 solver_threads: 16
-solver_batch_size: 4194304   # installer sets a GPU-specific default; tune with --benchmark
+solver_batch_size: 4194304   # installer picks per-GPU; run --auto-tune to optimize
 gpu_device: -1               # -1 = auto; 0/1/... = force one GPU
 # gpu_devices: "all"         # multi-GPU: "all", "0,1", or [0, 1]
 log_level: "INFO"
@@ -104,15 +104,15 @@ The installer picks sensible defaults for your GPU. To find the best batch size:
 amdbtx-miner --benchmark --config ~/.amdbtx-miner/config.yaml
 ```
 
-Then copy the recommended `solver_batch_size` into your config.
+Then copy the recommended `solver_batch_size` into your config. For a quick automatic tune, run `amdbtx-miner --auto-tune` instead.
 
 | GPU | Typical batch size |
 |-----|-------------------|
-| RX 470/480/570/580 | 64 |
-| RX Vega / RDNA 1 | 4096 |
-| RX 6600–6900 (RDNA 2) | 1048576 |
-| RX 7600–7900 (RDNA 3) | 4194304 |
-| RX 9060/9070 (RDNA 4) | run `--benchmark` |
+| RX 470/480/570/580 (Polaris) | 524288–2097152 |
+| RX Vega / RDNA 1 | 1048576–4194304 |
+| RX 6600–6900 (RDNA 2) | 2097152–8388608 |
+| RX 7600–7900 (RDNA 3) | 4194304–8388608 |
+| RX 9060/9070 (RDNA 4) | 4194304–8388608 |
 
 ---
 
@@ -166,8 +166,6 @@ Point your config at a BitMinerPool endpoint (may need a local proxy):
 pool_host: "stratum.bitminerpool.xyz"
 pool_port: 3333
 ```
-pool_port: 8660
-```
 
 On LuckyPool hosts (`*.lproute.com`) the miner auto-switches to the LuckyPool
 login/submit dialect. Other pools (BitMinerPool, etc.) always use standard
@@ -189,14 +187,14 @@ Pools do not create wallets. Get a BTX address at https://easybtx.com/wallet
 | `rocm-smi` not found | Install ROCm or `export PATH=/opt/rocm/bin:$PATH` |
 | `/dev/kfd` permission denied | `sudo chmod 666 /dev/kfd /dev/dri/*` |
 | GPU not detected in WSL | Set `HSA_ENABLE_DXG_DETECTION=1`, then `wsl --shutdown` and restart |
-| Low hashrate | Run `--benchmark` and update `solver_batch_size` |
+| Low hashrate | Run `amdbtx-miner --auto-tune` or `--benchmark` to find the best batch size |
 | Share rejected after reconnect | Wait 1–2 minutes for the pool to sync |
 
 ---
 
 ## Links
 
-- **Pool**: https://bitminerpool.xyz
-- **Releases**: https://github.com/thekillsquad007/amdbtx-releases
+- **Pool (default)**: https://luckypool.org
+- **Releases**: https://github.com/thekillsquad007/amdbtx/releases
 - **GitHub**: https://github.com/thekillsquad007/amdbtx
 - **Telegram**: @btxdexbot
