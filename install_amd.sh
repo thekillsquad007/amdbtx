@@ -303,7 +303,9 @@ arch_supported_by_prebuild() {
         gfx900|gfx906) return 0 ;;
         gfx1030|gfx1031|gfx1032) return 0 ;;
         gfx1100|gfx1101|gfx1102|gfx1103) return 0 ;;
-        *) return 1 ;;
+        *)
+            warn "unknown GPU arch '${arch}'; trying multi-arch prebuilt solver anyway"
+            return 0 ;;
     esac
 }
 
@@ -395,7 +397,7 @@ pick_discrete_gpu_from_rocminfo() {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
             name = $0
         }
-        /Name:[[:space:]]*gfx/ { match($0, /gfx[0-9a-f]+/); arch = substr($0, RSTART, RLENGTH) }
+        match($0, /gfx[0-9a-f]{3,}/) && dev == "GPU" { arch = substr($0, RSTART, RLENGTH) }
         /Size:[[:space:]]*[0-9]/ && dev == "GPU" { match($0, /[0-9]+/); mem = substr($0, RSTART, RLENGTH) + 0 }
         END {
             flush()
@@ -1051,6 +1053,15 @@ else
     else
         warn "no AMD GPU detected by solver probe either — solver will run on CPU only (much slower)"
         warn "ensure /dev/kfd and /dev/dri are accessible"
+    fi
+fi
+
+# If rocminfo parsed a bogus arch but the solver detected the real one, override.
+if [[ -n "$PROBE_GPU_ARCH" && "$GPU_ARCH" != "$PROBE_GPU_ARCH" ]]; then
+    if [[ ! "$GPU_ARCH" =~ ^gfx[0-9a-f]{3,}$ ]]; then
+        warn "rocminfo reported arch='${GPU_ARCH}' but solver detected '${PROBE_GPU_ARCH}'; using solver value"
+        GPU_ARCH="$PROBE_GPU_ARCH"
+        GPU_NAME="${PROBE_GPU_NAME:-$GPU_NAME}"
     fi
 fi
 
