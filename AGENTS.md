@@ -12,12 +12,12 @@
 
 - Installed path: `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip`
 - Version: `btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)`
-- Current installed SHA256: `c46445d37324b069dba4d36ab6836689c2b8ebae8161631fdb366c7227f41135`
-- Restored from `bak-trust-gpu-20260701-082202` after `__launch_bounds__` experiment regressed performance.
-- Backup made before install:
+- Current installed SHA256: `9503f4282a46d7a3a282c6f004d15f102f5a11f3c644d1ea358d2d551677feb9`
+- Bundles fused-A 128×2 optimization (5-6% rhs_a_ms reduction).
+- Fallback: `BTX_MATMUL_NO_128X2=1` restores original 256×1 dispatch.
+- Backups from earlier experiments:
   - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-trust-gpu-20260701-082202`
-- Newer backups from experiments:
-  - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-launchbounds-20260701-185024` (pre-experiment, same as trust-gpu)
+  - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-launchbounds-20260701-185024`
 
 The currently running miner keeps using its already-open executable until it is restarted. Restart is required to pick up the installed solver above.
 
@@ -269,16 +269,32 @@ SHA-256-heavy workloads. No further GPU occupancy tuning via launch bounds will 
 The 10-20% efficient occupancy is a fundamental consequence of SHA-256's register
 demands, not a tuneable deficiency.
 
+## Experiment: 128 Threads × 2 Elements (Fused A) — WON
+
+Changed `batch_generate_perturb_matrix_512x8_kernel` from 256 threads × 1 element
+per thread to 128 threads × 2 elements per thread (same 256-element-per-block
+coverage). Halves block count, each thread does 2 oracle calls + 2 inner products
++ 2 writes.
+
+Result: **5-6% rhs_a_ms reduction, ~2% overall NPS gain**. Consistent across
+batch sizes 131072 and 524288.
+
+- Fused-A 128×2: rhs_a_ms improved ~5.7% at batch 131072, ~5.5% at batch 524288.
+- Fused-B 128×2 trial regressed (~5% rhs_b_ms slower) — source kept, dispatch
+  uses original 256-thread kernel.
+- Env fallback: `BTX_MATMUL_NO_128X2=1` restores the original 256×1 dispatch.
+
 ## Experiments Tried And Reverted Earlier
 
 - Fused hash+compare: slower due register pressure.
 - Corrected 128-thread fused-B tile variant: no meaningful `rhs_b_ms` gain, slower/noisier overall, and compiler could not fully unroll the loop; reverted.
 - Launch bounds on perturb/fused-B: slower.
+- 128×2 fused B: regressed ~5% (register pressure from 2× oracle calls + 2× weighted sums per thread).
 - Cold/noinline oracle fallback: slower.
 - Oracle `!= kFieldModulus` fast check: neutral; reverted.
 - `GenerateMatrixFromMidstate512` 512-thread default: slower.
 - Shared seed cache: slower.
-- Fused-B 128-thread variant: incorrect.
+- Fused-B 128-thread variant (original try): incorrect.
 - Fused-B reduce interval `8`: incorrect.
 - Shared `s_w` fused-B cache: slightly slower.
 

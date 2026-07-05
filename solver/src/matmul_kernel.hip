@@ -2060,6 +2060,77 @@ __global__ void batch_generate_perturb_matrix_512x8_kernel(
     output[gid] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
 }
 
+// Variant: 128 threads × 2 elements per thread (same 256-elements-per-block as
+// the original).  Halves the block count so fewer blocks compete for CUs.
+// Enable with BTX_MATMUL_FUSED_A_128X2=1.
+__global__ void batch_generate_perturb_matrix_512x8_128x2_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kElemsPerThread = 2;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    const uint32_t kStride = blockDim.x * kElemsPerThread;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t tile_base =
+        static_cast<size_t>(blockIdx.x) * kStride;
+    const size_t gid0 = tile_base + threadIdx.x;
+    const size_t gid1 = gid0 + blockDim.x;
+    if (gid0 >= total_elements) return;
+
+    const size_t batch_index = tile_base >> 18U;
+    const uint8_t* seed = seeds + batch_index * 32U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    __syncthreads();
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    // --- element 0 ---
+    {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid0 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid0] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+
+    // --- element 1 ---
+    if (gid1 < total_elements) {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid1 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid1] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+}
+
 // One workgroup per output word. Threads map to the 16x16 compression
 // coordinates and accumulate all 32 inner blocks for that word.
 __global__ void batch_compressed_words_kernel(
@@ -2475,6 +2546,126 @@ __global__ void batch_build_factored_rhs_fused_b_512x16x8_kernel(
     rhs[out_index] = static_cast<uint32_t>(d_reduce64(acc));
 }
 
+// Variant: 128 threads × 2 elements per thread for fused B RHS.
+// Enable with BTX_MATMUL_FUSED_B_128X2=1.
+__global__ void batch_build_factored_rhs_fused_b_512x16x8_128x2_kernel(
+    const uint8_t* __restrict__ seed_b,
+    const uint32_t* __restrict__ seed_b_midstates,
+    const uint32_t* __restrict__ noise_fl,
+    const uint32_t* __restrict__ right_rhs,
+    const uint32_t* __restrict__ compress,
+    uint32_t* __restrict__ rhs)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kR = 8;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseLeftElements = size_t{kN} * kR;
+    constexpr size_t kRightRhsElements = kBlocksPerAxis * kB * kR;
+    constexpr uint32_t kTilesPerNonce = kBlocksPerAxis * kBlocksPerAxis;
+
+    __shared__ uint32_t s_midstate[16];
+    __shared__ uint32_t s_b[kB][kB];
+
+    const uint32_t tile = blockIdx.x;
+    const uint32_t batch_index = tile / kTilesPerNonce;
+    const uint32_t local_tile = tile & (kTilesPerNonce - 1U);
+    const uint32_t j = local_tile >> 5U;
+    const uint32_t m_tile = local_tile & (kBlocksPerAxis - 1U);
+    const uint32_t tid = threadIdx.x;
+
+    const uint8_t* seed = seed_b + static_cast<size_t>(batch_index) * 32U;
+    if (tid < 16U) {
+        s_midstate[tid] =
+            seed_b_midstates[static_cast<size_t>(batch_index) * 16U + tid];
+    }
+    __syncthreads();
+
+    // Fill s_b[16][16] — each thread fills 2 entries (first and second half of columns)
+    {
+        const uint32_t b_row = tid >> 3;      // 0..15
+        const uint32_t y0 = tid & 7;           // 0..7
+        const uint32_t m0 = (m_tile << 4U) + b_row;
+        const uint32_t b_index0 = m0 * kN + (j << 4U) + y0;
+        s_b[b_row][y0] = d_from_oracle_midstate(s_midstate, seed, b_index0);
+        __syncthreads();
+
+        const uint32_t y1 = y0 + 8;            // 8..15
+        const uint32_t b_index1 = m0 * kN + (j << 4U) + y1;
+        s_b[b_row][y1] = d_from_oracle_midstate(s_midstate, seed, b_index1);
+        __syncthreads();
+    }
+
+    // Weighted sum — each thread outputs 2 elements (same x, two m_local values)
+    {
+        const uint32_t x = tid >> 3;           // 0..15
+        const uint32_t ml0 = tid & 7;          // 0..7
+        const uint32_t ml1 = ml0 + 8;          // 8..15
+        const uint32_t m0 = (m_tile << 4U) + ml0;
+        const uint32_t m1 = (m_tile << 4U) + ml1;
+
+        const uint32_t* W = compress + (static_cast<size_t>(batch_index) << 8U) + (x << 4U);
+        const uint32_t* FL = noise_fl + static_cast<size_t>(batch_index) * kNoiseLeftElements;
+        const uint32_t* RR = right_rhs + static_cast<size_t>(batch_index) * kRightRhsElements;
+        const uint32_t* rr_row = RR + ((j << 4U) + x) * kR;
+
+        // Output 0: m = m0
+        {
+            const uint32_t* fl_row0 = FL + static_cast<size_t>(m0) * kR;
+            uint64_t acc = 0;
+            uint32_t pending = 0;
+            #pragma unroll
+            for (uint32_t yy = 0; yy < kB; ++yy) {
+                acc += static_cast<uint64_t>(W[yy]) * s_b[ml0][yy];
+                if (++pending == kReduceInterval) {
+                    acc = d_reduce64(acc);
+                    pending = 0;
+                }
+            }
+            #pragma unroll
+            for (uint32_t k = 0; k < kR; ++k) {
+                acc += static_cast<uint64_t>(fl_row0[k]) * rr_row[k];
+                if (++pending == kReduceInterval) {
+                    acc = d_reduce64(acc);
+                    pending = 0;
+                }
+            }
+            const size_t out0 =
+                static_cast<size_t>(batch_index) * kMatrixElements +
+                static_cast<size_t>((j << 4U) + x) * kN + m0;
+            rhs[out0] = static_cast<uint32_t>(d_reduce64(acc));
+        }
+
+        // Output 1: m = m1
+        {
+            const uint32_t* fl_row1 = FL + static_cast<size_t>(m1) * kR;
+            uint64_t acc = 0;
+            uint32_t pending = 0;
+            #pragma unroll
+            for (uint32_t yy = 0; yy < kB; ++yy) {
+                acc += static_cast<uint64_t>(W[yy]) * s_b[ml1][yy];
+                if (++pending == kReduceInterval) {
+                    acc = d_reduce64(acc);
+                    pending = 0;
+                }
+            }
+            #pragma unroll
+            for (uint32_t k = 0; k < kR; ++k) {
+                acc += static_cast<uint64_t>(fl_row1[k]) * rr_row[k];
+                if (++pending == kReduceInterval) {
+                    acc = d_reduce64(acc);
+                    pending = 0;
+                }
+            }
+            const size_t out1 =
+                static_cast<size_t>(batch_index) * kMatrixElements +
+                static_cast<size_t>((j << 4U) + x) * kN + m1;
+            rhs[out1] = static_cast<uint32_t>(d_reduce64(acc));
+        }
+    }
+}
+
 __global__ void batch_factored_words_512x16_kernel(
     const uint32_t* __restrict__ matrix_a,
     const uint32_t* __restrict__ rhs,
@@ -2553,6 +2744,87 @@ __global__ void batch_factored_words_512x16_kernel(
             static_cast<uint32_t>(d_reduce64(partials[0][2]));
         output[out_base + (i0 + 1U) * kBlocksPerAxis + j0 + 1U] =
             static_cast<uint32_t>(d_reduce64(partials[0][3]));
+    }
+}
+
+__global__ void batch_factored_words_512x16_onepass_kernel(
+    const uint32_t* __restrict__ matrix_a,
+    const uint32_t* __restrict__ rhs,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kB = 16;
+    constexpr uint32_t kBlocksPerAxis = 32;
+    constexpr uint32_t kTilesPerAxis = 16;
+    constexpr uint32_t kTilesPerNonce = kTilesPerAxis * kTilesPerAxis;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr uint32_t kWarpsPerBlock = 8;
+    __shared__ uint64_t s_partial[8][32][4];
+
+    const uint32_t batch_index = blockIdx.x;
+    const uint32_t* A = matrix_a + static_cast<size_t>(batch_index) * kMatrixElements;
+    const uint32_t* D = rhs + static_cast<size_t>(batch_index) * kMatrixElements;
+    uint32_t* out = output + (static_cast<size_t>(batch_index) << 10U);
+    const uint32_t lane = threadIdx.x & 31U;
+    const uint32_t warp_id = threadIdx.x >> 5U;
+
+    for (uint32_t tile_base = 0; tile_base < kTilesPerNonce; tile_base += kWarpsPerBlock) {
+        const uint32_t tile_index = tile_base + warp_id;
+        const uint32_t j0 = (tile_index & (kTilesPerAxis - 1U)) << 1U;
+        const uint32_t i0 = (tile_index >> 4U) << 1U;
+
+        uint64_t acc00 = 0;
+        uint64_t acc01 = 0;
+        uint64_t acc10 = 0;
+        uint64_t acc11 = 0;
+        uint32_t pending = 0;
+        for (uint32_t x = 0; x < kB; ++x) {
+            const uint32_t* a_row0 = A + static_cast<size_t>(i0 * kB + x) * kN;
+            const uint32_t* a_row1 = a_row0 + static_cast<size_t>(kB) * kN;
+            const uint32_t* d_row0 = D + static_cast<size_t>(j0 * kB + x) * kN;
+            const uint32_t* d_row1 = d_row0 + static_cast<size_t>(kB) * kN;
+            for (uint32_t m = lane; m < kN; m += 32U) {
+                const uint64_t a0 = a_row0[m];
+                const uint64_t a1 = a_row1[m];
+                const uint64_t d0 = d_row0[m];
+                const uint64_t d1 = d_row1[m];
+                acc00 += a0 * d0;
+                acc01 += a0 * d1;
+                acc10 += a1 * d0;
+                acc11 += a1 * d1;
+                if (++pending == kReduceInterval) {
+                    acc00 = d_reduce64(acc00);
+                    acc01 = d_reduce64(acc01);
+                    acc10 = d_reduce64(acc10);
+                    acc11 = d_reduce64(acc11);
+                    pending = 0;
+                }
+            }
+        }
+        s_partial[warp_id][lane][0] = d_reduce64(acc00);
+        s_partial[warp_id][lane][1] = d_reduce64(acc01);
+        s_partial[warp_id][lane][2] = d_reduce64(acc10);
+        s_partial[warp_id][lane][3] = d_reduce64(acc11);
+        __syncthreads();
+
+        if (lane == 0) {
+            uint64_t sum00 = 0, sum01 = 0, sum10 = 0, sum11 = 0;
+            for (uint32_t i = 0; i < 32U; ++i) {
+                sum00 += s_partial[warp_id][i][0];
+                sum01 += s_partial[warp_id][i][1];
+                sum10 += s_partial[warp_id][i][2];
+                sum11 += s_partial[warp_id][i][3];
+            }
+            out[i0 * kBlocksPerAxis + j0] =
+                static_cast<uint32_t>(d_reduce64(sum00));
+            out[i0 * kBlocksPerAxis + j0 + 1U] =
+                static_cast<uint32_t>(d_reduce64(sum01));
+            out[(i0 + 1U) * kBlocksPerAxis + j0] =
+                static_cast<uint32_t>(d_reduce64(sum10));
+            out[(i0 + 1U) * kBlocksPerAxis + j0 + 1U] =
+                static_cast<uint32_t>(d_reduce64(sum11));
+        }
+        __syncthreads();
     }
 }
 
@@ -3608,15 +3880,23 @@ bool ProcessPassedNoncesBatched(
             {
                 GpuStageTimer sub_timer(profile && profile->enabled);
                 if (use_fused_a_perturb) {
-                    const uint32_t fused_a_threads =
-                        EnvEnabled("BTX_MATMUL_FUSED_A_512T") ? 512U : 256U;
-                    const uint32_t fused_a_blocks = static_cast<uint32_t>(
-                        (total_matrix_elements + fused_a_threads - 1) /
-                        fused_a_threads);
-                    batch_generate_perturb_matrix_512x8_kernel<<<fused_a_blocks, fused_a_threads>>>(
-                        pool.d_seed_a, pool.d_seed_a_midstate,
-                        pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
-                        pool.d_matrix_a);
+                    if (EnvEnabled("BTX_MATMUL_NO_128X2")) {
+                        const uint32_t fused_a_blocks = static_cast<uint32_t>(
+                            (total_matrix_elements + 256 - 1) / 256);
+                        batch_generate_perturb_matrix_512x8_kernel<<<fused_a_blocks, 256>>>(
+                            pool.d_seed_a, pool.d_seed_a_midstate,
+                            pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
+                            pool.d_matrix_a);
+                    } else {
+                        constexpr uint32_t kBlockElements = 128 * 2;
+                        const uint32_t fused_a_blocks = static_cast<uint32_t>(
+                            (total_matrix_elements + kBlockElements - 1) /
+                            kBlockElements);
+                        batch_generate_perturb_matrix_512x8_128x2_kernel<<<fused_a_blocks, 128>>>(
+                            pool.d_seed_a, pool.d_seed_a_midstate,
+                            pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
+                            pool.d_matrix_a);
+                    }
                 } else {
                     if (use_precomputed_midstates) {
                         GenerateMatrixFromMidstate512(
