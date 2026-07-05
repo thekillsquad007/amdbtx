@@ -113,7 +113,9 @@ def parse_args():
     )
     p.add_argument("--benchmark", action="store_true", help="run benchmark to find optimal config")
     p.add_argument("--auto-tune", action="store_true",
-                   help="quick-sweep batch sizes at startup and pick the fastest")
+                   help="force batch-size sweep and exit (saves to config)")
+    p.add_argument("--no-auto-tune", action="store_true",
+                   help="skip the automatic batch-size sweep at startup")
     p.add_argument("--auto-tune-seconds", type=int, default=3, metavar="N",
                    help="seconds per batch size in auto-tune (default: 3)")
     p.add_argument(
@@ -269,16 +271,32 @@ def run_benchmark(cfg: dict, config_path: str = ""):
 
 def auto_tune(cfg: dict, batch_sizes: list[int] | None = None,
               seconds_per_test: float = 3.0,
-              config_path: str = "") -> int:
-    """Quick batch-size sweep; returns best solver_batch_size, updates cfg."""
+              config_path: str = "",
+              force: bool = False) -> int:
+    """Quick batch-size sweep; returns best solver_batch_size, updates cfg.
+
+    When *force* is False and *cfg* already carries a tuned solver_batch_size
+    (one of the test candidates), the sweep is skipped.
+    """
     solver_path = resolve_solver_path(cfg.get("gbt_solve_path", ""))
     if not solver_path.exists():
         log.warning("auto-tune: solver not found at %s", solver_path)
         return int(cfg.get("solver_batch_size", 4194304))
 
-    if not batch_sizes:
-        batch_sizes = [131072, 262144, 524288, 1048576,
-                       2097152, 4194304, 8388608, 16777216]
+    # Use config's benchmark_batch_sizes if caller didn't supply one.
+    if batch_sizes is None:
+        raw = cfg.get("benchmark_batch_sizes")
+        if isinstance(raw, list) and all(isinstance(v, int) for v in raw):
+            batch_sizes = raw
+        else:
+            batch_sizes = [131072, 262144, 524288, 1048576,
+                           2097152, 4194304, 8388608, 16777216]
+
+    # Short-circuit: already tuned (unless forced).
+    current = int(cfg.get("solver_batch_size", 0) or 0)
+    if not force and current in batch_sizes and cfg.get("auto_tuned", False):
+        log.info("auto-tune: solver_batch_size=%d already tuned — skipping", current)
+        return current
 
     backend = cfg.get("solver_backend", "rocm")
     workers = int(cfg.get("solver_prepare_workers", 16))
@@ -347,6 +365,7 @@ def auto_tune(cfg: dict, batch_sizes: list[int] | None = None,
             return fallback
 
     cfg["solver_batch_size"] = best_batch
+    cfg["auto_tuned"] = True
 
     if config_path:
         cp = Path(config_path)
@@ -357,6 +376,7 @@ def auto_tune(cfg: dict, batch_sizes: list[int] | None = None,
             if not isinstance(yaml_cfg, dict):
                 yaml_cfg = {}
             yaml_cfg["solver_batch_size"] = best_batch
+            yaml_cfg["auto_tuned"] = True
             cp.write_text(yaml.dump(yaml_cfg, default_flow_style=False))
             log.info("auto-tune: saved solver_batch_size=%d to %s", best_batch, cp)
         except Exception as e:
@@ -959,8 +979,12 @@ def run_miner():
 
     if args.auto_tune:
         auto_tune(cfg, seconds_per_test=max(2.0, float(args.auto_tune_seconds)),
-                  config_path=str(args.config))
+                  config_path=str(args.config), force=True)
         return
+
+    if not args.no_auto_tune:
+        auto_tune(cfg, seconds_per_test=max(2.0, float(args.auto_tune_seconds)),
+                  config_path=str(args.config))
 
     cfg = validate_config(cfg)
 

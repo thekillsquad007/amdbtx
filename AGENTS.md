@@ -12,9 +12,10 @@
 
 - Installed path: `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip`
 - Version: `btx-gbt-solve-hip 2.1.0 (BTX V3 parent-MTP)`
-- Current installed SHA256: `9503f4282a46d7a3a282c6f004d15f102f5a11f3c644d1ea358d2d551677feb9`
+- Current installed SHA256: `f205c2f721a180fc84eae997e51bd4ef8134a8422b98d848188b2e03afd67cd8`
 - Bundles fused-A 128×2 optimization (5-6% rhs_a_ms reduction).
 - Fallback: `BTX_MATMUL_NO_128X2=1` restores original 256×1 dispatch.
+- Experimental: `BTX_MATMUL_FUSED_A_256X2=1` (256-thread × 2-elem) and `BTX_MATMUL_FUSED_A_64X4=1` (64-thread × 4-elem) — neither beats 128×2.
 - Backups from earlier experiments:
   - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-trust-gpu-20260701-082202`
   - `/home/aravindthana/.amdbtx-miner/bin/btx-gbt-solve-hip.bak-launchbounds-20260701-185024`
@@ -133,7 +134,9 @@ is better.
     - `GenerateMatrixFromMidstate512`
   - Fused A perturb path currently default for `512x16x8`:
     - Disable with `BTX_MATMUL_NO_FUSED_A=1`.
-    - Try 512-thread variant with `BTX_MATMUL_FUSED_A_512T=1`.
+    - Try 256×2 variant with `BTX_MATMUL_FUSED_A_256X2=1` (512 elements/block, within noise).
+    - Try 64×4 variant with `BTX_MATMUL_FUSED_A_64X4=1` (256 elements/block, within noise).
+    - 128×2 remains the optimal dispatch (see Experiment: 256×2 and 64×4 below).
   - Profile fields include:
     - `arch`
     - `words_path`
@@ -284,12 +287,42 @@ batch sizes 131072 and 524288.
   uses original 256-thread kernel.
 - Env fallback: `BTX_MATMUL_NO_128X2=1` restores the original 256×1 dispatch.
 
+## Experiment: 256×2 and 64×4 Fused A — Both Within Noise (No Improvement)
+
+Added two new fused A variants to test whether further thread/element ratio
+changes could beat 128×2:
+
+- **256 threads × 2 elements** (`BTX_MATMUL_FUSED_A_256X2=1`): 512 elements/block,
+  each thread 2 oracle calls. Halves block count vs 128×2.
+- **64 threads × 4 elements** (`BTX_MATMUL_FUSED_A_64X4=1`): 256 elements/block,
+  each thread 4 oracle calls. Same block count as original, fewer threads/block.
+
+Both kernels implemented in `matmul_kernel.hip` and dispatched via env toggles.
+
+Results (15 sequential runs each, no GPU contention):
+
+| Variant | batch 131072 N/S | vs 128×2 | rhs_a_ms | batch 524288 N/S | vs 128×2 | rhs_a_ms |
+|---|---|---:|---:|---|---:|---:|
+| 128×2 (default) | 3,881,099 | — | 10.8 | 3,964,431 | — | 44.6 |
+| 256×1 (NO_128X2) | 3,790,312 | −2.3% | 11.4 | 3,901,590 | −1.6% | 47.7 |
+| 256×2 (FUSED_A_256X2) | 3,886,012 | +0.1% | 10.6 | 3,976,637 | +0.3% | 45.3 |
+| 64×4 (FUSED_A_64X4) | 3,890,502 | +0.2% | 10.9 | 3,996,136 | +0.8% | 44.4 |
+
+**Verdict: None beat the current 128×2 default.** All differences within ~1%
+run-to-run noise. 128×2 remains the optimal fused A dispatch.
+
+Important lesson: running multiple `bench_solver.py` processes concurrently
+contaminates GPU timing (each gets 1/N GPU throughput). Always run sequential
+benchmarks for clean numbers.
+
 ## Experiments Tried And Reverted Earlier
 
 - Fused hash+compare: slower due register pressure.
 - Corrected 128-thread fused-B tile variant: no meaningful `rhs_b_ms` gain, slower/noisier overall, and compiler could not fully unroll the loop; reverted.
 - Launch bounds on perturb/fused-B: slower.
 - 128×2 fused B: regressed ~5% (register pressure from 2× oracle calls + 2× weighted sums per thread).
+- 256×2 fused A: no improvement (within 0.3% of 128×2).
+- 64×4 fused A: no improvement (within 0.8% of 128×2).
 - Cold/noinline oracle fallback: slower.
 - Oracle `!= kFieldModulus` fast check: neutral; reverted.
 - `GenerateMatrixFromMidstate512` 512-thread default: slower.
@@ -368,15 +401,14 @@ As of the latest update, `git status --short` showed:
 
 ```text
  M .gitignore
- M src/amdbtx_miner/__main__.py
+ M AGENTS.md
+ M solver/src/matmul_kernel.hip
 ?? solver/build-test/
 ?? tests/test_pool_visibility_metrics.py
 ```
 
 `solver/build-test/` and `tests/test_pool_visibility_metrics.py` are untracked.
-Solver source files (`solver/src/matmul_kernel.hip`, `solver/src/solve_gpu.hip`,
-`src/amdbtx_miner/gbt_solve_wrapper.py`) are clean — the trust-GPU fix and all
-grouped RHS optimizations are committed in HEAD.
+`matmul_kernel.hip` has uncommitted changes adding 256×2 and 64×4 fused A variants.
 
 `AGENTS.md` itself may be ignored by git. Do not assume it appears in `git status`.
 
@@ -389,3 +421,4 @@ grouped RHS optimizations are committed in HEAD.
 4. Consider native Linux profiling later if possible, but pool can remain on Windows if accessed over LAN. On this same physical machine, native Linux cannot run the Windows pool simultaneously.
 
 Be careful with attractive micro-optimizations. Several looked promising but were slower or incorrect. Always run correctness checks and median benchmarks before installing.
+Running multiple `bench_solver.py` processes concurrently contaminates GPU timing — always run sequential benchmarks.

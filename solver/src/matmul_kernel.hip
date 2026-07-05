@@ -2131,6 +2131,179 @@ __global__ void batch_generate_perturb_matrix_512x8_128x2_kernel(
     }
 }
 
+// Variant: 256 threads × 2 elements per thread (512 elements per block).
+// Half the block count of 128×2.  Enable with BTX_MATMUL_FUSED_A_256X2=1.
+__global__ void batch_generate_perturb_matrix_512x8_256x2_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kElemsPerThread = 2;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    const uint32_t kStride = blockDim.x * kElemsPerThread;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t tile_base =
+        static_cast<size_t>(blockIdx.x) * kStride;
+    const size_t gid0 = tile_base + threadIdx.x;
+    const size_t gid1 = gid0 + blockDim.x;
+    if (gid0 >= total_elements) return;
+
+    const size_t batch_index = tile_base >> 18U;
+    const uint8_t* seed = seeds + batch_index * 32U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    __syncthreads();
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid0 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid0] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+
+    if (gid1 < total_elements) {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid1 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid1] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+}
+
+// Variant: 64 threads × 4 elements per thread (256 elements per block, same coverage
+// as original).  Fewer threads per block for higher CU occupancy.
+// Enable with BTX_MATMUL_FUSED_A_64X4=1.
+__global__ void batch_generate_perturb_matrix_512x8_64x4_kernel(
+    const uint8_t* __restrict__ seeds,
+    const uint32_t* __restrict__ midstates,
+    const uint32_t* __restrict__ noise_left,
+    const uint32_t* __restrict__ noise_right,
+    size_t total_elements,
+    uint32_t* __restrict__ output)
+{
+    constexpr uint32_t kN = 512;
+    constexpr uint32_t kElemsPerThread = 4;
+    constexpr size_t kMatrixElements = size_t{kN} * kN;
+    constexpr size_t kNoiseElements = size_t{kN} * 8;
+    const uint32_t kStride = blockDim.x * kElemsPerThread;
+    __shared__ uint32_t s_midstate[16];
+
+    const size_t tile_base =
+        static_cast<size_t>(blockIdx.x) * kStride;
+    const size_t gid0 = tile_base + threadIdx.x;
+    const size_t gid1 = gid0 + blockDim.x;
+    const size_t gid2 = gid1 + blockDim.x;
+    const size_t gid3 = gid2 + blockDim.x;
+    if (gid0 >= total_elements) return;
+
+    const size_t batch_index = tile_base >> 18U;
+    const uint8_t* seed = seeds + batch_index * 32U;
+    if (threadIdx.x < 16U) {
+        s_midstate[threadIdx.x] =
+            midstates[batch_index * 16U + threadIdx.x];
+    }
+    const uint32_t* left = noise_left + batch_index * kNoiseElements;
+    __syncthreads();
+    const uint32_t* right = noise_right + batch_index * kNoiseElements;
+
+    {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid0 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid0] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+
+    if (gid1 < total_elements) {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid1 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid1] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+
+    if (gid2 < total_elements) {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid2 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid2] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+
+    if (gid3 < total_elements) {
+        const uint32_t local_index =
+            static_cast<uint32_t>(gid3 & (kMatrixElements - 1U));
+        const uint32_t row = local_index >> 9U;
+        const uint32_t col = local_index & (kN - 1U);
+        uint64_t acc = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+            acc += static_cast<uint64_t>(left[(row << 3U) + k]) *
+                   right[k * kN + col];
+            if ((k & 3U) == 3U) acc = d_reduce64(acc);
+        }
+        const uint32_t base =
+            d_from_oracle_midstate(s_midstate, seed, local_index);
+        output[gid3] = d_add(base, static_cast<uint32_t>(d_reduce64(acc)));
+    }
+}
+
 // One workgroup per output word. Threads map to the 16x16 compression
 // coordinates and accumulate all 32 inner blocks for that word.
 __global__ void batch_compressed_words_kernel(
@@ -3880,7 +4053,25 @@ bool ProcessPassedNoncesBatched(
             {
                 GpuStageTimer sub_timer(profile && profile->enabled);
                 if (use_fused_a_perturb) {
-                    if (EnvEnabled("BTX_MATMUL_NO_128X2")) {
+                    if (EnvEnabled("BTX_MATMUL_FUSED_A_256X2")) {
+                        constexpr uint32_t kBlockElements = 256 * 2;
+                        const uint32_t fused_a_blocks = static_cast<uint32_t>(
+                            (total_matrix_elements + kBlockElements - 1) /
+                            kBlockElements);
+                        batch_generate_perturb_matrix_512x8_256x2_kernel<<<fused_a_blocks, 256>>>(
+                            pool.d_seed_a, pool.d_seed_a_midstate,
+                            pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
+                            pool.d_matrix_a);
+                    } else if (EnvEnabled("BTX_MATMUL_FUSED_A_64X4")) {
+                        constexpr uint32_t kBlockElements = 64 * 4;
+                        const uint32_t fused_a_blocks = static_cast<uint32_t>(
+                            (total_matrix_elements + kBlockElements - 1) /
+                            kBlockElements);
+                        batch_generate_perturb_matrix_512x8_64x4_kernel<<<fused_a_blocks, 64>>>(
+                            pool.d_seed_a, pool.d_seed_a_midstate,
+                            pool.d_noise_el, pool.d_noise_er, total_matrix_elements,
+                            pool.d_matrix_a);
+                    } else if (EnvEnabled("BTX_MATMUL_NO_128X2")) {
                         const uint32_t fused_a_blocks = static_cast<uint32_t>(
                             (total_matrix_elements + 256 - 1) / 256);
                         batch_generate_perturb_matrix_512x8_kernel<<<fused_a_blocks, 256>>>(
