@@ -422,3 +422,23 @@ As of the latest update, `git status --short` showed:
 
 Be careful with attractive micro-optimizations. Several looked promising but were slower or incorrect. Always run correctness checks and median benchmarks before installing.
 Running multiple `bench_solver.py` processes concurrently contaminates GPU timing — always run sequential benchmarks.
+
+## Portable Linux Binaries (2026-07-04)
+
+### Root Cause: PyInstaller Frozen Check Bypassed by Config
+The `resolve_solver_path()` in `src/amdbtx_miner/__main__.py:78` checked `configured_path` first (line 79-80), returning immediately before checking `sys._MEIPASS` for the bundled solver. The user's `~/.amdbtx-miner/config.yaml` had `gbt_solve_path: "/home/bazzite/.amdbtx-miner/bin/btx-gbt-solve-hip"` which made the frozen bundle check unreachable on the target machine.
+
+**Fix**: moved the frozen/bundle check before the `configured_path` check. Now `sys._MEIPASS` is checked first, and only if the solver isn't bundled does it fall through to the configured path or home dir.
+
+### Ubuntu 20 Build Note
+ROCm 5.7.0 clang 14 does not support `gfx1200`/`gfx1201` (RDNA4). Build with:
+```bash
+cmake -S . -B build-distrobox-ubuntu20 -DHIP_ARCHS='gfx803;gfx900;gfx906;gfx1010;gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102'
+```
+Also: ROCm 5.7 `hipcc` is much slower than ROCm 7.2 `hipcc` — ~5min vs ~30s for 10 archs.
+
+### Release
+Both tarballs replaced on GitHub release v1.2.0:
+- `amdbtx-miner-linux-ubuntu22-v1.2.0.tar.gz` (85 MB, ROCm 7.2.4, glibc 2.35+)
+- `amdbtx-miner-linux-ubuntu20-v1.2.0.tar.gz` (79 MB, ROCm 5.7.0, glibc 2.31+)
+- `amdbtx-1.2.0_hiveos.tar.gz` (162 MB, both binaries + HiveOS wrapper)

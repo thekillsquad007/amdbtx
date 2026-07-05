@@ -14,6 +14,19 @@ for file in h-config.sh h-run.sh h-stats.sh; do
     }
 done
 
+# Copy portable binaries into the package
+for distro in ubuntu22 ubuntu20; do
+    src="${ROOT_DIR}/dist/amdbtx-miner-linux-${distro}/amdbtx-miner"
+    dst="${PACKAGE_DIR}/amdbtx-miner-linux-${distro}"
+    if [[ -f "$src" ]]; then
+        cp -a "$src" "$dst"
+        chmod 0755 "$dst"
+        echo "bundled $dst ($(du -h "$dst" | cut -f1))"
+    else
+        echo "WARNING: $src not found, skipping" >&2
+    fi
+done
+
 mkdir -p "$OUT_DIR"
 chmod 0755 "${PACKAGE_DIR}/h-config.sh" "${PACKAGE_DIR}/h-run.sh" "${PACKAGE_DIR}/h-stats.sh"
 tar -czf "$OUT_FILE" -C "${ROOT_DIR}/hiveos" amdbtx

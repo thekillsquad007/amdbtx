@@ -53,8 +53,61 @@ installed_version() {
     "${VENV_DIR}/bin/python" -c 'import amdbtx_miner; print(amdbtx_miner.__version__)' 2>/dev/null || true
 }
 
+os_distro() {
+    # Detect distro: 22 (Ubuntu 22) or 20 (Ubuntu 20) or unknown
+    local id version
+    if [[ -f /etc/os-release ]]; then
+        id="$(grep -oP '(?<=^ID=).*' /etc/os-release 2>/dev/null | tr -d '"')"
+        version="$(grep -oP '(?<=^VERSION_ID=).*' /etc/os-release 2>/dev/null | tr -d '"')"
+        case "$id" in
+            ubuntu)
+                case "$version" in
+                    22*) echo "22" ;;
+                    20*) echo "20" ;;
+                    *) echo "unknown" ;;
+                esac
+                ;;
+            *) echo "unknown" ;;
+        esac
+    else
+        echo "unknown"
+    fi
+}
+
+use_bundled_binary() {
+    local binary="${MINER_DIR}/amdbtx-miner-linux-ubuntu${1}"
+    if [[ -x "$binary" ]]; then
+        echo "AMDBTX: using bundled portable binary (ubuntu${1})"
+        mkdir -p "$(dirname "$MINER_BIN")"
+        mkdir -p "$(dirname "$SOLVER_BIN")"
+        cp -a "$binary" "$MINER_BIN"
+        # The portable binary includes the solver internally; mark SOLVER_BIN as present
+        touch "$SOLVER_BIN"
+        chmod +x "$MINER_BIN" "$SOLVER_BIN"
+        return 0
+    fi
+    return 1
+}
+
 ensure_installed() {
-    local version installer install_mode
+    local version installer install_mode distro
+
+    # Try bundled binaries first
+    distro="$(os_distro)"
+    case "$distro" in
+        22|20)
+            if use_bundled_binary "$distro"; then
+                version="$(installed_version)"
+                [[ "$version" == "$MINER_VERSION" ]] || {
+                    echo "AMDBTX: bundled version '$version', expected '$MINER_VERSION'" >&2
+                }
+                if [[ -x "$MINER_BIN" ]]; then
+                    return 0
+                fi
+            fi
+            ;;
+    esac
+
     version="$(installed_version)"
     if [[ "$version" == "$MINER_VERSION" && -x "$MINER_BIN" && -x "$SOLVER_BIN" ]]; then
         return 0
