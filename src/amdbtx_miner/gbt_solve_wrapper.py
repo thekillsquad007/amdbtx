@@ -91,10 +91,24 @@ class GBTSolveWrapper:
         self._ready_event = threading.Event()
         self._start(allow_cpu_fallback=True)
 
+    @staticmethod
+    def _bundled_runtime_dir() -> str:
+        """Return path to bundled ROCm runtime libs in PyInstaller bundle, or empty."""
+        if not getattr(sys, "frozen", False):
+            return ""
+        bundle = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(sys.executable).parent
+        for candidate in [bundle / "runtime", bundle.parent / "runtime"]:
+            if candidate.is_dir():
+                return str(candidate.resolve())
+        return ""
+
     def _build_ld_path(self) -> str:
         parts = []
+        bundled = self._bundled_runtime_dir()
+        if bundled and bundled not in parts:
+            parts.append(bundled)
         if self.runtime_ld_path:
-            for p in self.runtime_ld_path.split(":"):
+            for p in self.runtime_ld_path.split(os.pathsep):
                 if p and p not in parts:
                     parts.append(p)
         runtime_dir = str(Path.home() / ".amdbtx-miner" / "runtime")
@@ -102,10 +116,10 @@ class GBTSolveWrapper:
             parts.append(runtime_dir)
         existing = os.environ.get("LD_LIBRARY_PATH", "")
         if existing:
-            for p in existing.split(":"):
+            for p in existing.split(os.pathsep):
                 if p and p not in parts:
                     parts.append(p)
-        return ":".join(parts)
+        return os.pathsep.join(parts)
 
     def _stop_proc(self):
         if self.proc is None:
@@ -135,7 +149,16 @@ class GBTSolveWrapper:
         _ensure_amdgpu_ids_symlink()
 
         env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = self._build_ld_path()
+        bundled_runtime = self._bundled_runtime_dir()
+        if bundled_runtime:
+            os_name = sys.platform
+            if os_name.startswith("win"):
+                env["PATH"] = bundled_runtime + os.pathsep + env.get("PATH", "")
+                env["HSA_PATH"] = bundled_runtime
+            elif os_name.startswith("linux"):
+                env["LD_LIBRARY_PATH"] = self._build_ld_path()
+        else:
+            env["LD_LIBRARY_PATH"] = self._build_ld_path()
         env["HSA_ENABLE_DXG_DETECTION"] = "1"
         env["BTX_MATMUL_BACKEND"] = self.backend
         env["BTX_MATMUL_SOLVER_THREADS"] = str(self.threads)

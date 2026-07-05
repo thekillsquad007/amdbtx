@@ -690,15 +690,13 @@ __device__ __forceinline__ uint32_t d_candidate_from_midstate(const uint32_t* mb
     w[5] = mb[5];
     w[6] = mb[6];
     w[7] = mb[7];
-    #pragma unroll
-    for (uint32_t i = 8; i < 16; ++i) {
-        w[i] = 0U;
-    }
-    d_set_sha_byte(w, 32U, index & 0xffU);
-    d_set_sha_byte(w, 33U, (index >> 8U) & 0xffU);
-    d_set_sha_byte(w, 34U, (index >> 16U) & 0xffU);
-    d_set_sha_byte(w, 35U, (index >> 24U) & 0xffU);
-    d_set_sha_byte(w, 36U, 0x80U);
+    w[8] = d_bswap32(index);
+    w[9] = 0x80000000U;
+    w[10] = 0U;
+    w[11] = 0U;
+    w[12] = 0U;
+    w[13] = 0U;
+    w[14] = 0U;
     w[15] = 36U * 8U;
 
     uint32_t a = mb[8], b = mb[9], c = mb[10], d = mb[11];
