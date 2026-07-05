@@ -35,7 +35,14 @@ endforeach()
 if(WIN32)
     set(HIP_LINK_FLAGS "")
 else()
-    set(HIP_LINK_FLAGS "-lpthread" "-Wl,-rpath,/opt/rocm/lib:/opt/rocm-7.2.0/lib")
+    # -Wl,-rpath,'$ORIGIN': runtime libs in same dir as the binary.
+    # -Wl,-rpath,'$ORIGIN/runtime': bundled PyInstaller runtime/ subdir.
+    # Falls back to host ROCm install path for development use.
+    set(HIP_LINK_FLAGS "-lpthread"
+        "-Wl,-rpath,'\$\$ORIGIN'"
+        "-Wl,-rpath,'\$\$ORIGIN/runtime'"
+        "-Wl,-rpath,/opt/rocm/lib:/opt/rocm-7.2.0/lib:/opt/rocm-7.2.3/lib"
+    )
 endif()
 
 add_custom_command(
