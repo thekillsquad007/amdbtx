@@ -1,6 +1,7 @@
 import subprocess
 import json
 import os
+import sys
 import time
 import logging
 import threading
@@ -8,6 +9,44 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def _ensure_amdgpu_ids_symlink():
+    """Bundle /usr/share/libdrm/amdgpu.ids from PyInstaller if missing on system.
+
+    ``libdrm_amdgpu`` reads this file with an absolute path at runtime to map
+    PCI device IDs to human-readable ASIC names.  When the file is absent,
+    ``amdgpu_open_device`` — and therefore HIP/ROCr — may fail to enumerate
+    GPUs, causing the solver to silently fall back to CPU mode.
+
+    This function runs once at wrapper startup.  On HiveOS (where the miner
+    typically runs as root) it creates a symlink from the bundled copy to the
+    expected system path.
+    """
+    target_path = Path("/usr/share/libdrm/amdgpu.ids")
+    if target_path.exists() and not target_path.is_symlink():
+        return  # system already has the real file
+
+    if not getattr(sys, "frozen", False):
+        return  # development environment, nothing to bundle
+
+    bundle_dir = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(sys.executable).parent
+    bundled = bundle_dir / "amdgpu.ids"
+    if not bundled.exists():
+        log.warning("bundled amdgpu.ids not found at %s", bundled)
+        return
+
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.is_symlink() and target_path.exists():
+            return  # already pointing to a valid file
+        target_path.unlink(missing_ok=True)
+        target_path.symlink_to(str(bundled))
+        log.info("symlinked %s -> %s", target_path, bundled)
+    except PermissionError:
+        log.warning("cannot create symlink at %s (not root? GPU may still work)", target_path)
+    except OSError as exc:
+        log.warning("failed to symlink %s: %s", target_path, exc)
 
 
 def apply_matmul_experimental_flags(env: dict, experimental_rdna4_wmma: bool = False) -> None:
@@ -92,6 +131,8 @@ class GBTSolveWrapper:
 
         self._stop_proc()
         self._ready_event = threading.Event()
+
+        _ensure_amdgpu_ids_symlink()
 
         env = os.environ.copy()
         env["LD_LIBRARY_PATH"] = self._build_ld_path()
