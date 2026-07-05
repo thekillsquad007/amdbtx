@@ -1016,6 +1016,18 @@ def run_miner():
         log.warning("No AMD GPU detected — solver will likely fail with backend=rocm")
 
     gpu_devices = resolve_gpu_devices(cfg, gpu_info)
+    if len(gpu_devices) > 1 and cfg.get("solver_backend", "rocm") != "cpu":
+        from .hardware import _probe_alive_gpu_indices
+        alive = _probe_alive_gpu_indices(str(solver_path), total=len(gpu_devices))
+        if alive:
+            filtered = [i for i in gpu_devices if i in alive]
+            skipped = [i for i in gpu_devices if i not in alive]
+            if filtered and len(filtered) != len(gpu_devices):
+                log.warning(
+                    "GPU alive probe: skipped dead indices %s (alive %s); using %s",
+                    skipped, alive, filtered,
+                )
+                gpu_devices = filtered
     if len(gpu_devices) == 1:
         log.info("mining on GPU %d", gpu_devices[0])
     else:

@@ -186,11 +186,17 @@ def _amd_gfx_target(env: dict[str, str] | None = None,
 
 
 def _amd_pci_bdfs() -> list[str]:
-    """PCI bus IDs for AMD display/3D controllers (vendor 0x1002)."""
+    """PCI bus IDs for AMD display/3D controllers (vendor 0x1002).
+
+    Excludes integrated GPUs (typically on bus 0 root-complex slot) so the
+    default enumeration prefers discrete GPUs. Set AMDBTX_INCLUDE_IGPU=1
+    to opt back into including them.
+    """
     bdfs: list[str] = []
     pci_root = "/sys/bus/pci/devices"
     if not os.path.isdir(pci_root):
         return bdfs
+    include_igpu = os.environ.get("AMDBTX_INCLUDE_IGPU", "").lower() in ("1", "true", "yes")
     try:
         for entry in sorted(os.listdir(pci_root)):
             base = os.path.join(pci_root, entry)
@@ -201,6 +207,11 @@ def _amd_pci_bdfs() -> list[str]:
                 with open(os.path.join(base, "class")) as f:
                     cls = f.read().strip()
                 if not (cls.startswith("0x0300") or cls.startswith("0x0302")):
+                    continue
+                # Integrated GPUs sit on PCI bus 0 with secondary function 0
+                # (e.g. "00:01.0"). Exclude by default unless AMDBTX_INCLUDE_IGPU
+                bus = entry.split(":")[0]
+                if not include_igpu and bus == "0000":
                     continue
                 bdfs.append(entry)
             except OSError:
@@ -381,6 +392,86 @@ def _enumerate_amd_gpus() -> list[dict[str, Any]]:
     return _amd_gpus_from_rocminfo()
 
 
+def _max_gpu_index_from_pci() -> int:
+    """Highest PCI slot index visible. Used to bound per-GPU probing."""
+    try:
+        entries = [e for e in os.listdir("/sys/bus/pci/devices")
+                   if os.path.isfile(os.path.join("/sys/bus/pci/devices", e, "vendor"))]
+    except OSError:
+        return 0
+    indices = []
+    for e in entries:
+        try:
+            with open(os.path.join("/sys/bus/pci/devices", e, "vendor")) as f:
+                if f.read().strip() != "0x1002":
+                    continue
+            with open(os.path.join("/sys/bus/pci/devices", e, "class")) as f:
+                cls = f.read().strip()
+            if not (cls.startswith("0x0300") or cls.startswith("0x0302")):
+                continue
+            indices.append(int(e.split(":")[1], 16))
+        except (OSError, ValueError):
+            continue
+    return max(indices) if indices else 0
+
+
+def _count_amd_pci_devices() -> int:
+    """Count PCI AMD display/3D devices (matching _amd_pci_bdfs filter)."""
+    pci_root = "/sys/bus/pci/devices"
+    if not os.path.isdir(pci_root):
+        return 0
+    include_igpu = os.environ.get("AMDBTX_INCLUDE_IGPU", "").lower() in ("1", "true", "yes")
+    count = 0
+    try:
+        for entry in sorted(os.listdir(pci_root)):
+            base = os.path.join(pci_root, entry)
+            try:
+                with open(os.path.join(base, "vendor")) as f:
+                    if f.read().strip() != "0x1002":
+                        continue
+                with open(os.path.join(base, "class")) as f:
+                    cls = f.read().strip()
+                if not (cls.startswith("0x0300") or cls.startswith("0x0302")):
+                    continue
+                bus = entry.split(":")[0]
+                if not include_igpu and bus == "0000":
+                    continue
+                count += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return count
+
+
+def _probe_alive_gpu_indices(solver_path: str | None, total: int | None = None) -> list[int]:
+    """Probe each candidate GPU index individually; return list of indices that
+    initialize HIP successfully.
+
+    Solves the 4xGPU+1broken-card failure mode where rocm-smi enumerates cards
+    but HIP refuses one of them, so the solver reports No HIP GPU found and
+    falls back to CPU.
+
+    Only probes indices that have a corresponding PCI AMD display device — does
+    not try every PCI slot up to 16.
+
+    Does NOT exclude GPUs whose rocm-smi sensors report degraded values: HIP
+    init success is the only criterion, so a working GPU with bad sensors still
+    counts.
+    """
+    if not solver_path or not os.path.isfile(solver_path):
+        return []
+    if total is None or total <= 0:
+        total = max(1, _count_amd_pci_devices())
+    total = min(total, 16)
+    alive: list[int] = []
+    for idx in range(total):
+        probe = _probe_solver_gpu_at_index(solver_path, idx)
+        if probe is not None:
+            alive.append(idx)
+    return alive
+
+
 def _detect_environment() -> dict[str, Any]:
     info = {
         "is_containerized": False,
@@ -444,7 +535,19 @@ def _probe_active_backend(solver_path: str | None) -> dict[str, Any]:
 def _probe_solver_gpu(solver_path: str | None) -> dict[str, Any] | None:
     if not solver_path or not os.path.isfile(solver_path):
         return None
+    return _probe_solver_gpu_at_index(solver_path, -1)
+
+
+def _probe_solver_gpu_at_index(solver_path: str | None, device_index: int) -> dict[str, Any] | None:
+    """Probe one GPU index. device_index=-1 means probe default device.
+
+    Returns None if HIP fails to detect any GPU (e.g. broken hardware card).
+    """
+    if not solver_path or not os.path.isfile(solver_path):
+        return None
     env = _rocm_miner_env()
+    if device_index >= 0:
+        env = {**env, "HIP_VISIBLE_DEVICES": str(device_index)}
     try:
         proc = subprocess.Popen(
             [solver_path, "--daemon", "--backend", "hip", "--batch-size", "1", "--epsilon-bits", "0"],
@@ -471,13 +574,17 @@ def _probe_solver_gpu(solver_path: str | None) -> dict[str, Any] | None:
         return None
     gfx = m.group(2)
     pci_bdfs = _amd_pci_bdfs()
-    ident = pci_bdfs[0] if pci_bdfs else (_hostname() or "solver-probe")
+    ident = pci_bdfs[device_index] if 0 <= device_index < len(pci_bdfs) else (
+        pci_bdfs[0] if pci_bdfs else (_hostname() or "solver-probe")
+    )
     return {
         "model": m.group(1).strip() or "AMD GPU",
         "vram_gb": round(int(m.group(3)) / 1024, 2),
         "compute_capability": gfx,
-        "gpu_uuid": _make_amd_gpu_uuid(gfx, ident),
-        "pcie_link": pci_bdfs[0] if pci_bdfs else None,
+        "gpu_uuid": _make_amd_gpu_uuid(gfx, f"{device_index}-{ident}" if device_index >= 0 else ident),
+        "pcie_link": pci_bdfs[device_index] if 0 <= device_index < len(pci_bdfs) else (
+            pci_bdfs[0] if pci_bdfs else None
+        ),
     }
 
 
