@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE_DIR="${ROOT_DIR}/hiveos/amdbtx"
-VERSION="1.2.0_hiveos"
+VERSION="1.2.2_hiveos"
 OUT_DIR="${ROOT_DIR}/dist"
 OUT_FILE="${OUT_DIR}/amdbtx-${VERSION}.tar.gz"
 

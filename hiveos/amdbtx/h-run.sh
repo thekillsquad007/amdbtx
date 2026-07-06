@@ -2,7 +2,7 @@
 set -e
 set -o pipefail
 
-MINER_VERSION="1.2.0"
+MINER_VERSION="1.2.2"
 MINER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CUSTOM_CONFIG_FILENAME:-${MINER_DIR}/amdbtx.yaml}"
 ARGS_FILE="${CONFIG_FILE}.args"

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import socket
 import json
 import time
