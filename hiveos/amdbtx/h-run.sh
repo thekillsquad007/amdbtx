@@ -1,21 +1,44 @@
 #!/usr/bin/env bash
+#
+# Runs the AMDBTX miner on HiveOS.
+# Working directory is /hive/miners/custom/amdbtx/.
+#
+# HiveOS sets CUSTOM_CONFIG_FILENAME (from h-manifest.conf) before invoking
+# this script. We just need to:
+#   1. Find a usable bundled PyInstaller binary matching the host distro
+#      (Ubuntu 22.04 / 20.04) and copy it into $HOME/.amdbtx-miner/bin.
+#   2. Launch it via the resolved miner binary path.
+
 set -e
 set -o pipefail
 
 MINER_VERSION="1.2.2"
 MINER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Belt-and-suspenders: if HiveOS didn't pre-load CUSTOM_* env vars from the
+# manifest, fall back to reading them now without overwriting existing values.
+if [[ -f "${MINER_DIR}/h-manifest.conf" ]]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            CUSTOM_CONFIG_FILENAME|CUSTOM_LOG_BASENAME|CUSTOM_NAME|CUSTOM_VERSION)
+                if [[ -z "${!key:-}" ]]; then
+                    export "$key=$value"
+                fi
+                ;;
+        esac
+    done < "${MINER_DIR}/h-manifest.conf"
+fi
+
 CONFIG_FILE="${CUSTOM_CONFIG_FILENAME:-${MINER_DIR}/amdbtx.yaml}"
 ARGS_FILE="${CONFIG_FILE}.args"
-LOG_BASENAME="${CUSTOM_LOG_BASENAME:-/var/log/miner/amdbtx/lastrun}"
-LOG_FILE="${LOG_BASENAME}.log"
-START_FILE="/var/run/amdbtx.started"
 
 export HOME="${HOME:-/root}"
 INSTALL_DIR="${HOME}/.amdbtx-miner"
-VENV_DIR="${AMDBTX_VENV_DIR:-${HOME}/.local/share/amdbtx-miner/venv}"
-MINER_BIN="${VENV_DIR}/bin/amdbtx-miner"
-SOLVER_BIN="${INSTALL_DIR}/bin/btx-gbt-solve-hip"
-INSTALLER_URL="${AMDBTX_INSTALLER_URL:-https://raw.githubusercontent.com/thekillsquad007/amdbtx/v${MINER_VERSION}/install_amd.sh}"
+MINER_BIN="${INSTALL_DIR}/bin/amdbtx-miner"
+
+LOG_BASENAME="${CUSTOM_LOG_BASENAME:-/var/log/miner/amdbtx/lastrun}"
+LOG_FILE="${LOG_BASENAME}.log"
+START_FILE="/var/run/amdbtx.started"
 
 add_existing_path() {
     local path
@@ -49,12 +72,7 @@ setup_hive_rocm_env() {
     add_existing_ld_path /usr/lib/x86_64-linux-gnu /usr/local/lib
 }
 
-installed_version() {
-    "${VENV_DIR}/bin/python" -c 'import amdbtx_miner; print(amdbtx_miner.__version__)' 2>/dev/null || true
-}
-
 os_distro() {
-    # Detect distro: 22 (Ubuntu 22) or 20 (Ubuntu 20) or unknown
     local id version
     if [[ -f /etc/os-release ]]; then
         id="$(grep -oP '(?<=^ID=).*' /etc/os-release 2>/dev/null | tr -d '"')"
@@ -74,94 +92,73 @@ os_distro() {
     fi
 }
 
-use_bundled_binary() {
-    local binary="${MINER_DIR}/amdbtx-miner-linux-ubuntu${1}"
-    if [[ -x "$binary" ]]; then
-        echo "AMDBTX: using bundled portable binary (ubuntu${1})"
-        mkdir -p "$(dirname "$MINER_BIN")"
-        mkdir -p "$(dirname "$SOLVER_BIN")"
-        cp -a "$binary" "$MINER_BIN"
-        # The portable binary includes the solver internally; mark SOLVER_BIN as present
-        touch "$SOLVER_BIN"
-        chmod +x "$MINER_BIN" "$SOLVER_BIN"
-        return 0
+install_bundled_binary() {
+    local distro="$1"
+    local bundled="${MINER_DIR}/amdbtx-miner-linux-ubuntu${distro}"
+    if [[ ! -x "$bundled" ]]; then
+        return 1
     fi
-    return 1
+    mkdir -p "$(dirname "$MINER_BIN")"
+    cp -a "$bundled" "$MINER_BIN"
+    chmod +x "$MINER_BIN"
+    echo "AMDBTX: using bundled portable binary (ubuntu${distro})"
+    return 0
 }
 
-ensure_installed() {
-    local version installer install_mode distro
+download_installer() {
+    local installer_url="https://raw.githubusercontent.com/thekillsquad007/amdbtx/v${MINER_VERSION}/install_amd.sh"
+    local installer="/tmp/amdbtx-install-${MINER_VERSION}.sh"
+    command -v curl >/dev/null 2>&1 || {
+        echo "AMDBTX: curl is required to download installer" >&2
+        return 1
+    }
+    curl -fsSL "$installer_url" -o "$installer" || return 1
+    chmod +x "$installer"
+    AMDBTX_SOURCE_REF="v${MINER_VERSION}" bash "$installer" \
+        --yes \
+        --skip-rocm \
+        --use-prebuilt \
+        --pool "btx-sg.lproute.com:8660" || return 1
+    return 0
+}
 
-    # Try bundled binaries first
+ensure_miner_binary() {
+    local distro installed_version
+
+    installed_version="$("${MINER_BIN}" --version 2>/dev/null || true)"
+    if [[ -x "$MINER_BIN" && "$installed_version" == *"$MINER_VERSION"* ]]; then
+        return 0
+    fi
+
     distro="$(os_distro)"
     case "$distro" in
         22|20)
-            if use_bundled_binary "$distro"; then
-                version="$(installed_version)"
-                [[ "$version" == "$MINER_VERSION" ]] || {
-                    echo "AMDBTX: bundled version '$version', expected '$MINER_VERSION'" >&2
-                }
-                if [[ -x "$MINER_BIN" ]]; then
-                    return 0
-                fi
+            if install_bundled_binary "$distro"; then
+                return 0
             fi
             ;;
     esac
 
-    version="$(installed_version)"
-    if [[ "$version" == "$MINER_VERSION" && -x "$MINER_BIN" && -x "$SOLVER_BIN" ]]; then
-        return 0
-    fi
+    echo "AMDBTX: no bundled binary for this distro; falling back to installer"
+    download_installer || return 1
 
-    command -v curl >/dev/null 2>&1 || {
-        echo "AMDBTX: curl is required for first-run installation" >&2
-        return 1
-    }
-
-    installer="/tmp/amdbtx-install-${MINER_VERSION}.sh"
-    echo "AMDBTX: installing upstream v${MINER_VERSION} (ROCm packages are skipped for HiveOS)"
-    curl -fsSL "$INSTALLER_URL" -o "$installer"
-    chmod +x "$installer"
-
-    install_mode="${AMDBTX_HIVE_INSTALL_MODE:-prebuilt}"
-    if [[ "$install_mode" == "source" ]]; then
-        AMDBTX_SOURCE_REF="v${MINER_VERSION}" bash "$installer" \
-            --yes \
-            --skip-rocm \
-            --pool "btx-sg.lproute.com:8660"
-    else
-        AMDBTX_SOURCE_REF="v${MINER_VERSION}" bash "$installer" \
-            --yes \
-            --skip-rocm \
-            --use-prebuilt \
-            --pool "btx-sg.lproute.com:8660"
-    fi
-
-    version="$(installed_version)"
-    [[ "$version" == "$MINER_VERSION" ]] || {
-        echo "AMDBTX: installed version '$version', expected '$MINER_VERSION'" >&2
-        return 1
-    }
-    [[ -x "$MINER_BIN" && -x "$SOLVER_BIN" ]] || {
-        echo "AMDBTX: miner or solver binary is missing after installation" >&2
-        return 1
-    }
+    [[ -x "$MINER_BIN" ]] || return 1
+    return 0
 }
 
 read_extra_args() {
     EXTRA_ARGS=()
     [[ -s "$ARGS_FILE" ]] || return 0
-    # HiveOS extra CLI arguments are intentionally simple whitespace-separated flags.
-    # Use Extra config YAML lines when values need spaces or complex quoting.
-    read -r -a EXTRA_ARGS < "$ARGS_FILE"
+    read -r -a EXTRA_ARGS < "$ARGS_FILE" || true
 }
 
-mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$START_FILE")"
-date +%s > "$START_FILE"
-touch "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2>&1
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+mkdir -p "$(dirname "$START_FILE")" 2>/dev/null || true
+date +%s > "$START_FILE" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
+exec > >(tee -a "$LOG_FILE" 2>/dev/null) 2>&1
 
-setup_hive_rocm_env
+setup_hive_rocm_env 2>/dev/null || true
 
 if [[ ! -s "$CONFIG_FILE" ]]; then
     echo "AMDBTX: config file not found: $CONFIG_FILE"
@@ -169,7 +166,11 @@ if [[ ! -s "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
-ensure_installed
+if ! ensure_miner_binary; then
+    echo "AMDBTX: failed to install miner binary"
+    exit 1
+fi
+
 read_extra_args
 
 echo "AMDBTX: starting miner v${MINER_VERSION}"

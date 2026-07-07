@@ -1,7 +1,33 @@
 #!/usr/bin/env bash
-set -e
+#
+# Called (sourced) by HiveOS each time the miner starts/stops.
+# HiveOS sets $CUSTOM_URL, $CUSTOM_USER_CONFIG, $CUSTOM_TEMPLATE,
+# $WAL, $EWAL, $DWAL, $ZWAL, $EMAIL, $WORKER_NAME, $CUSTOM_CONFIG_FILENAME,
+# $CUSTOM_LOG_BASENAME before sourcing this file.
+#
+# Generate the miner YAML config and write it to $CUSTOM_CONFIG_FILENAME
+# (or fall back to $MINER_DIR/amdbtx.yaml).
 
 MINER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# HiveOS is supposed to source h-manifest.conf and propagate CUSTOM_*_FILENAME
+# before sourcing this file.  As a safety net (e.g. when h-config.sh is invoked
+# from a shell that didn't source the manifest), fall back to its values for
+# any vars that are still unset.
+if [[ -f "${MINER_DIR}/h-manifest.conf" ]]; then
+    # Source into a subshell-like scope so we don't overwrite env vars HiveOS
+    # already provided.  Only apply values for CUSTOM_* vars that are empty.
+    while IFS='=' read -r key value; do
+        case "$key" in
+            CUSTOM_CONFIG_FILENAME|CUSTOM_LOG_BASENAME|CUSTOM_NAME|CUSTOM_VERSION)
+                if [[ -z "${!key:-}" ]]; then
+                    export "$key=$value"
+                fi
+                ;;
+        esac
+    done < "${MINER_DIR}/h-manifest.conf"
+fi
+
 CONFIG_FILE="${CUSTOM_CONFIG_FILENAME:-${MINER_DIR}/amdbtx.yaml}"
 ARGS_FILE="${CONFIG_FILE}.args"
 DEFAULT_POOL="btx-sg.lproute.com:8660"
@@ -127,18 +153,22 @@ mkdir -p "$(dirname "$CONFIG_FILE")"
     printf 'payout_address: %s\n' "$(yaml_quote "$PAYOUT_ADDRESS")"
     printf 'worker_name: %s\n' "$(yaml_quote "$WORKER")"
     echo
-    printf 'gbt_solve_path: %s\n' "$(yaml_quote "${HOME:-/root}/.amdbtx-miner/bin/btx-gbt-solve-hip")"
-    echo
+    #
+    # NOTE: do NOT set gbt_solve_path here.  The portable PyInstaller bundle
+    # has the solver embedded and resolves it via sys._MEIPASS first.  Setting
+    # gbt_solve_path forces the miner to look on the host filesystem where no
+    # solver is installed on HiveOS, causing "solver not found".
+    #
     echo 'solver_backend: "rocm"'
     echo 'solver_threads: 16'
     echo 'solver_prepare_workers: 16'
-    echo 'solver_batch_size: 4194304'
+    echo 'solver_batch_size: 131072'
     echo 'solver_prefetch_depth: 8'
     echo 'solver_pipeline_async: 1'
-    echo 'gpu_inputs: 1'
+    echo 'gpu_inputs: 0'
     echo 'gpu_devices: "all"'
     echo
-    echo 'nonces_per_slice: 20000000'
+    echo 'nonces_per_slice: 2000000'
     echo 'solver_max_seconds_per_slice: 5.0'
     echo 'pool_max_shares_per_slice: 0'
     echo
