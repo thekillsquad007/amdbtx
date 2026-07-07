@@ -78,9 +78,6 @@ def _format_share_eta(gate_per_s: float, target_hex: str | None) -> str:
 
 
 def resolve_solver_path(configured_path: str = "") -> Path:
-    if configured_path:
-        return Path(configured_path).expanduser()
-
     # PyInstaller bundle: solver next to the executable
     if getattr(sys, "frozen", False):
         bundle_dir = Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(sys.executable).parent
@@ -88,6 +85,9 @@ def resolve_solver_path(configured_path: str = "") -> Path:
             candidate = bundle_dir / name
             if candidate.exists():
                 return candidate
+
+    if configured_path:
+        return Path(configured_path).expanduser()
 
     solver_bin_dir = Path.home() / ".amdbtx-miner" / "bin"
     for name in ["btx-gbt-solve-hip.exe", "btx-gbt-solve-hip", "btx-gbt-solve"]:

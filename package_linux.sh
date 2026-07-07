@@ -6,7 +6,24 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$REPO_ROOT/dist/amdbtx-miner-linux"
 ENTRY_POINT="$REPO_ROOT/src/run_miner.py"
 SOLVER_BUILD="$REPO_ROOT/solver/build-portable"
-ROCM_LIB="/opt/rocm/lib"
+
+# === Find ROCm ===
+# Look in /opt/rocm-* first (newer distros), then /opt/rocm, then anywhere under /opt
+ROCM_LIB=""
+for cand in /opt/rocm-*/lib /opt/rocm/lib; do
+    if [[ -d "$cand" ]] && [[ -f "$cand/libamdhip64.so" ]]; then
+        ROCM_LIB="$cand"
+        break
+    fi
+done
+if [[ -z "$ROCM_LIB" ]]; then
+    ROCM_LIB="$(find /opt -maxdepth 3 -name 'libamdhip64.so' -path '*/lib/*' 2>/dev/null | head -1 | xargs -r dirname)"
+fi
+if [[ -z "$ROCM_LIB" ]] || [[ ! -d "$ROCM_LIB" ]]; then
+    echo "ERROR: ROCm not found. Install ROCm (amdgpu + rocm-runtime) or set ROCM_LIB_PATH."
+    exit 1
+fi
+echo "ROCm lib: $ROCM_LIB"
 
 echo "=== Building solver (with ORIGIN RUNPATH) ==="
 cd "$REPO_ROOT/solver"
@@ -21,43 +38,81 @@ if [[ ! -x "$SOLVER_BIN" ]]; then
     exit 1
 fi
 
-# Verify RUNPATH was applied correctly
-if ! readelf -d "$SOLVER_BIN" | grep -q "ORIGIN"; then
-    echo "ERROR: solver RUNPATH does not contain ORIGIN. Mobile reload the source."
-    readelf -d "$SOLVER_BIN" | grep -i "RPATH\|RUNPATH"
+# Verify RUNPATH was applied correctly (works on both DT_RUNPATH and DT_RPATH)
+if ! readelf -d "$SOLVER_BIN" | grep -qE '(RUNPATH|RPATH)' ; then
+    echo "ERROR: solver has no RUNPATH/RPATH set"
+    readelf -d "$SOLVER_BIN"
     exit 1
 fi
+if ! readelf -d "$SOLVER_BIN" | grep -Eq '(RUNPATH|RPATH).*\$ORIGIN' ; then
+    echo "WARNING: solver RUNPATH does not contain \$ORIGIN, bundled .so may not be found"
+fi
+echo "RUNPATH: $(readelf -d "$SOLVER_BIN" | grep -E '(RUNPATH|RPATH)')"
 
-echo "=== Staging ROCm runtime libs ==="
+echo "=== Staging ROCm runtime libraries ==="
 RUNTIME_DIR="$SOLVER_BUILD/runtime"
 mkdir -p "$RUNTIME_DIR"
-# Symlinks (used by dlruntime) + the real versioned .so files
-for lib in libamdhip64.so libamdhip64.so.7 libhsa-runtime64.so libhsa-runtime64.so.1 librocprofiler-register.so librocprofiler-register.so.0; do
+
+# Copy the canonical SONAMEs (dlopen via bare 'libamdhip64.so' needs these)
+# and the versioned .so files (dynamic linker uses these)
+declare -a SONAMES=(
+    "libamdhip64.so"
+    "libamdhip64.so.7"
+    "libhsa-runtime64.so"
+    "libhsa-runtime64.so.1"
+    "librocprofiler-register.so"
+    "librocprofiler-register.so.0"
+)
+for lib in "${SONAMES[@]}"; do
     src="$ROCM_LIB/$lib"
-    if [[ -f "$src" ]]; then
-        cp -a "$src" "$RUNTIME_DIR/" 2>/dev/null || cp "$src" "$RUNTIME_DIR/" 2>/dev/null || true
-    fi
+    [[ -f "$src" ]] || continue
+    cp -a "$src" "$RUNTIME_DIR/" 2>/dev/null || cp "$src" "$RUNTIME_DIR/" 2>/dev/null || true
 done
-# Also copy the unversioned sonames — needed by dlextract
-for lib in libamdhip64.so.7.2.70200 libhsa-runtime64.so.1.18.70200 librocprofiler-register.so.0.6.0; do
-    src="$ROCM_LIB/$lib"
-    if [[ -f "$src" ]]; then
-        cp -a "$src" "$RUNTIME_DIR/" 2>/dev/null || true
-    fi
+
+# Copy the rest of the matching unversioned artifacts (libamdhip64.so.7.2.x and similar)
+for lib in "$ROCM_LIB"/*.so*; do
+    [[ -f "$lib" ]] || continue
+    base="$(basename "$lib")"
+    case "$base" in
+        libamdhip64*|libhsa-runtime64*|librocprofiler-register*)
+            cp -a "$lib" "$RUNTIME_DIR/"
+            ;;
+    esac
 done
 
 if ls "$RUNTIME_DIR"/*.so* 1>/dev/null 2>&1; then
-    echo "Bundled runtime libs:"
-    ls -la "$RUNTIME_DIR/"*.so* 2>/dev/null
+    echo "Bundled runtime ($(ls "$RUNTIME_DIR"/*.so* | wc -l) files):"
+    ls "$RUNTIME_DIR/" | sed 's/^/  /'
 else
     echo "WARNING: no .so files copied — runtime dir empty"
+    exit 1
+fi
+
+# Bundle amdgpu.ids if available (needed by libdrm_amdgpu on HiveOS)
+AMDGPU_IDS=""
+for cand in /usr/share/libdrm/amdgpu.ids /usr/share/amdgpu.ids /opt/rocm*/share/libdrm/amdgpu.ids; do
+    if [[ -f "$cand" ]]; then
+        AMDGPU_IDS="$cand"
+        break
+    fi
+done
+if [[ -n "$AMDGPU_IDS" ]]; then
+    cp -a "$AMDGPU_IDS" "$RUNTIME_DIR/"
+    echo "Bundled amdgpu.ids from $AMDGPU_IDS"
 fi
 
 echo "=== Installing Python deps ==="
-pip3 install --user --break-system-packages pyyaml pyinstaller 2>/dev/null || pip3 install --break-system-packages pyyaml pyinstaller
+pip3 install --user --break-system-packages pyyaml pyinstaller 2>/dev/null \
+    || pip3 install --break-system-packages pyyaml pyinstaller \
+    || python3 -m pip install --user pyyaml pyinstaller 2>/dev/null \
+    || python3 -m pip install pyyaml pyinstaller
+if ! command -v pyinstaller >/dev/null && ! python3 -c "import PyInstaller" 2>/dev/null; then
+    echo "ERROR: pyinstaller not available; cannot package"
+    exit 1
+fi
 
 echo "=== Packaging with PyInstaller ==="
-mkdir -p "$OUT_DIR"
+mkdir -p "$(dirname "$OUT_DIR")"
 rm -rf "$REPO_ROOT/build" "$REPO_ROOT"/*.spec 2>/dev/null || true
 
 python3 -m PyInstaller --clean --onefile --console \
@@ -71,7 +126,13 @@ python3 -m PyInstaller --clean --onefile --console \
 
 echo "=== Done ==="
 EXE="$OUT_DIR/amdbtx-miner"
+if [[ ! -x "$EXE" ]]; then
+    echo "ERROR: $EXE not produced"
+    exit 1
+fi
 ls -lh "$EXE"
 echo ""
-echo "Usage: $EXE --payout-address YOUR_BTX_ADDRESS --pool-host btx-sg.lproute.com --pool-port 8660"
-echo "Usage: $EXE --auto-tune   (force batch-size sweep and exit)"
+echo "Smoke test: $EXE --version (or --help)"
+echo ""
+echo "Usage: $EXE --payout-address YOUR_BTX_ADDRESS"
+echo "       $EXE --auto-tune   (force batch-size sweep and exit)"
